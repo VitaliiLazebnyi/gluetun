@@ -2,10 +2,12 @@ package wgapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -174,47 +176,120 @@ func Test_htmlForm_values(t *testing.T) {
 	}, form.values())
 }
 
-func Test_isLoginForm_isTwoFactorForm(t *testing.T) {
+func Test_Client_submitForm(t *testing.T) {
 	t.Parallel()
 
-	loginID := htmlInput{name: "loginId"}
-	password := htmlInput{name: "password"}
-	code := htmlInput{name: "code"}
-	twoFactorID := htmlInput{name: "twoFactorId"}
+	testCases := map[string]struct {
+		action     string
+		errWrapped error
+		errMessage string
+	}{
+		"invalid_action": {
+			action:     "%zz",
+			errMessage: `parsing form action: parse "%zz": invalid URL escape "%zz"`,
+		},
+		"other_host": {
+			action:     "https://evil.example.com/oauth2/authorize",
+			errWrapped: errHostNotAllowed,
+			errMessage: "form action: host not allowed: evil.example.com",
+		},
+		"insecure_scheme": {
+			action:     "http://auth.purevpn.com/oauth2/authorize",
+			errWrapped: errHostNotAllowed,
+		},
+	}
 
-	assert.True(t, isLoginForm(&htmlForm{inputs: []htmlInput{loginID, password}}))
-	assert.False(t, isLoginForm(&htmlForm{inputs: []htmlInput{loginID}}))
-	assert.False(t, isLoginForm(&htmlForm{inputs: []htmlInput{password}}))
-	assert.True(t, isTwoFactorForm(&htmlForm{inputs: []htmlInput{code, twoFactorID}}))
-	assert.False(t, isTwoFactorForm(&htmlForm{inputs: []htmlInput{code}}))
-	assert.False(t, isTwoFactorForm(&htmlForm{inputs: []htmlInput{twoFactorID}}))
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			httpClient := &http.Client{
+				Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					t.Error("unexpected request")
+					return nil, errors.New("unexpected request")
+				}),
+			}
+			client, err := New(httpClient, "", "", Credentials{}, Session{})
+			require.NoError(t, err)
+			page := &htmlPage{url: client.authURL}
+
+			_, err = client.submitForm(t.Context(), page, &htmlForm{action: testCase.action},
+				url.Values{"password": {"secret"}})
+
+			if testCase.errWrapped != nil {
+				assert.ErrorIs(t, err, testCase.errWrapped)
+			}
+			assert.ErrorContains(t, err, testCase.errMessage)
+		})
+	}
 }
 
-func Test_setDefault(t *testing.T) {
+func Test_Client_redirects(t *testing.T) {
 	t.Parallel()
 
-	values := url.Values{"set": {"value"}, "empty": {""}}
-	setDefault(values, "set", "default")
-	setDefault(values, "empty", "default")
-	setDefault(values, "missing", "default")
+	testCases := map[string]struct {
+		redirectTo    func(otherURL string) string
+		checkRedirect func(request *http.Request, via []*http.Request) error
+		errWrapped    error
+		errMessage    string
+		otherRequests uint
+	}{
+		"other_host": {
+			redirectTo: func(otherURL string) string { return otherURL + "/steal" },
+			errWrapped: errHostNotAllowed,
+			errMessage: "redirect: host not allowed: ",
+		},
+		"redirect_loop": {
+			redirectTo: func(string) string { return "/loop" },
+			errWrapped: errUnexpectedResponse,
+			errMessage: "stopped after 10 redirects",
+		},
+		"caller_check_redirect": {
+			redirectTo: func(string) string { return "/loop" },
+			checkRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
 
-	assert.Equal(t, url.Values{
-		"set":     {"value"},
-		"empty":   {"default"},
-		"missing": {"default"},
-	}, values)
-}
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			otherRequests := uint(0)
+			var mutex sync.Mutex
+			otherServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				mutex.Lock()
+				otherRequests++
+				mutex.Unlock()
+			}))
+			t.Cleanup(otherServer.Close)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				// 307 would replay the request body with the credentials.
+				http.Redirect(writer, request, testCase.redirectTo(otherServer.URL), http.StatusTemporaryRedirect)
+			}))
+			t.Cleanup(server.Close)
+			httpClient := &http.Client{Transport: &http.Transport{}, CheckRedirect: testCase.checkRedirect}
+			client, err := New(httpClient, server.URL, server.URL, Credentials{}, Session{})
+			require.NoError(t, err)
 
-func Test_Client_submitForm_invalidAction(t *testing.T) {
-	t.Parallel()
+			_, err = client.doAuthRequest(t.Context(), http.MethodPost, server.URL+"/oauth2/authorize",
+				url.Values{"password": {"secret"}})
+			if testCase.errWrapped != nil {
+				assert.ErrorIs(t, err, testCase.errWrapped)
+				assert.ErrorContains(t, err, testCase.errMessage)
+			} else {
+				assert.NoError(t, err)
+			}
 
-	client, err := New(&http.Client{}, "", "", Credentials{}, Session{})
-	require.NoError(t, err)
-	page := &htmlPage{url: client.authURL}
+			err = client.apiRequest(t.Context(), "token", "/v2/api/subscription", nil, nil)
+			if testCase.errWrapped != nil {
+				assert.ErrorIs(t, err, testCase.errWrapped)
+			}
 
-	_, err = client.submitForm(context.Background(), page, &htmlForm{action: "%zz"}, url.Values{})
-
-	assert.EqualError(t, err, `parsing form action: parse "%zz": invalid URL escape "%zz"`)
+			mutex.Lock()
+			assert.Zero(t, otherRequests)
+			mutex.Unlock()
+		})
+	}
 }
 
 func Test_Client_doAuthRequest(t *testing.T) {
@@ -241,9 +316,9 @@ func Test_Client_doAuthRequest(t *testing.T) {
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(testCase.status)
-				_, _ = w.Write([]byte(`<form action="/x"><input name="a"></form>`))
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(testCase.status)
+				_, _ = writer.Write([]byte(`<form action="/x"><input name="a"></form>`))
 			}))
 			t.Cleanup(server.Close)
 			client := newTestClient(t, server.URL, Credentials{}, Session{})
@@ -267,24 +342,4 @@ func Test_Client_doAuthRequest(t *testing.T) {
 			assert.Equal(t, []*htmlForm{{action: "/x", inputs: []htmlInput{{name: "a"}}}}, page.forms)
 		})
 	}
-}
-
-func Test_Client_loginWithCredentials_alreadyLoggedIn(t *testing.T) {
-	t.Parallel()
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "GET /oauth2/authorize", r.Method+" "+r.URL.Path)
-		// The browser session is still valid, so the auth server
-		// redirects to the member area which sets the access token.
-		http.SetCookie(w, &http.Cookie{Name: accessToken, Value: "token", Path: "/"})
-		_, _ = w.Write([]byte("<html>dashboard</html>"))
-	}))
-	t.Cleanup(server.Close)
-	credentials := Credentials{Username: testUsername, Password: testPassword}
-	client := newTestClient(t, server.URL, credentials, Session{})
-
-	token, err := client.loginWithCredentials(context.Background())
-
-	require.NoError(t, err)
-	assert.Equal(t, "token", token)
 }

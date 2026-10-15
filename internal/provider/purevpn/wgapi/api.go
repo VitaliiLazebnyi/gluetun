@@ -1,11 +1,13 @@
 package wgapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -17,7 +19,7 @@ type ServerRequest struct {
 	// CountryCode is the ISO 3166 alpha-2 country code, for example "US".
 	CountryCode string
 	// CityID is the optional PureVPN city ID, for example 8778 for New York.
-	CityID uint
+	CityID uint32
 	// SubscriptionID is the optional subscription ID to use,
 	// if the account has more than one subscription.
 	SubscriptionID string
@@ -75,17 +77,15 @@ func (c *Client) fetchConfig(ctx context.Context, request ServerRequest) (
 }
 
 type apiResponse struct {
-	Status  bool            `json:"status"`
-	Message string          `json:"message"`
-	Body    json.RawMessage `json:"body"`
+	Status    bool            `json:"status"`
+	Message   string          `json:"message"`
+	ErrorCode string          `json:"error_code"`
+	Body      json.RawMessage `json:"body"`
 }
 
 func (c *Client) apiRequest(ctx context.Context, token, path string,
 	form url.Values, body any,
 ) (err error) {
-	if form == nil {
-		form = url.Values{}
-	}
 	requestURL := joinURL(c.appURL, path)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		requestURL.String(), strings.NewReader(form.Encode()))
@@ -121,10 +121,7 @@ func (c *Client) apiRequest(ctx context.Context, token, path string,
 	case response.StatusCode == http.StatusOK:
 	case response.StatusCode == http.StatusUnauthorized:
 		return fmt.Errorf("%w: API returned %s", errUnauthorized, response.Status)
-	case response.StatusCode == http.StatusForbidden && !isHTML:
-		return fmt.Errorf("%w: API returned %s: %s", errUnauthorized, response.Status,
-			truncate(string(responseBody)))
-	case response.StatusCode == http.StatusForbidden:
+	case response.StatusCode == http.StatusForbidden && isHTML:
 		// HTML error page from the website protection, not the API.
 		return fmt.Errorf("%w: API returned %s with an HTML page", errBlocked, response.Status)
 	default:
@@ -141,7 +138,9 @@ func (c *Client) apiRequest(ctx context.Context, token, path string,
 		return fmt.Errorf("%w: API returned an HTML page", errUnauthorized)
 	case err != nil:
 		return fmt.Errorf("%w: decoding response: %w", errUnexpectedResponse, err)
-	case !data.Status && isAuthMessage(data.Message):
+	case !data.Status && data.ErrorCode == "token_expired":
+		// The API answers with this error code and a 200 status
+		// for any token it does not accept, expired or not.
 		return fmt.Errorf("%w: %s", errUnauthorized, data.Message)
 	case !data.Status:
 		return fmt.Errorf("%w: %s", errAPI, data.Message)
@@ -158,62 +157,43 @@ func (c *Client) apiRequest(ctx context.Context, token, path string,
 
 func isHTMLResponse(response *http.Response, body []byte) bool {
 	return strings.Contains(response.Header.Get("Content-Type"), "text/html") ||
-		strings.HasPrefix(strings.TrimSpace(string(body)), "<")
+		bytes.HasPrefix(bytes.TrimSpace(body), []byte("<"))
 }
 
-// isAuthMessage returns true if the API error message given
-// clearly indicates the access token is not accepted.
-func isAuthMessage(message string) bool {
-	message = strings.ToLower(message)
-	for _, phrase := range [...]string{
-		"unauthorized", "unauthorised", "not authenticated", "unauthenticated", //nolint:misspell
-		"token expired", "token has expired", "expired token",
-		"invalid token", "token is invalid", "invalid access token",
-		"access token is invalid",
-	} {
-		if strings.Contains(message, phrase) {
-			return true
-		}
-	}
-	return false
-}
-
+// truncate trims and truncates the text given to
+// at most 200 runes, followed by "..." if truncated.
 func truncate(text string) string {
-	const maxLength = 200
+	const maxRunes = 200
 	text = strings.TrimSpace(text)
-	if len(text) <= maxLength {
-		return text
+	runeCount := 0
+	for index := range text {
+		if runeCount == maxRunes {
+			return text[:index] + "..."
+		}
+		runeCount++
 	}
-	return text[:maxLength] + "..."
+	return text
 }
 
 type subscription struct {
 	ID           string   `json:"id"`
 	State        string   `json:"state"`
-	Status       string   `json:"status"`
 	VPNUsernames []string `json:"vpnusernames"`
-}
-
-func (s subscription) active() bool {
-	state := s.State
-	if state == "" {
-		state = s.Status
-	}
-	return state == "" || strings.EqualFold(state, "active")
 }
 
 func (c *Client) selectSubscription(ctx context.Context, token,
 	wantedID, wantedUsername string,
 ) (subscriptionID, vpnUsername string, err error) {
-	subscriptions, err := c.getSubscriptions(ctx, token)
+	var subscriptions []subscription
+	err = c.apiRequest(ctx, token, "/v2/api/subscription", nil, &subscriptions)
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("requesting subscriptions: %w", err)
 	}
 
 	for _, candidate := range subscriptions {
 		switch {
 		case wantedID != "" && candidate.ID != wantedID,
-			wantedID == "" && !candidate.active(),
+			wantedID == "" && !strings.EqualFold(candidate.State, "active"),
 			len(candidate.VPNUsernames) == 0:
 			continue
 		case wantedUsername == "":
@@ -231,46 +211,11 @@ func (c *Client) selectSubscription(ctx context.Context, token,
 	return "", "", errNoActiveSubscription
 }
 
-// getSubscriptions gets the account subscriptions, trying the
-// subscription endpoint first and then the on-boarding endpoint,
-// since both have been used by the member area.
-// The returned error only wraps errUnauthorized if the on-boarding
-// endpoint rejects the access token, so a subscription endpoint
-// rejecting it alone does not trigger a new login.
-func (c *Client) getSubscriptions(ctx context.Context, token string) (
-	subscriptions []subscription, err error,
-) {
-	err = c.apiRequest(ctx, token, "/v2/api/subscription", nil, &subscriptions)
-	switch {
-	case err == nil:
-		return subscriptions, nil
-	case !errors.Is(err, errAPI) && !errors.Is(err, errUnexpectedResponse) &&
-		!errors.Is(err, errUnauthorized):
-		return nil, fmt.Errorf("requesting subscriptions: %w", err)
-	}
-	subscriptionErr := err
-
-	var onBoarding struct {
-		Subscriptions []subscription `json:"subscriptions"`
-	}
-	err = c.apiRequest(ctx, token, "/v2/api/on-boarding", nil, &onBoarding)
-	switch {
-	case err == nil:
-		return onBoarding.Subscriptions, nil
-	case errors.Is(subscriptionErr, errUnauthorized) && !errors.Is(err, errUnauthorized):
-		return nil, fmt.Errorf("requesting on-boarding after subscriptions endpoint "+
-			"rejected the access token: %w", err)
-	default:
-		return nil, fmt.Errorf("requesting subscriptions: %w; requesting on-boarding: %w",
-			subscriptionErr, err)
-	}
-}
-
 func describeSubscriptions(subscriptions []subscription) string {
 	descriptions := make([]string, len(subscriptions))
 	for i, accountSubscription := range subscriptions {
-		descriptions[i] = fmt.Sprintf("%s (%s) with VPN usernames %s", accountSubscription.ID,
-			accountSubscription.State, strings.Join(accountSubscription.VPNUsernames, ", "))
+		descriptions[i] = fmt.Sprintf("%s (%s) with %d VPN username(s)", accountSubscription.ID,
+			accountSubscription.State, len(accountSubscription.VPNUsernames))
 	}
 	if len(descriptions) == 0 {
 		return "none"
@@ -317,22 +262,10 @@ func (c *Client) getWireguardServer(ctx context.Context, token string,
 		form.Set("iCityId", strconv.FormatUint(uint64(request.CityID), 10))
 	}
 
-	var raw json.RawMessage
-	err = c.apiRequest(ctx, token, "/v2/api/wireguard/get-wg-server", form, &raw)
+	var servers []wireguardServer
+	err = c.apiRequest(ctx, token, "/v2/api/wireguard/get-wg-server", form, &servers)
 	if err != nil {
 		return Config{}, err
-	}
-
-	// The body is a list of servers, but can also be a single object.
-	var servers []wireguardServer
-	err = json.Unmarshal(raw, &servers)
-	if err != nil {
-		var server wireguardServer
-		err = json.Unmarshal(raw, &server)
-		if err != nil {
-			return Config{}, fmt.Errorf("%w: decoding server: %w", errUnexpectedResponse, err)
-		}
-		servers = []wireguardServer{server}
 	}
 	if len(servers) == 0 || servers[0].Configuration == "" {
 		return Config{}, fmt.Errorf("%w: no WireGuard configuration in response", errUnexpectedResponse)
@@ -342,6 +275,12 @@ func (c *Client) getWireguardServer(ctx context.Context, token string,
 	if err != nil {
 		return Config{}, fmt.Errorf("%w: parsing WireGuard configuration: %w", errUnexpectedResponse, err)
 	}
-	config.ProtocolIP = servers[0].ProtocolIP
+	if servers[0].ProtocolIP != "" {
+		protocolIP, err := netip.ParseAddr(servers[0].ProtocolIP)
+		if err != nil {
+			return Config{}, fmt.Errorf("%w: parsing protocol IP: %w", errUnexpectedResponse, err)
+		}
+		config.ProtocolIP = protocolIP.Unmap()
+	}
 	return config, nil
 }

@@ -7,10 +7,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func Test_parseConfig(t *testing.T) {
 	t.Parallel()
+
+	serverKey, err := wgtypes.ParseKey(testServerKey)
+	require.NoError(t, err)
 
 	testCases := map[string]struct {
 		content    string
@@ -27,7 +31,7 @@ func Test_parseConfig(t *testing.T) {
 					netip.MustParsePrefix("10.14.0.3/32"),
 					netip.MustParsePrefix("fd00::3/128"),
 				},
-				ServerPublicKey: testServerKey,
+				ServerPublicKey: serverKey,
 				EndpointHost:    "198.51.100.1",
 				EndpointPort:    51820,
 			},
@@ -37,7 +41,7 @@ func Test_parseConfig(t *testing.T) {
 				"\nEndpoint=host.example:51820\nPersistentKeepalive=25",
 			config: Config{
 				Addresses:           []netip.Prefix{netip.MustParsePrefix("172.21.6.133/32")},
-				ServerPublicKey:     testServerKey,
+				ServerPublicKey:     serverKey,
 				EndpointHost:        "host.example",
 				EndpointPort:        51820,
 				PersistentKeepalive: 25 * time.Second,
@@ -48,7 +52,7 @@ func Test_parseConfig(t *testing.T) {
 				"\nEndpoint=1.2.3.4:51820",
 			config: Config{
 				Addresses:       []netip.Prefix{netip.MustParsePrefix("10.0.0.1/32")},
-				ServerPublicKey: testServerKey,
+				ServerPublicKey: serverKey,
 				EndpointHost:    "1.2.3.4",
 				EndpointPort:    51820,
 			},
@@ -109,14 +113,32 @@ func Test_parseConfig(t *testing.T) {
 func Test_Config_EndpointIP(t *testing.T) {
 	t.Parallel()
 
-	ip, ok := Config{EndpointHost: "host.example", ProtocolIP: "203.0.113.7"}.EndpointIP()
-	assert.True(t, ok)
-	assert.Equal(t, netip.MustParseAddr("203.0.113.7"), ip)
+	testCases := map[string]struct {
+		config Config
+		ip     netip.Addr
+		ok     bool
+	}{
+		"protocol_ip": {
+			config: Config{EndpointHost: "198.51.100.1", ProtocolIP: netip.MustParseAddr("203.0.113.7")},
+			ip:     netip.MustParseAddr("203.0.113.7"),
+			ok:     true,
+		},
+		"endpoint_host_ip": {
+			config: Config{EndpointHost: "::ffff:198.51.100.1"},
+			ip:     netip.MustParseAddr("198.51.100.1"),
+			ok:     true,
+		},
+		"endpoint_hostname": {
+			config: Config{EndpointHost: "host.example"},
+		},
+	}
 
-	ip, ok = Config{EndpointHost: "198.51.100.1"}.EndpointIP()
-	assert.True(t, ok)
-	assert.Equal(t, netip.MustParseAddr("198.51.100.1"), ip)
-
-	_, ok = Config{EndpointHost: "host.example"}.EndpointIP()
-	assert.False(t, ok)
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ip, ok := testCase.config.EndpointIP()
+			assert.Equal(t, testCase.ip, ip)
+			assert.Equal(t, testCase.ok, ok)
+		})
+	}
 }

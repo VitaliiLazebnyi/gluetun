@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -132,7 +131,7 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	logger.Info("fetching Wireguard configuration from PureVPN for " + describeLocation(purevpnSettings))
 	config, err := client.FetchConfig(ctx, wgapi.ServerRequest{
 		CountryCode:     purevpnSettings.Country,
-		CityID:          *purevpnSettings.CityID,
+		CityID:          uint32(*purevpnSettings.CityID), //nolint:gosec
 		SubscriptionID:  *purevpnSettings.SubscriptionID,
 		VPNUsername:     *purevpnSettings.VPNUsername,
 		ClientPublicKey: publicKey,
@@ -183,7 +182,7 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 			Protocol:   constants.UDP,
 			Hostname:   config.EndpointHost,
 			ServerName: config.EndpointHost,
-			PubKey:     config.ServerPublicKey,
+			PubKey:     config.ServerPublicKey.String(),
 		},
 		PrivateKey:          privateKey,
 		Addresses:           config.Addresses,
@@ -257,18 +256,10 @@ func (f *wireguardFetcher) applySessionToken(token string, logger Logger) {
 
 	if wgapi.IsJWT(token) {
 		logger.Debug("using PureVPN session token as access token")
-		f.state.Session.AccessToken = token
 	} else {
 		logger.Debug("using PureVPN session token as single sign-on cookie")
-		cookies := maps.Clone(f.state.Session.AuthCookies)
-		if cookies == nil {
-			cookies = make(map[string]string, 1)
-		}
-		cookies["fusionauth.sso"] = token
-		f.state.Session.AuthCookies = cookies
-		// The access token comes from the previous single sign-on session.
-		f.state.Session.AccessToken = ""
 	}
+	f.state.Session = f.state.Session.WithSessionToken(token)
 	f.state.SessionTokenHash = tokenHash
 }
 

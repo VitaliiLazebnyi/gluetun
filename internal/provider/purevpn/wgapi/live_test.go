@@ -1,3 +1,5 @@
+//go:build live
+
 package wgapi
 
 import (
@@ -14,11 +16,12 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// Test_Live talks to the real PureVPN website and only runs if the
-// PUREVPN_LIVE_TEST environment variable is set to the path of an env
-// file such as purevpn-wireguard.env at the repository root, for example:
+// Test_Live talks to the real PureVPN website. It is only built with the
+// live build tag, and only runs if the PUREVPN_LIVE_TEST environment
+// variable is set to the path of an env file such as purevpn-wireguard.env
+// at the repository root, for example:
 //
-//	PUREVPN_LIVE_TEST=$PWD/purevpn-wireguard.env go test -run Test_Live -v ./internal/provider/purevpn/wgapi/
+//	PUREVPN_LIVE_TEST=$PWD/purevpn-wireguard.env go test -tags live -run Test_Live -v ./internal/provider/purevpn/wgapi/
 //
 // It logs in, fetches a Wireguard configuration and prints it, without
 // the private key. Set PUREVPN_LIVE_EXPECT=invalid_credentials to check
@@ -32,13 +35,8 @@ func Test_Live(t *testing.T) { //nolint:paralleltest
 	env := readEnvFile(t, envPath)
 
 	session := Session{}
-	token := env["PUREVPN_SESSION_TOKEN"]
-	switch {
-	case token == "":
-	case IsJWT(token):
-		session.AccessToken = token
-	default:
-		session.AuthCookies = map[string]string{"fusionauth.sso": token}
+	if env["PUREVPN_SESSION_TOKEN"] != "" {
+		session = session.WithSessionToken(env["PUREVPN_SESSION_TOKEN"])
 	}
 	credentials := Credentials{
 		Username:   env["PUREVPN_USERNAME"],
@@ -56,9 +54,11 @@ func Test_Live(t *testing.T) { //nolint:paralleltest
 		require.NoError(t, err)
 	}
 
-	config, err := client.FetchConfig(context.Background(), ServerRequest{
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	config, err := client.FetchConfig(ctx, ServerRequest{
 		CountryCode:     env["PUREVPN_COUNTRY"],
-		CityID:          uint(cityID),
+		CityID:          uint32(cityID),
 		SubscriptionID:  env["PUREVPN_SUBSCRIPTION_ID"],
 		VPNUsername:     env["PUREVPN_VPN_USERNAME"],
 		ClientPublicKey: key.PublicKey().String(),

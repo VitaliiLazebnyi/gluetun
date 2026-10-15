@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -20,6 +21,7 @@ import (
 	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 const testUsername = "user@example.com"
@@ -46,24 +48,20 @@ type fakePureVPN struct {
 
 	mutex sync.Mutex
 	// Settings
-	twoFactor            bool
-	twoFactorMethods     string // HTML radio inputs to show a method selection page
-	twoFactorPageExtra   string // HTML added after the two-factor code form
-	totpTime             time.Time
-	rejectCodes          uint // number of valid two-factor codes to reject
-	blockCodeSubmission  uint // two-factor code submission number blocked by Cloudflare
-	cloudflare           bool
-	captcha              bool
-	apiResponses         map[string]*fakeResponse // API response for a path
-	blocked              map[string]bool          // "METHOD /path" blocked by Cloudflare
-	subscriptions        []subscription
-	singleServerObject   bool
-	noCityID             bool              // the city ID is not expected in the server request
-	brokenAuthorizePages uint              // number of GET authorize pages without any form
-	htmlAPIResponses     uint              // number of API responses with an HTML page
-	rejectToken          string            // API rejects this access token once
-	ssoDisabled          bool              // ignore the single sign-on cookie
-	pages                map[string]string // HTML page served for "METHOD /path"
+	twoFactor           bool
+	twoFactorMethods    string // HTML radio inputs to show a method selection page
+	twoFactorPageExtra  string // HTML added after the two-factor code form
+	totpTime            time.Time
+	rejectCodes         uint // number of valid two-factor codes to reject
+	blockCodeSubmission uint // two-factor code submission number blocked by Cloudflare
+	cloudflare          bool
+	captcha             bool
+	apiResponses        map[string]*fakeResponse // API response for a path
+	subscriptions       []subscription
+	noCityID            bool              // the city ID is not expected in the server request
+	rejectToken         string            // API rejects this access token once
+	ssoDisabled         bool              // ignore the single sign-on cookie
+	pages               map[string]string // HTML page served for "METHOD /path"
 	// State
 	counters    fakeCounters
 	latestToken string
@@ -71,6 +69,7 @@ type fakePureVPN struct {
 }
 
 type fakeCounters struct {
+	authorizePages  uint
 	passwordLogins  uint
 	twoFactorLogins uint
 	tokens          uint
@@ -82,12 +81,12 @@ type fakeResponse struct {
 	body        string
 }
 
-func (r *fakeResponse) write(w http.ResponseWriter) {
+func (r *fakeResponse) write(writer http.ResponseWriter) {
 	if r.contentType != "" {
-		w.Header().Set("Content-Type", r.contentType)
+		writer.Header().Set("Content-Type", r.contentType)
 	}
-	w.WriteHeader(r.status)
-	fmt.Fprint(w, r.body)
+	writer.WriteHeader(r.status)
+	fmt.Fprint(writer, r.body)
 }
 
 func newFakePureVPN(t *testing.T) *fakePureVPN {
@@ -159,112 +158,110 @@ const smsMethod = `<label class="radio"><input type="radio" name="methodId" valu
 const authenticatorMethod = `<input type="radio" id="method-auth" name="methodId" value="m-auth">
 <label for="method-auth">Authenticator app</label>`
 
-func (f *fakePureVPN) issueToken(w http.ResponseWriter, r *http.Request) {
+func (f *fakePureVPN) issueToken(writer http.ResponseWriter, request *http.Request) {
 	f.counters.tokens++
 	f.latestToken = makeJWT(time.Now().Add(time.Hour), f.counters.tokens)
 	f.validTokens[f.latestToken] = true
-	http.SetCookie(w, &http.Cookie{Name: "fusionauth.sso", Value: testSSOCookie, Path: "/"})
-	http.Redirect(w, r, "/v2/api/fusionauth/login?code=abc", http.StatusFound)
+	http.SetCookie(writer, &http.Cookie{Name: "fusionauth.sso", Value: testSSOCookie, Path: "/"})
+	http.Redirect(writer, request, "/v2/api/fusionauth/login?code=abc", http.StatusFound)
 }
 
-func (f *fakePureVPN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
-	if f.cloudflare || f.blocked[r.Method+" "+r.URL.Path] {
-		writeCloudflareBlock(w)
+	if f.cloudflare {
+		writeCloudflareBlock(writer)
 		return
 	}
-	page, ok := f.pages[r.Method+" "+r.URL.Path]
+	if request.Method+" "+request.URL.Path == "GET /oauth2/authorize" {
+		f.counters.authorizePages++
+	}
+	page, ok := f.pages[request.Method+" "+request.URL.Path]
 	if ok {
-		fmt.Fprint(w, page)
+		fmt.Fprint(writer, page)
 		return
 	}
 
-	baseURL := "http://" + r.Host
-	switch r.Method + " " + r.URL.Path {
+	baseURL := "http://" + request.Host
+	switch request.Method + " " + request.URL.Path {
 	case "GET /oauth2/authorize":
-		f.serveAuthorizePage(w, r, baseURL)
+		f.serveAuthorizePage(writer, request, baseURL)
 	case "POST /oauth2/authorize":
-		if !f.parseForm(w, r) {
+		if !f.parseForm(writer, request) {
 			return
 		}
-		assert.Equal(f.t, clientID, r.PostForm.Get("client_id"))
+		assert.Equal(f.t, clientID, request.PostForm.Get("client_id"))
 		f.counters.passwordLogins++
 		switch {
 		case f.captcha:
-			fmt.Fprintf(w, loginPage, baseURL, " error", //nolint:gosec // test server
+			fmt.Fprintf(writer, loginPage, baseURL, " error", //nolint:gosec // test server
 				`<span class="error">Please complete the captcha.</span>`)
-		case r.PostForm.Get("loginId") != testUsername || r.PostForm.Get("password") != testPassword:
-			fmt.Fprintf(w, loginPage, baseURL, " error", //nolint:gosec // test server
+		case request.PostForm.Get("loginId") != testUsername || request.PostForm.Get("password") != testPassword:
+			fmt.Fprintf(writer, loginPage, baseURL, " error", //nolint:gosec // test server
 				`<span class="error">Invalid login credentials.</span>`)
 		case f.twoFactor && f.twoFactorMethods != "":
-			fmt.Fprintf(w, twoFactorMethodsPage, f.twoFactorMethods)
+			fmt.Fprintf(writer, twoFactorMethodsPage, f.twoFactorMethods)
 		case f.twoFactor:
-			f.writeTwoFactorPage(w, "")
+			f.writeTwoFactorPage(writer, "")
 		default:
-			f.issueToken(w, r)
+			f.issueToken(writer, request)
 		}
 	case "POST /oauth2/two-factor-methods":
-		if !f.parseForm(w, r) {
+		if !f.parseForm(writer, request) {
 			return
 		}
-		assert.Equal(f.t, "m-auth", r.PostForm.Get("methodId"))
-		f.writeTwoFactorPage(w, "")
+		assert.Equal(f.t, "m-auth", request.PostForm.Get("methodId"))
+		f.writeTwoFactorPage(writer, "")
 	case "POST /oauth2/two-factor":
-		f.serveTwoFactorCode(w, r)
+		f.serveTwoFactorCode(writer, request)
 	case "GET /v2/api/fusionauth/login":
-		http.SetCookie(w, &http.Cookie{Name: accessToken, Value: f.latestToken, Path: "/"})
-		http.Redirect(w, r, "/v2/dashboard", http.StatusFound)
+		http.SetCookie(writer, &http.Cookie{Name: accessToken, Value: f.latestToken, Path: "/"})
+		http.Redirect(writer, request, "/v2/dashboard", http.StatusFound)
 	case "GET /v2/dashboard":
-		fmt.Fprint(w, "<html>dashboard</html>")
+		fmt.Fprint(writer, "<html>dashboard</html>")
 	default:
-		f.serveAPI(w, r)
+		f.serveAPI(writer, request)
 	}
 }
 
-func (f *fakePureVPN) serveAuthorizePage(w http.ResponseWriter, r *http.Request, baseURL string) {
-	if f.brokenAuthorizePages > 0 {
-		f.brokenAuthorizePages--
-		fmt.Fprint(w, "<html>Under maintenance</html>")
-		return
-	}
-	cookie, err := r.Cookie("fusionauth.sso")
+func (f *fakePureVPN) serveAuthorizePage(writer http.ResponseWriter, request *http.Request, baseURL string) {
+	cookie, err := request.Cookie("fusionauth.sso")
 	switch {
 	case err != nil, f.ssoDisabled:
 	case cookie.Value == testSSOCookie:
-		f.issueToken(w, r)
+		f.issueToken(writer, request)
 		return
 	case cookie.Value == "untrusted": // trusted device cookie expired
-		f.writeTwoFactorPage(w, "")
+		f.writeTwoFactorPage(writer, "")
 		return
 	}
-	fmt.Fprintf(w, loginPage, baseURL, "", "") //nolint:gosec // test server
+	fmt.Fprintf(writer, loginPage, baseURL, "", "") //nolint:gosec // test server
 }
 
-func writeCloudflareBlock(w http.ResponseWriter) {
-	w.Header().Set("Server", "cloudflare")
-	w.WriteHeader(http.StatusForbidden)
-	fmt.Fprint(w, "<html><title>Just a moment...</title></html>")
+func writeCloudflareBlock(writer http.ResponseWriter) {
+	writer.Header().Set("Server", "cloudflare")
+	writer.WriteHeader(http.StatusForbidden)
+	fmt.Fprint(writer, "<html><title>Just a moment...</title></html>")
 }
 
-func (f *fakePureVPN) writeTwoFactorPage(w http.ResponseWriter, errorHTML string) {
-	fmt.Fprintf(w, twoFactorPage, errorHTML, f.twoFactorPageExtra)
+func (f *fakePureVPN) writeTwoFactorPage(writer http.ResponseWriter, errorHTML string) {
+	fmt.Fprintf(writer, twoFactorPage, errorHTML, f.twoFactorPageExtra)
 }
 
-func (f *fakePureVPN) serveTwoFactorCode(w http.ResponseWriter, r *http.Request) {
-	if !f.parseForm(w, r) {
+func (f *fakePureVPN) serveTwoFactorCode(writer http.ResponseWriter, request *http.Request) {
+	if !f.parseForm(writer, request) {
 		return
 	}
 	f.counters.twoFactorLogins++
 	if f.counters.twoFactorLogins == f.blockCodeSubmission {
 		f.cloudflare = true
-		writeCloudflareBlock(w)
+		writeCloudflareBlock(writer)
 		return
 	}
-	assert.Equal(f.t, "tf-1", r.PostForm.Get("twoFactorId"))
-	assert.Equal(f.t, "true", r.PostForm.Get("trustComputer"))
-	valid, err := totp.ValidateCustom(r.PostForm.Get("code"), testTOTPSecret, f.totpTime, totp.ValidateOpts{
+	assert.Equal(f.t, "tf-1", request.PostForm.Get("twoFactorId"))
+	assert.Equal(f.t, "true", request.PostForm.Get("trustComputer"))
+	valid, err := totp.ValidateCustom(request.PostForm.Get("code"), testTOTPSecret, f.totpTime, totp.ValidateOpts{
 		Period: 30, Skew: 1, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
 	})
 	assert.NoError(f.t, err)
@@ -272,28 +269,23 @@ func (f *fakePureVPN) serveTwoFactorCode(w http.ResponseWriter, r *http.Request)
 		if valid {
 			f.rejectCodes--
 		}
-		f.writeTwoFactorPage(w, `<div class="error">Invalid code</div>`)
+		f.writeTwoFactorPage(writer, `<div class="error">Invalid code</div>`)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: "fusionauth.trust", Value: "trusted", Path: "/"})
-	f.issueToken(w, r)
+	http.SetCookie(writer, &http.Cookie{Name: "fusionauth.trust", Value: "trusted", Path: "/"})
+	f.issueToken(writer, request)
 }
 
-func (f *fakePureVPN) serveAPI(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+func (f *fakePureVPN) serveAPI(writer http.ResponseWriter, request *http.Request) {
+	token := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
 	if token == f.rejectToken || !f.validTokens[token] {
 		f.rejectToken = ""
 		delete(f.validTokens, token)
-		w.WriteHeader(http.StatusUnauthorized)
+		// The real API answers like this for any token it does not accept.
+		fmt.Fprint(writer, `{"status":false,"message":"Token is expired","error_code":"token_expired","errors":[]}`)
 		return
 	}
-	if f.htmlAPIResponses > 0 {
-		f.htmlAPIResponses--
-		delete(f.validTokens, token)
-		fmt.Fprint(w, "<html>login</html>")
-		return
-	}
-	if !f.parseForm(w, r) {
+	if !f.parseForm(writer, request) {
 		return
 	}
 
@@ -305,32 +297,30 @@ func (f *fakePureVPN) serveAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	response, ok := f.apiResponses[r.URL.Path]
+	response, ok := f.apiResponses[request.URL.Path]
 	if ok {
-		response.write(w)
+		response.write(writer)
 		return
 	}
 
 	var body any
-	switch r.URL.Path {
+	switch request.URL.Path {
 	case "/v2/api/subscription":
 		body = subscriptions
-	case "/v2/api/on-boarding":
-		body = map[string]any{"subscriptions": subscriptions}
 	case "/v2/api/wireguard/get-encrypt-password":
-		assert.Equal(f.t, testVPNUsername, r.PostForm.Get("username"))
+		assert.Equal(f.t, testVPNUsername, request.PostForm.Get("username"))
 		body = map[string]string{"encrypPass": "encrypted"}
 	case "/v2/api/wireguard/get-wg-server":
-		assert.Equal(f.t, testVPNUsername, r.PostForm.Get("sUsername"))
-		assert.Equal(f.t, "encrypted", r.PostForm.Get("sPassword"))
-		assert.Equal(f.t, "US", r.PostForm.Get("sCountrySlug"))
+		assert.Equal(f.t, testVPNUsername, request.PostForm.Get("sUsername"))
+		assert.Equal(f.t, "encrypted", request.PostForm.Get("sPassword"))
+		assert.Equal(f.t, "US", request.PostForm.Get("sCountrySlug"))
 		if f.noCityID {
-			assert.False(f.t, r.PostForm.Has("iCityId"))
+			assert.False(f.t, request.PostForm.Has("iCityId"))
 		} else {
-			assert.Equal(f.t, "8778", r.PostForm.Get("iCityId"))
+			assert.Equal(f.t, "8778", request.PostForm.Get("iCityId"))
 		}
-		assert.Equal(f.t, testSubsID, r.PostForm.Get("sSubsId"))
-		assert.Equal(f.t, testClientKey, r.PostForm.Get("sClientPublicKey"))
+		assert.Equal(f.t, testSubsID, request.PostForm.Get("sSubsId"))
+		assert.Equal(f.t, testClientKey, request.PostForm.Get("sClientPublicKey"))
 		server := map[string]string{
 			"protocol_ip": "203.0.113.7",
 			"wireguard_configuration": "[Interface]\nPrivateKey={clientPrivateKey}\n" +
@@ -339,28 +329,25 @@ func (f *fakePureVPN) serveAPI(w http.ResponseWriter, r *http.Request) {
 				"Endpoint=us-ny.purevpn.net:51820\nPersistentKeepalive=21\n",
 		}
 		body = []map[string]string{server}
-		if f.singleServerObject {
-			body = server
-		}
 	default:
-		w.WriteHeader(http.StatusNotFound)
+		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
 	bodyJSON, err := json.Marshal(body)
 	if !assert.NoError(f.t, err) {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(writer, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	err = json.NewEncoder(w).Encode(apiResponse{Status: true, Body: bodyJSON})
+	err = json.NewEncoder(writer).Encode(apiResponse{Status: true, Body: bodyJSON})
 	assert.NoError(f.t, err)
 }
 
-func (f *fakePureVPN) parseForm(w http.ResponseWriter, r *http.Request) (ok bool) {
+func (f *fakePureVPN) parseForm(writer http.ResponseWriter, request *http.Request) (ok bool) {
 	const maxBodySize = 1 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-	err := r.ParseForm()
+	request.Body = http.MaxBytesReader(writer, request.Body, maxBodySize)
+	err := request.ParseForm()
 	if !assert.NoError(f.t, err) {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return false
 	}
 	return true
@@ -376,19 +363,25 @@ func newTestRequest() ServerRequest {
 
 func newTestClient(t *testing.T, serverURL string, credentials Credentials, session Session) *Client {
 	t.Helper()
-	client, err := New(&http.Client{Timeout: 5 * time.Second}, serverURL, serverURL, credentials, session)
+	// A dedicated transport is used since closing a test server closes
+	// the idle connections of the default transport, used by other tests.
+	httpClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{}}
+	client, err := New(httpClient, serverURL, serverURL, credentials, session)
 	require.NoError(t, err)
 	return client
 }
 
-func newExpectedConfig() Config {
+func newExpectedConfig(t *testing.T) Config {
+	t.Helper()
+	serverKey, err := wgtypes.ParseKey(testServerKey)
+	require.NoError(t, err)
 	return Config{
 		Addresses:           []netip.Prefix{netip.MustParsePrefix("172.21.7.9/32")},
-		ServerPublicKey:     testServerKey,
+		ServerPublicKey:     serverKey,
 		EndpointHost:        "us-ny.purevpn.net",
 		EndpointPort:        51820,
 		PersistentKeepalive: 21 * time.Second,
-		ProtocolIP:          "203.0.113.7",
+		ProtocolIP:          netip.MustParseAddr("203.0.113.7"),
 	}
 }
 
@@ -403,41 +396,33 @@ func Test_Client_FetchConfig(t *testing.T) {
 	}
 	ssoCookies := map[string]string{"fusionauth.sso": testSSOCookie}
 	trustedCookies := map[string]string{"fusionauth.sso": testSSOCookie, "fusionauth.trust": "trusted"}
-
-	jsonForbidden := &fakeResponse{
-		status:      http.StatusForbidden,
-		contentType: "application/json",
-		body:        `{"status":false,"message":"Forbidden"}`,
-	}
-	serverError := &fakeResponse{status: http.StatusInternalServerError, body: "oops"}
 	loginPageAgain := fmt.Sprintf(loginPage, "http://127.0.0.1", " error",
 		`<span class="error">Invalid login credentials.</span>`)
 
 	testCases := map[string]struct {
-		setup         func(fake *fakePureVPN)
-		credentials   Credentials
-		session       Session
-		request       func(request *ServerRequest)
-		ctxTimeout    time.Duration
-		errWrapped    error
-		errNotWrapped error
-		errMessage    string
-		authError     bool
-		captchaError  bool
-		authCookies   map[string]string
-		counters      fakeCounters
+		setup        func(fake *fakePureVPN)
+		credentials  Credentials
+		session      Session
+		request      func(request *ServerRequest)
+		ctxTimeout   time.Duration
+		errWrapped   error
+		errMessage   string
+		authError    bool
+		captchaError bool
+		authCookies  map[string]string
+		counters     fakeCounters
 	}{
 		"password_login": {
 			credentials: credentials,
 			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},
 		"invalid_credentials": {
 			credentials: Credentials{Username: testUsername, Password: "wrong"},
 			errWrapped:  errInvalidCredentials,
 			errMessage:  "Invalid login credentials.",
 			authError:   true,
-			counters:    fakeCounters{passwordLogins: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1},
 		},
 		"captcha_required": {
 			setup:        func(fake *fakePureVPN) { fake.captcha = true },
@@ -445,7 +430,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			errWrapped:   errCaptchaRequired,
 			errMessage:   "Please complete the captcha.",
 			captchaError: true,
-			counters:     fakeCounters{passwordLogins: 1},
+			counters:     fakeCounters{authorizePages: 1, passwordLogins: 1},
 		},
 		"credentials_not_set": {
 			errWrapped: errCredentialsNotSet,
@@ -456,13 +441,13 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: credentials,
 			errWrapped:  errTwoFactorRequired,
 			authError:   true,
-			counters:    fakeCounters{passwordLogins: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1},
 		},
 		"two_factor_with_valid_secret": {
 			setup:       func(fake *fakePureVPN) { fake.twoFactor = true },
 			credentials: credentialsWithTOTP,
 			authCookies: trustedCookies,
-			counters:    fakeCounters{passwordLogins: 1, twoFactorLogins: 1, tokens: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1, tokens: 1},
 		},
 		"two_factor_with_wrong_secret": {
 			setup: func(fake *fakePureVPN) { fake.twoFactor = true },
@@ -472,7 +457,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			errWrapped: errTwoFactorCodeInvalid,
 			errMessage: "Invalid code",
 			authError:  true,
-			counters:   fakeCounters{passwordLogins: 1, twoFactorLogins: 2},
+			counters:   fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 2},
 		},
 		"two_factor_code_rejected_once": {
 			setup: func(fake *fakePureVPN) {
@@ -481,7 +466,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			},
 			credentials: credentialsWithTOTP,
 			authCookies: trustedCookies,
-			counters:    fakeCounters{passwordLogins: 1, twoFactorLogins: 2, tokens: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 2, tokens: 1},
 		},
 		"two_factor_code_retry_blocked": {
 			setup: func(fake *fakePureVPN) {
@@ -492,17 +477,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: credentialsWithTOTP,
 			errWrapped:  errBlocked,
 			errMessage:  "submitting two-factor code",
-			counters:    fakeCounters{passwordLogins: 1, twoFactorLogins: 2},
-		},
-		"two_factor_code_blocked": {
-			setup: func(fake *fakePureVPN) {
-				fake.twoFactor = true
-				fake.blockCodeSubmission = 1
-			},
-			credentials: credentialsWithTOTP,
-			errWrapped:  errBlocked,
-			errMessage:  "submitting two-factor code",
-			counters:    fakeCounters{passwordLogins: 1, twoFactorLogins: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 2},
 		},
 		"two_factor_wait_canceled": {
 			setup: func(fake *fakePureVPN) {
@@ -513,7 +488,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			ctxTimeout:  2 * time.Second,
 			errWrapped:  context.DeadlineExceeded,
 			errMessage:  "waiting for the next two-factor code",
-			counters:    fakeCounters{passwordLogins: 1, twoFactorLogins: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1},
 		},
 		"two_factor_invalid_secret": {
 			setup: func(fake *fakePureVPN) { fake.twoFactor = true },
@@ -521,7 +496,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 				Username: testUsername, Password: testPassword, TOTPSecret: "INVALID1",
 			},
 			errMessage: "generating two-factor code from TOTP secret",
-			counters:   fakeCounters{passwordLogins: 1},
+			counters:   fakeCounters{authorizePages: 1, passwordLogins: 1},
 		},
 		"two_factor_code_page_with_other_method_form": {
 			setup: func(fake *fakePureVPN) {
@@ -530,7 +505,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			},
 			credentials: credentialsWithTOTP,
 			authCookies: trustedCookies,
-			counters:    fakeCounters{passwordLogins: 1, twoFactorLogins: 1, tokens: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1, tokens: 1},
 		},
 		"login_page_after_two_factor_code": {
 			setup: func(fake *fakePureVPN) {
@@ -540,20 +515,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: credentialsWithTOTP,
 			errWrapped:  errUnexpectedResponse,
 			errMessage:  "no access token after logging in, landed on",
-			counters:    fakeCounters{passwordLogins: 1},
-		},
-		"methods_page_after_method_selection": {
-			setup: func(fake *fakePureVPN) {
-				fake.twoFactor = true
-				fake.twoFactorMethods = authenticatorMethod
-				fake.pages = map[string]string{
-					"POST /oauth2/two-factor-methods": fmt.Sprintf(twoFactorMethodsPage, authenticatorMethod),
-				}
-			},
-			credentials: credentialsWithTOTP,
-			errWrapped:  errUnexpectedResponse,
-			errMessage:  "no access token after logging in, landed on",
-			counters:    fakeCounters{passwordLogins: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1},
 		},
 		"unknown_page_after_password": {
 			setup: func(fake *fakePureVPN) {
@@ -562,6 +524,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: credentials,
 			errWrapped:  errUnexpectedResponse,
 			errMessage:  "no access token after logging in, landed on",
+			counters:    fakeCounters{authorizePages: 1},
 		},
 		"two_factor_method_selection": {
 			setup: func(fake *fakePureVPN) {
@@ -570,7 +533,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			},
 			credentials: credentialsWithTOTP,
 			authCookies: trustedCookies,
-			counters:    fakeCounters{passwordLogins: 1, twoFactorLogins: 1, tokens: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1, tokens: 1},
 		},
 		"two_factor_method_unsupported": {
 			setup: func(fake *fakePureVPN) {
@@ -580,319 +543,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: credentialsWithTOTP,
 			errWrapped:  errTwoFactorMethodUnsupported,
 			authError:   true,
-			counters:    fakeCounters{passwordLogins: 1},
-		},
-		"stored_session_without_credentials": {
-			setup:       func(fake *fakePureVPN) { fake.twoFactor = true }, // must not matter
-			session:     Session{AuthCookies: map[string]string{"fusionauth.sso": testSSOCookie}},
-			authCookies: ssoCookies,
-			counters:    fakeCounters{tokens: 1},
-		},
-		"expired_stored_session_falls_back_on_credentials": {
-			credentials: credentials,
-			session: Session{
-				AccessToken: makeJWT(time.Now().Add(-time.Hour), 0),
-				AuthCookies: map[string]string{"fusionauth.sso": "expired"},
-			},
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"expired_stored_session_without_credentials": {
-			session:    Session{AuthCookies: map[string]string{"fusionauth.sso": "expired"}},
-			errWrapped: errSessionExpired,
-			errMessage: "PureVPN account username and password are not set",
-			authError:  true,
-		},
-		"stored_session_with_expired_trusted_device": {
-			setup:       func(fake *fakePureVPN) { fake.twoFactor = true },
-			credentials: credentialsWithTOTP,
-			session:     Session{AuthCookies: map[string]string{"fusionauth.sso": "untrusted"}},
-			authCookies: trustedCookies,
-			counters:    fakeCounters{twoFactorLogins: 1, tokens: 1},
-		},
-		"stored_session_unexpected_response_falls_back_on_credentials": {
-			setup:       func(fake *fakePureVPN) { fake.brokenAuthorizePages = 1 },
-			credentials: credentials,
-			session:     Session{AuthCookies: map[string]string{"fusionauth.sso": "stale"}},
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"stored_session_unexpected_response_without_credentials": {
-			setup:      func(fake *fakePureVPN) { fake.brokenAuthorizePages = 1 },
-			session:    Session{AuthCookies: map[string]string{"fusionauth.sso": "stale"}},
-			errWrapped: errUnexpectedResponse,
-			errMessage: "logging in with stored session",
-		},
-		"rejected_access_token_triggers_login": {
-			credentials: credentials,
-			// The token looks valid locally but the API rejects it.
-			session:     Session{AccessToken: makeJWT(time.Now().Add(time.Hour), 0)},
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"html_api_response_triggers_login": {
-			setup:       func(fake *fakePureVPN) { fake.htmlAPIResponses = 1 },
-			credentials: credentials,
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 2},
-		},
-		"cloudflare_block": {
-			setup:       func(fake *fakePureVPN) { fake.cloudflare = true },
-			credentials: credentials,
-			errWrapped:  errBlocked,
-		},
-		"on_boarding_fallback": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/subscription": {status: http.StatusNotFound}}
-			},
-			credentials: credentials,
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"on_boarding_fallback_error": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{
-					"/v2/api/subscription": {status: http.StatusNotFound},
-					"/v2/api/on-boarding":  serverError,
-				}
-			},
-			credentials: credentials,
-			errWrapped:  errAPI,
-			errMessage:  "requesting subscriptions: PureVPN API error: API returned 404 Not Found",
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"subscription_forbidden_on_boarding_fallback": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/subscription": jsonForbidden}
-			},
-			credentials: credentials,
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"subscription_forbidden_on_boarding_error": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{
-					"/v2/api/subscription": jsonForbidden,
-					"/v2/api/on-boarding":  serverError,
-				}
-			},
-			credentials:   credentials,
-			errWrapped:    errAPI,
-			errNotWrapped: errUnauthorized,
-			errMessage:    "subscriptions endpoint rejected the access token",
-			counters:      fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"subscription_and_on_boarding_forbidden": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{
-					"/v2/api/subscription": jsonForbidden,
-					"/v2/api/on-boarding":  jsonForbidden,
-				}
-			},
-			credentials: credentials,
-			errWrapped:  errUnauthorized,
-			errMessage:  "requesting subscriptions: PureVPN API rejected the access token",
-			// The first access token is rejected, so the client logs in again
-			// with the single sign-on session.
-			counters: fakeCounters{passwordLogins: 1, tokens: 2},
-		},
-		"subscription_blocked": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/subscription": {
-					status: http.StatusForbidden, contentType: "text/html", body: "<html>denied</html>",
-				}}
-			},
-			credentials: credentials,
-			errWrapped:  errBlocked,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"single_server_object": {
-			setup:       func(fake *fakePureVPN) { fake.singleServerObject = true },
-			credentials: credentials,
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"no_active_subscription": {
-			setup: func(fake *fakePureVPN) {
-				fake.subscriptions = []subscription{{ID: "old", State: "expired", VPNUsernames: []string{"x"}}}
-			},
-			credentials: credentials,
-			errWrapped:  errNoActiveSubscription,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"subscription_selected_by_id": {
-			setup: func(fake *fakePureVPN) {
-				fake.subscriptions = []subscription{
-					{ID: "other", State: "active", VPNUsernames: []string{"purevpn0sother"}},
-					{ID: testSubsID, State: "active", VPNUsernames: []string{testVPNUsername}},
-				}
-			},
-			credentials: credentials,
-			request:     func(request *ServerRequest) { request.SubscriptionID = testSubsID },
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"encrypted_password_error": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-encrypt-password": serverError}
-			},
-			credentials: credentials,
-			errWrapped:  errAPI,
-			errMessage:  "getting VPN password",
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"encrypted_password_empty": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-encrypt-password": {
-					status: http.StatusOK, body: `{"status":true,"body":{"encrypPass":""}}`,
-				}}
-			},
-			credentials: credentials,
-			errWrapped:  errUnexpectedResponse,
-			errMessage:  "encrypted password is empty",
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"wireguard_server_error": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-wg-server": serverError}
-			},
-			credentials: credentials,
-			errWrapped:  errAPI,
-			errMessage:  "getting WireGuard server",
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"wireguard_server_invalid_body": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-wg-server": {
-					status: http.StatusOK, body: `{"status":true,"body":"text"}`,
-				}}
-			},
-			credentials: credentials,
-			errWrapped:  errUnexpectedResponse,
-			errMessage:  "decoding server",
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"wireguard_server_list_empty": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-wg-server": {
-					status: http.StatusOK, body: `{"status":true,"body":[]}`,
-				}}
-			},
-			credentials: credentials,
-			errWrapped:  errUnexpectedResponse,
-			errMessage:  "no WireGuard configuration in response",
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"wireguard_configuration_invalid": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-wg-server": {
-					status: http.StatusOK, body: `{"status":true,"body":[{"wireguard_configuration":"[Interface]"}]}`,
-				}}
-			},
-			credentials: credentials,
-			errWrapped:  errUnexpectedResponse,
-			errMessage:  "parsing WireGuard configuration: interface address is missing",
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"login_page_blocked": {
-			setup: func(fake *fakePureVPN) {
-				fake.blocked = map[string]bool{"GET /oauth2/authorize": true}
-			},
-			credentials: credentials,
-			errWrapped:  errBlocked,
-			errMessage:  "loading login page",
-		},
-		"single_sign_on_blocked": {
-			setup: func(fake *fakePureVPN) {
-				fake.blocked = map[string]bool{"GET /oauth2/authorize": true}
-			},
-			credentials: credentials,
-			session:     Session{AuthCookies: ssoCookies},
-			errWrapped:  errBlocked,
-			errMessage:  "logging in with stored session",
-		},
-		"login_form_blocked": {
-			setup: func(fake *fakePureVPN) {
-				fake.blocked = map[string]bool{"POST /oauth2/authorize": true}
-			},
-			credentials: credentials,
-			errWrapped:  errBlocked,
-			errMessage:  "submitting login form",
-		},
-		"two_factor_method_selection_blocked": {
-			setup: func(fake *fakePureVPN) {
-				fake.twoFactor = true
-				fake.twoFactorMethods = authenticatorMethod
-				fake.blocked = map[string]bool{"POST /oauth2/two-factor-methods": true}
-			},
-			credentials: credentialsWithTOTP,
-			errWrapped:  errBlocked,
-			errMessage:  "selecting two-factor method",
-			counters:    fakeCounters{passwordLogins: 1},
-		},
-		"login_form_not_found": {
-			setup: func(fake *fakePureVPN) {
-				fake.pages = map[string]string{"GET /oauth2/authorize": "<html>no form</html>"}
-			},
-			credentials: credentials,
-			errWrapped:  errUnexpectedResponse,
-			errMessage:  "login form not found",
-		},
-		"rejected_access_token_without_credentials": {
-			session:    Session{AccessToken: makeJWT(time.Now().Add(time.Hour), 0)},
-			errWrapped: errCredentialsNotSet,
-			errMessage: "logging in again after access token was rejected",
-			authError:  true,
-		},
-		"subscription_selected_by_vpn_username": {
-			setup: func(fake *fakePureVPN) {
-				fake.subscriptions = []subscription{
-					{ID: "no-username", Status: "active"},
-					{ID: "other", Status: "Active", VPNUsernames: []string{"purevpn0sother"}},
-					{ID: testSubsID, VPNUsernames: []string{"purevpn0sother2", testVPNUsername}},
-				}
-			},
-			credentials: credentials,
-			request:     func(request *ServerRequest) { request.VPNUsername = testVPNUsername },
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"subscription_not_found_without_subscriptions": {
-			setup:       func(fake *fakePureVPN) { fake.subscriptions = []subscription{} },
-			credentials: credentials,
-			request:     func(request *ServerRequest) { request.SubscriptionID = testSubsID },
-			errWrapped:  errSubscriptionNotFound,
-			errMessage:  "available subscriptions are none",
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"no_city_id": {
-			setup:       func(fake *fakePureVPN) { fake.noCityID = true },
-			credentials: credentials,
-			request:     func(request *ServerRequest) { request.CityID = 0 },
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"subscription_invalid_json_falls_back_on_onboarding": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/subscription": {
-					status: http.StatusOK, contentType: "application/json", body: "not json",
-				}}
-			},
-			credentials: credentials,
-			authCookies: ssoCookies,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
-		},
-		"server_with_empty_configuration": {
-			setup: func(fake *fakePureVPN) {
-				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-wg-server": {
-					status: http.StatusOK,
-					body:   `{"status":true,"body":[{"wireguard_configuration":""}]}`,
-				}}
-			},
-			credentials: credentials,
-			errWrapped:  errUnexpectedResponse,
-			errMessage:  "no WireGuard configuration in response",
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1},
 		},
 		"two_factor_methods_page_on_authorize": {
 			// The single sign-on session is valid but the trusted device
@@ -905,14 +556,158 @@ func Test_Client_FetchConfig(t *testing.T) {
 			},
 			credentials: credentialsWithTOTP,
 			authCookies: trustedCookies,
-			counters:    fakeCounters{twoFactorLogins: 1, tokens: 1},
+			counters:    fakeCounters{authorizePages: 1, twoFactorLogins: 1, tokens: 1},
+		},
+		"stored_session_without_credentials": {
+			setup:       func(fake *fakePureVPN) { fake.twoFactor = true }, // must not matter
+			session:     Session{AuthCookies: ssoCookies},
+			authCookies: ssoCookies,
+			counters:    fakeCounters{authorizePages: 1, tokens: 1},
+		},
+		"expired_stored_session_falls_back_on_credentials": {
+			credentials: credentials,
+			session: Session{
+				AccessToken: makeJWT(time.Now().Add(-time.Hour), 0),
+				AuthCookies: map[string]string{"fusionauth.sso": "expired"},
+			},
+			authCookies: ssoCookies,
+			// The login page is only loaded once.
+			counters: fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"expired_stored_session_without_credentials": {
+			session:    Session{AuthCookies: map[string]string{"fusionauth.sso": "expired"}},
+			errWrapped: errSessionExpired,
+			errMessage: "PureVPN account username and password are not set",
+			authError:  true,
+			counters:   fakeCounters{authorizePages: 1},
+		},
+		"stored_session_with_expired_trusted_device": {
+			setup:       func(fake *fakePureVPN) { fake.twoFactor = true },
+			credentials: credentialsWithTOTP,
+			session:     Session{AuthCookies: map[string]string{"fusionauth.sso": "untrusted"}},
+			authCookies: trustedCookies,
+			counters:    fakeCounters{authorizePages: 1, twoFactorLogins: 1, tokens: 1},
+		},
+		"login_form_not_found": {
+			setup: func(fake *fakePureVPN) {
+				fake.pages = map[string]string{"GET /oauth2/authorize": "<html>no form</html>"}
+			},
+			credentials: credentials,
+			session:     Session{AuthCookies: map[string]string{"fusionauth.sso": "stale"}},
+			errWrapped:  errUnexpectedResponse,
+			errMessage:  "login form not found",
+			counters:    fakeCounters{authorizePages: 1},
+		},
+		"rejected_access_token_triggers_login": {
+			credentials: credentials,
+			// The token looks valid locally but the API rejects it.
+			session:     Session{AccessToken: makeJWT(time.Now().Add(time.Hour), 0)},
+			authCookies: ssoCookies,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"rejected_access_token_without_credentials": {
+			session:    Session{AccessToken: makeJWT(time.Now().Add(time.Hour), 0)},
+			errWrapped: errCredentialsNotSet,
+			errMessage: "logging in again after access token was rejected",
+			authError:  true,
+		},
+		"cloudflare_block": {
+			setup:       func(fake *fakePureVPN) { fake.cloudflare = true },
+			credentials: credentials,
+			errWrapped:  errBlocked,
+			errMessage:  "loading login page",
+		},
+		"no_active_subscription": {
+			setup: func(fake *fakePureVPN) {
+				fake.subscriptions = []subscription{{ID: "old", State: "expired", VPNUsernames: []string{"x"}}}
+			},
+			credentials: credentials,
+			errWrapped:  errNoActiveSubscription,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"subscription_selected_by_id": {
+			setup: func(fake *fakePureVPN) {
+				fake.subscriptions = []subscription{
+					{ID: "other", State: "active", VPNUsernames: []string{"purevpn0sother"}},
+					{ID: testSubsID, State: "active", VPNUsernames: []string{testVPNUsername}},
+				}
+			},
+			credentials: credentials,
+			request:     func(request *ServerRequest) { request.SubscriptionID = testSubsID },
+			authCookies: ssoCookies,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"subscription_selected_by_vpn_username": {
+			setup: func(fake *fakePureVPN) {
+				fake.subscriptions = []subscription{
+					{ID: "no-username", State: "active"},
+					{ID: "other", State: "Active", VPNUsernames: []string{"purevpn0sother"}},
+					{ID: testSubsID, State: "active", VPNUsernames: []string{"purevpn0sother2", testVPNUsername}},
+				}
+			},
+			credentials: credentials,
+			request:     func(request *ServerRequest) { request.VPNUsername = testVPNUsername },
+			authCookies: ssoCookies,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"subscription_not_found_without_subscriptions": {
+			setup:       func(fake *fakePureVPN) { fake.subscriptions = []subscription{} },
+			credentials: credentials,
+			request:     func(request *ServerRequest) { request.SubscriptionID = testSubsID },
+			errWrapped:  errSubscriptionNotFound,
+			errMessage:  "available subscriptions are none",
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},
 		"subscription_not_found": {
 			credentials: credentials,
 			request:     func(request *ServerRequest) { request.VPNUsername = "purevpn0sother" },
 			errWrapped:  errSubscriptionNotFound,
-			errMessage:  testVPNUsername,
-			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
+			errMessage: "available subscriptions are expired (expired) with 1 VPN username(s); " +
+				testSubsID + " (active) with 1 VPN username(s)",
+			counters: fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"encrypted_password_empty": {
+			setup: func(fake *fakePureVPN) {
+				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-encrypt-password": {
+					status: http.StatusOK, body: `{"status":true,"body":{"encrypPass":""}}`,
+				}}
+			},
+			credentials: credentials,
+			errWrapped:  errUnexpectedResponse,
+			errMessage:  "getting VPN password: unexpected response from PureVPN: encrypted password is empty",
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"wireguard_server_list_empty": {
+			setup: func(fake *fakePureVPN) {
+				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-wg-server": {
+					status: http.StatusOK, body: `{"status":true,"body":[]}`,
+				}}
+			},
+			credentials: credentials,
+			errWrapped:  errUnexpectedResponse,
+			errMessage:  "getting WireGuard server: unexpected response from PureVPN: no WireGuard configuration",
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"wireguard_server_invalid_protocol_ip": {
+			setup: func(fake *fakePureVPN) {
+				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-wg-server": {
+					status: http.StatusOK,
+					body: `{"status":true,"body":[{"protocol_ip":"not-an-ip","wireguard_configuration":` +
+						`"[Interface]\nAddress=172.21.7.9\n[Peer]\nPublicKey=` + testServerKey +
+						`\nEndpoint=us-ny.purevpn.net:51820\n"}]}`,
+				}}
+			},
+			credentials: credentials,
+			errWrapped:  errUnexpectedResponse,
+			errMessage:  "parsing protocol IP",
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"no_city_id": {
+			setup:       func(fake *fakePureVPN) { fake.noCityID = true },
+			credentials: credentials,
+			request:     func(request *ServerRequest) { request.CityID = 0 },
+			authCookies: ssoCookies,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},
 	}
 
@@ -954,16 +749,13 @@ func Test_Client_FetchConfig(t *testing.T) {
 			if testCase.errMessage != "" {
 				assert.ErrorContains(t, err, testCase.errMessage)
 			}
-			if testCase.errNotWrapped != nil {
-				assert.NotErrorIs(t, err, testCase.errNotWrapped)
-			}
 			assert.Equal(t, testCase.authError, IsAuthError(err))
 			assert.Equal(t, testCase.captchaError, IsCaptchaError(err))
 			assert.Equal(t, testCase.counters, fake.getCounters())
 			if err != nil {
 				return
 			}
-			assert.Equal(t, newExpectedConfig(), config)
+			assert.Equal(t, newExpectedConfig(t), config)
 			session := client.Session()
 			assert.True(t, IsJWT(session.AccessToken))
 			assert.Equal(t, testCase.authCookies, session.AuthCookies)
@@ -979,13 +771,13 @@ func Test_Client_FetchConfig_second_fetch(t *testing.T) {
 		counters          fakeCounters
 	}{
 		"access_token_reused": {
-			counters: fakeCounters{passwordLogins: 1, tokens: 1},
+			counters: fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},
 		"rejected_access_token_single_sign_on": {
 			beforeSecondFetch: func(fake *fakePureVPN) {
 				fake.rejectToken = fake.latestToken
 			},
-			counters: fakeCounters{passwordLogins: 1, tokens: 2},
+			counters: fakeCounters{authorizePages: 2, passwordLogins: 1, tokens: 2},
 		},
 		"rejected_access_token_stale_cookie_ignored": {
 			// The stale access token cookie must not be mistaken
@@ -994,7 +786,7 @@ func Test_Client_FetchConfig_second_fetch(t *testing.T) {
 				fake.rejectToken = fake.latestToken
 				fake.ssoDisabled = true
 			},
-			counters: fakeCounters{passwordLogins: 2, tokens: 2},
+			counters: fakeCounters{authorizePages: 2, passwordLogins: 2, tokens: 2},
 		},
 	}
 
@@ -1019,7 +811,7 @@ func Test_Client_FetchConfig_second_fetch(t *testing.T) {
 
 			config, err := client.FetchConfig(context.Background(), newTestRequest())
 			require.NoError(t, err)
-			assert.Equal(t, newExpectedConfig(), config)
+			assert.Equal(t, newExpectedConfig(t), config)
 			assert.Equal(t, testCase.counters, fake.getCounters())
 			if testCase.counters.tokens > 1 {
 				assert.NotEqual(t, firstToken, client.Session().AccessToken)
@@ -1104,6 +896,18 @@ func Test_Client_apiRequest(t *testing.T) {
 			status: http.StatusOK,
 			body:   `{"status":true,"body":{"value":"x"}}`,
 		},
+		"token_expired": {
+			status:     http.StatusOK,
+			body:       `{"status":false,"message":"Token is expired","error_code":"token_expired","errors":[]}`,
+			errWrapped: errUnauthorized,
+			errMessage: "Token is expired",
+		},
+		"api_error": {
+			status:     http.StatusOK,
+			body:       `{"status":false,"message":"Your subscription has expired","error_code":"other"}`,
+			errWrapped: errAPI,
+			errMessage: "Your subscription has expired",
+		},
 		"unauthorized_status": {
 			status:     http.StatusUnauthorized,
 			errWrapped: errUnauthorized,
@@ -1112,29 +916,28 @@ func Test_Client_apiRequest(t *testing.T) {
 			status:     http.StatusForbidden,
 			headers:    map[string]string{"Content-Type": "application/json"},
 			body:       `{"status":false,"message":"Forbidden"}`,
-			errWrapped: errUnauthorized,
-		},
-		"forbidden_empty": {
-			status:     http.StatusForbidden,
-			errWrapped: errUnauthorized,
+			errWrapped: errAPI,
+			errMessage: "API returned 403 Forbidden: {",
 		},
 		"forbidden_html": {
 			status:     http.StatusForbidden,
 			headers:    map[string]string{"Content-Type": "text/html"},
 			body:       "<html>Access denied</html>",
 			errWrapped: errBlocked,
-		},
-		"forbidden_cloudflare": {
-			status:     http.StatusForbidden,
-			headers:    map[string]string{"Server": "cloudflare", "Content-Type": "text/html"},
-			body:       "<html><title>Attention Required! | Cloudflare</title></html>",
-			errWrapped: errBlocked,
-			errMessage: "Cloudflare returned 403 Forbidden",
+			errMessage: "API returned 403 Forbidden with an HTML page",
 		},
 		"cloudflare_challenge": {
 			status:     http.StatusForbidden,
 			headers:    map[string]string{"Cf-Mitigated": "challenge"},
 			errWrapped: errBlocked,
+			errMessage: "Cloudflare challenge",
+		},
+		"cloudflare_error_page": {
+			status:     http.StatusServiceUnavailable,
+			headers:    map[string]string{"Server": "cloudflare", "Content-Type": "text/html"},
+			body:       `<html><div id="cf-error-details">Error</div></html>`,
+			errWrapped: errBlocked,
+			errMessage: "Cloudflare returned 503 Service Unavailable",
 		},
 		"server_error": {
 			status:     http.StatusInternalServerError,
@@ -1142,40 +945,17 @@ func Test_Client_apiRequest(t *testing.T) {
 			errWrapped: errAPI,
 			errMessage: "oops",
 		},
-		"server_error_long_body": {
-			status:     http.StatusInternalServerError,
-			body:       strings.Repeat("x", 201),
-			errWrapped: errAPI,
-			errMessage: strings.Repeat("x", 200) + "...",
-		},
-		"forbidden_cloudflare_without_marker": {
-			status:     http.StatusForbidden,
-			headers:    map[string]string{"Server": "cloudflare", "Content-Type": "text/html"},
-			body:       "<html>Forbidden</html>",
-			errWrapped: errBlocked,
-			errMessage: "API returned 403 Forbidden with an HTML page",
-		},
-		"html_instead_of_json": {
+		"html_body_with_json_content_type": {
 			status:     http.StatusOK,
-			headers:    map[string]string{"Content-Type": "text/html"},
-			body:       "<html>login</html>",
+			headers:    map[string]string{"Content-Type": "application/json"},
+			body:       "  <html>login</html>",
 			errWrapped: errUnauthorized,
+			errMessage: "API returned an HTML page",
 		},
 		"invalid_json": {
 			status:     http.StatusOK,
 			body:       "not json",
 			errWrapped: errUnexpectedResponse,
-		},
-		"token_expired_message": {
-			status:     http.StatusOK,
-			body:       `{"status":false,"message":"Token expired"}`,
-			errWrapped: errUnauthorized,
-		},
-		"subscription_expired_message": {
-			status:     http.StatusOK,
-			body:       `{"status":false,"message":"Your subscription has expired"}`,
-			errWrapped: errAPI,
-			errMessage: "Your subscription has expired",
 		},
 		"invalid_body": {
 			status:     http.StatusOK,
@@ -1187,40 +967,19 @@ func Test_Client_apiRequest(t *testing.T) {
 			body:    `{"status":true,"body":"text"}`,
 			nilBody: true,
 		},
-		"html_body_with_json_content_type": {
-			status:     http.StatusOK,
-			headers:    map[string]string{"Content-Type": "application/json"},
-			body:       "  <html>login</html>",
-			errWrapped: errUnauthorized,
-			errMessage: "API returned an HTML page",
-		},
-		"cloudflare_service_unavailable": {
-			status:     http.StatusServiceUnavailable,
-			headers:    map[string]string{"Server": "cloudflare", "Content-Type": "text/html"},
-			body:       "<html><div id=\"cf-error-details\">Error</div></html>",
-			errWrapped: errBlocked,
-			errMessage: "Cloudflare returned 503 Service Unavailable",
-		},
-		"cloudflare_too_many_requests": {
-			status:     http.StatusTooManyRequests,
-			headers:    map[string]string{"Server": "cloudflare", "Content-Type": "text/html"},
-			body:       "<html><title>Just a moment...</title></html>",
-			errWrapped: errBlocked,
-			errMessage: "Cloudflare returned 429 Too Many Requests",
-		},
 	}
 
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				assert.Equal(t, "Bearer token", r.Header.Get("Authorization"))
-				assert.Equal(t, "application/json", r.Header.Get("Accept"))
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				assert.Equal(t, "Bearer token", request.Header.Get("Authorization"))
+				assert.Equal(t, "application/json", request.Header.Get("Accept"))
 				for key, value := range testCase.headers {
-					w.Header().Set(key, value)
+					writer.Header().Set(key, value)
 				}
-				w.WriteHeader(testCase.status)
-				fmt.Fprint(w, testCase.body)
+				writer.WriteHeader(testCase.status)
+				fmt.Fprint(writer, testCase.body)
 			}))
 			defer server.Close()
 
@@ -1243,161 +1002,6 @@ func Test_Client_apiRequest(t *testing.T) {
 			}
 		})
 	}
-}
-
-func Test_isAuthMessage(t *testing.T) {
-	t.Parallel()
-
-	testCases := map[string]struct {
-		message string
-		isAuth  bool
-	}{
-		"empty":                   {},
-		"unauthorized":            {message: "Unauthorized", isAuth: true},
-		"unauthorised":            {message: "Request unauthorised", isAuth: true}, //nolint:misspell
-		"not_authenticated":       {message: "User is not authenticated", isAuth: true},
-		"token_expired":           {message: "Token Expired", isAuth: true},
-		"invalid_token":           {message: "Invalid token provided", isAuth: true},
-		"token_is_invalid":        {message: "The token is invalid", isAuth: true},
-		"subscription_expired":    {message: "Your subscription has expired"},
-		"invalid_public_key":      {message: "Invalid public key token"},
-		"session_limit":           {message: "Maximum session limit reached"},
-		"login_country_not_found": {message: "Login server not found for country"},
-	}
-
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			assert.Equal(t, testCase.isAuth, isAuthMessage(testCase.message))
-		})
-	}
-}
-
-func Test_cookieJar(t *testing.T) {
-	t.Parallel()
-
-	const authorizeURL = "https://auth.example.com/oauth2/authorize"
-	testCases := map[string]struct {
-		requestURL    string
-		serverCookies []*http.Cookie
-		expected      map[string][]string
-	}{
-		"same_domain_and_path": {
-			serverCookies: []*http.Cookie{{Name: "fusionauth.sso", Value: "new", Path: "/"}},
-			expected: map[string][]string{
-				"fusionauth.sso":   {"new"},
-				"fusionauth.trust": {"trusted"},
-			},
-		},
-		"parent_domain": {
-			serverCookies: []*http.Cookie{{Name: "fusionauth.sso", Value: "new", Domain: "example.com", Path: "/"}},
-			expected: map[string][]string{
-				"fusionauth.sso":   {"new"},
-				"fusionauth.trust": {"trusted"},
-			},
-		},
-		"other_path": {
-			serverCookies: []*http.Cookie{{Name: "fusionauth.sso", Value: "new", Path: "/oauth2"}},
-			expected: map[string][]string{
-				"fusionauth.sso":   {"new"},
-				"fusionauth.trust": {"trusted"},
-			},
-		},
-		"default_path": {
-			serverCookies: []*http.Cookie{{Name: "fusionauth.sso", Value: "new"}},
-			expected: map[string][]string{
-				"fusionauth.sso":   {"new"},
-				"fusionauth.trust": {"trusted"},
-			},
-		},
-		"default_root_path": {
-			requestURL:    "https://auth.example.com",
-			serverCookies: []*http.Cookie{{Name: "fusionauth.sso", Value: "new"}},
-			expected: map[string][]string{
-				"fusionauth.sso":   {"new"},
-				"fusionauth.trust": {"trusted"},
-			},
-		},
-		"replaced_then_parent_domain": {
-			// The cookie replacing the restored cookie must not be
-			// removed when another cookie with the same name is set.
-			serverCookies: []*http.Cookie{
-				{Name: "fusionauth.sso", Value: "new", Path: "/"},
-				{Name: "fusionauth.sso", Value: "newer", Domain: "example.com", Path: "/"},
-			},
-			expected: map[string][]string{
-				"fusionauth.sso":   {"new", "newer"},
-				"fusionauth.trust": {"trusted"},
-			},
-		},
-		"same_value": {
-			serverCookies: []*http.Cookie{{Name: "fusionauth.sso", Value: "old", Domain: "example.com", Path: "/"}},
-			expected: map[string][]string{
-				"fusionauth.sso":   {"old", "old"},
-				"fusionauth.trust": {"trusted"},
-			},
-		},
-		"rejected_domain": {
-			serverCookies: []*http.Cookie{{Name: "fusionauth.sso", Value: "new", Domain: "other.com", Path: "/"}},
-			expected: map[string][]string{
-				"fusionauth.sso":   {"old"},
-				"fusionauth.trust": {"trusted"},
-			},
-		},
-		"app_host_same_name": {
-			requestURL:    "https://my.example.com/v2/dashboard",
-			serverCookies: []*http.Cookie{{Name: "fusionauth.sso", Value: "new", Domain: "example.com", Path: "/"}},
-			expected: map[string][]string{
-				"fusionauth.sso":   {"old", "new"},
-				"fusionauth.trust": {"trusted"},
-			},
-		},
-		"other_cookie": {
-			serverCookies: []*http.Cookie{{Name: "fusionauth.locale", Value: "en", Path: "/"}},
-			expected: map[string][]string{
-				"fusionauth.sso":    {"old"},
-				"fusionauth.trust":  {"trusted"},
-				"fusionauth.locale": {"en"},
-			},
-		},
-	}
-
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			authURL, err := url.Parse("https://auth.example.com")
-			require.NoError(t, err)
-			rawRequestURL := testCase.requestURL
-			if rawRequestURL == "" {
-				rawRequestURL = authorizeURL
-			}
-			requestURL, err := url.Parse(rawRequestURL)
-			require.NoError(t, err)
-
-			jar, err := newCookieJar(authURL)
-			require.NoError(t, err)
-			jar.restore(map[string]string{"fusionauth.sso": "old", "fusionauth.trust": "trusted"})
-			for _, serverCookie := range testCase.serverCookies {
-				jar.SetCookies(requestURL, []*http.Cookie{serverCookie})
-			}
-
-			checkURL, err := url.Parse(authorizeURL)
-			require.NoError(t, err)
-			cookies := make(map[string][]string)
-			for _, cookie := range jar.Cookies(checkURL) {
-				cookies[cookie.Name] = append(cookies[cookie.Name], cookie.Value)
-			}
-			assert.Equal(t, testCase.expected, cookies)
-		})
-	}
-}
-
-func Test_redactURL(t *testing.T) {
-	t.Parallel()
-
-	fullURL, err := url.Parse("https://user:pass@my.purevpn.com/v2/api/fusionauth/login?code=secret&state=x#top")
-	require.NoError(t, err)
-	assert.Equal(t, "https://my.purevpn.com/v2/api/fusionauth/login", redactURL(fullURL))
 }
 
 func Test_accessTokenValid(t *testing.T) {
@@ -1431,7 +1035,7 @@ func Test_truncate(t *testing.T) {
 	t.Parallel()
 
 	assert.Equal(t, "text", truncate("  text \n"))
-	maxLengthText := strings.Repeat("x", 200)
+	maxLengthText := strings.Repeat("é", 200)
 	assert.Equal(t, maxLengthText, truncate(maxLengthText))
 	assert.Equal(t, maxLengthText+"...", truncate(maxLengthText+"y"))
 }
@@ -1461,40 +1065,6 @@ func Test_Client_readBodyError(t *testing.T) {
 	page, err := client.doAuthRequest(context.Background(), http.MethodGet, DefaultAuthURL, nil)
 	assert.EqualError(t, err, "reading response body: test read error")
 	assert.Nil(t, page)
-}
-
-func Test_Client_apiRequest_requestError(t *testing.T) {
-	t.Parallel()
-
-	errTest := errors.New("test error")
-	httpClient := &http.Client{
-		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return nil, errTest
-		}),
-	}
-	client, err := New(httpClient, "", "", Credentials{}, Session{})
-	require.NoError(t, err)
-
-	err = client.apiRequest(context.Background(), "token", "/v2/api/test", nil, nil)
-
-	assert.ErrorIs(t, err, errTest)
-	assert.EqualError(t, err, `Post "https://my.purevpn.com/v2/api/test": test error`)
-}
-
-func Test_setBrowserHeaders(t *testing.T) {
-	t.Parallel()
-
-	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/", nil)
-	setBrowserHeaders(request)
-	assert.Equal(t, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		request.Header.Get("Accept"))
-	assert.Contains(t, request.Header.Get("User-Agent"), "Mozilla/5.0")
-	assert.Equal(t, "en-US,en;q=0.9", request.Header.Get("Accept-Language"))
-
-	request = httptest.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/", nil)
-	request.Header.Set("Accept", "application/json")
-	setBrowserHeaders(request)
-	assert.Equal(t, "application/json", request.Header.Get("Accept"), "Accept header set must be kept")
 }
 
 type timeoutError struct{}
@@ -1539,69 +1109,13 @@ func Test_wrapRequestError(t *testing.T) {
 	}
 }
 
-func cookiesToStrings(cookies []*http.Cookie) []string {
-	values := make([]string, len(cookies))
-	for i, cookie := range cookies {
-		values[i] = cookie.Name + "=" + cookie.Value
-	}
-	return values
-}
-
-func Test_Client_clearAccessToken(t *testing.T) {
-	t.Parallel()
-
-	testCases := map[string]struct {
-		sessionToken string
-		staleTokens  []string
-	}{
-		"session_token_set": {
-			sessionToken: "session-token",
-			staleTokens:  []string{"session-token", "domain-token"},
-		},
-		"session_token_not_set": {
-			staleTokens: []string{"domain-token"},
-		},
-	}
-
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			client, err := New(&http.Client{}, "https://auth.example.com", "https://app.example.com",
-				Credentials{}, Session{AccessToken: testCase.sessionToken})
-			require.NoError(t, err)
-			client.jar.SetCookies(client.appURL, []*http.Cookie{
-				{Name: accessToken, Value: "", Path: "/"},
-				// A cookie set with a Domain attribute cannot be removed
-				// by setting an expired host-only cookie.
-				{Name: accessToken, Value: "domain-token", Domain: "example.com", Path: "/"},
-				{Name: "other", Value: "x", Path: "/"},
-			})
-
-			// The empty access token cookie is ignored.
-			assert.Equal(t, "domain-token", client.getAccessTokenCookie())
-
-			client.clearAccessToken()
-
-			assert.Equal(t, testCase.staleTokens, client.staleTokens)
-			assert.Empty(t, client.session.AccessToken)
-			assert.ElementsMatch(t, []string{accessToken + "=domain-token", "other=x"},
-				cookiesToStrings(client.jar.Cookies(client.appURL)))
-			assert.Empty(t, client.getAccessTokenCookie(), "stale access token must be ignored")
-
-			client.jar.SetCookies(client.appURL, []*http.Cookie{{Name: accessToken, Value: "fresh", Path: "/"}})
-			assert.Equal(t, "fresh", client.getAccessTokenCookie())
-		})
-	}
-}
-
 func Test_Client_saveSession(t *testing.T) {
 	t.Parallel()
 
 	client, err := New(&http.Client{}, "https://auth.example.com", "https://app.example.com",
 		Credentials{}, Session{})
 	require.NoError(t, err)
-	client.jar.SetCookies(client.authURL, []*http.Cookie{
+	client.httpClient.Jar.SetCookies(client.authURL, []*http.Cookie{
 		{Name: "fusionauth.sso", Value: "general", Path: "/"},
 		{Name: "fusionauth.sso", Value: "specific", Path: "/oauth2"},
 		{Name: "fusionauth.trust", Value: "trusted", Path: "/"},
@@ -1666,6 +1180,50 @@ func Test_joinURL(t *testing.T) {
 			base, err := url.Parse(testCase.base)
 			require.NoError(t, err)
 			assert.Equal(t, testCase.expected, joinURL(base, testCase.path).String())
+		})
+	}
+}
+
+func Test_Session_WithSessionToken(t *testing.T) {
+	t.Parallel()
+
+	jwt := makeJWT(time.Unix(1_000_000, 0), 0)
+	testCases := map[string]struct {
+		session  Session
+		token    string
+		expected Session
+	}{
+		"jwt_on_empty_session": {
+			token:    jwt,
+			expected: Session{AccessToken: jwt},
+		},
+		"jwt_keeps_cookies": {
+			session:  Session{AccessToken: "old", AuthCookies: map[string]string{"fusionauth.trust": "trusted"}},
+			token:    jwt,
+			expected: Session{AccessToken: jwt, AuthCookies: map[string]string{"fusionauth.trust": "trusted"}},
+		},
+		"sso_cookie_on_empty_session": {
+			token:    "sso",
+			expected: Session{AuthCookies: map[string]string{"fusionauth.sso": "sso"}},
+		},
+		"sso_cookie_clears_access_token": {
+			session: Session{AccessToken: "old", AuthCookies: map[string]string{
+				"fusionauth.sso": "old", "fusionauth.trust": "trusted",
+			}},
+			token: "sso",
+			expected: Session{AuthCookies: map[string]string{
+				"fusionauth.sso": "sso", "fusionauth.trust": "trusted",
+			}},
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			originalCookies := maps.Clone(testCase.session.AuthCookies)
+			updated := testCase.session.WithSessionToken(testCase.token)
+			assert.Equal(t, testCase.expected, updated)
+			assert.Equal(t, originalCookies, testCase.session.AuthCookies, "session given must not be modified")
 		})
 	}
 }

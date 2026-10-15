@@ -19,7 +19,7 @@ type Config struct {
 	// Addresses are the interface addresses assigned to the client.
 	Addresses []netip.Prefix
 	// ServerPublicKey is the WireGuard public key of the server.
-	ServerPublicKey string
+	ServerPublicKey wgtypes.Key
 	// EndpointHost is the server endpoint host, either an IP
 	// address or a hostname.
 	EndpointHost string
@@ -29,20 +29,21 @@ type Config struct {
 	// and is zero if not set.
 	PersistentKeepalive time.Duration
 	// ProtocolIP is the server IP address, given separately
-	// from the configuration, and can be empty.
-	ProtocolIP string
+	// from the configuration, and is invalid if not given.
+	ProtocolIP netip.Addr
 }
 
-// EndpointIP returns the endpoint IP address if the endpoint host
-// or the protocol IP is an IP address.
+// EndpointIP returns the protocol IP if it is set, or else the
+// endpoint host if it is an IP address.
 func (c Config) EndpointIP() (ip netip.Addr, ok bool) {
-	for _, candidate := range [...]string{c.ProtocolIP, c.EndpointHost} {
-		ip, err := netip.ParseAddr(strings.TrimSpace(candidate))
-		if err == nil {
-			return ip.Unmap(), true
-		}
+	if c.ProtocolIP.IsValid() {
+		return c.ProtocolIP, true
 	}
-	return netip.Addr{}, false
+	ip, err := netip.ParseAddr(c.EndpointHost)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return ip.Unmap(), true
 }
 
 var (
@@ -78,8 +79,7 @@ func parseConfig(content string) (config Config, err error) {
 		case "interface.address":
 			config.Addresses, err = parseAddresses(value)
 		case "peer.publickey":
-			config.ServerPublicKey = value
-			_, err = wgtypes.ParseKey(value)
+			config.ServerPublicKey, err = wgtypes.ParseKey(value)
 		case "peer.endpoint":
 			config.EndpointHost, config.EndpointPort, err = parseEndpoint(value)
 		case "peer.persistentkeepalive":
@@ -95,7 +95,7 @@ func parseConfig(content string) (config Config, err error) {
 	switch {
 	case len(config.Addresses) == 0:
 		return Config{}, errAddressMissing
-	case config.ServerPublicKey == "":
+	case config.ServerPublicKey == wgtypes.Key{}:
 		return Config{}, errPublicKeyMissing
 	case config.EndpointHost == "":
 		return Config{}, errEndpointMissing

@@ -47,6 +47,9 @@ var (
 	errSubscriptionNotFound = errors.New("PureVPN subscription not found")
 	// errAPI is returned when the API answers with an error status.
 	errAPI = errors.New("PureVPN API error")
+	// errHostNotAllowed is returned when a redirect or a form would send
+	// a request to a host other than the PureVPN auth and app hosts.
+	errHostNotAllowed = errors.New("host not allowed")
 	// errUnexpectedResponse is returned when a response does not have
 	// the expected format, usually because PureVPN changed its website.
 	errUnexpectedResponse = errors.New("unexpected response from PureVPN")

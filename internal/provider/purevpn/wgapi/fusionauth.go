@@ -24,37 +24,18 @@ func (c *Client) authorizeURL() *url.URL {
 	return authorizeURL
 }
 
-// loginWithSSO uses the single sign-on session cookie to get
-// a new access token without the account credentials.
-// It returns errSessionExpired if the session is no longer valid.
-func (c *Client) loginWithSSO(ctx context.Context) (token string, err error) {
-	page, err := c.doAuthRequest(ctx, http.MethodGet, c.authorizeURL().String(), nil)
-	if err != nil {
-		return "", err
-	}
-
-	token = c.getAccessTokenCookie()
-	if token != "" {
-		return token, nil
-	}
-
-	if page.findForm(isLoginForm) != nil || page.findForm(isTwoFactorForm) != nil {
-		return "", errSessionExpired
-	}
-	return "", fmt.Errorf("%w: no access token after single sign-on redirect to %s",
-		errUnexpectedResponse, redactURL(page.url))
-}
-
-// loginWithCredentials logs in using the account username, password
-// and, if needed, a two-factor code generated from the TOTP secret.
-func (c *Client) loginWithCredentials(ctx context.Context) (token string, err error) {
+// authenticate gets a new access token, through the single sign-on
+// session cookie if it is still valid, or else by logging in with the
+// account username, password and, if needed, a two-factor code
+// generated from the TOTP secret.
+func (c *Client) authenticate(ctx context.Context) (token string, err error) {
 	page, err := c.doAuthRequest(ctx, http.MethodGet, c.authorizeURL().String(), nil)
 	if err != nil {
 		return "", fmt.Errorf("loading login page: %w", err)
 	}
 
 	token = c.getAccessTokenCookie()
-	if token != "" { // already logged in through a cookie
+	if token != "" { // logged in through the single sign-on session
 		return token, nil
 	}
 
@@ -68,6 +49,9 @@ func (c *Client) loginWithCredentials(ctx context.Context) (token string, err er
 		// trusted device cookie expired, so go straight to two-factor.
 	case loginForm == nil:
 		return "", fmt.Errorf("%w: login form not found at %s", errUnexpectedResponse, redactURL(page.url))
+	case !c.credentialsSet():
+		// The login form is only shown without a valid single sign-on session.
+		return "", fmt.Errorf("%w and %w", errSessionExpired, errCredentialsNotSet)
 	default:
 		page, err = c.submitLoginForm(ctx, page, loginForm)
 		if err != nil {
@@ -164,7 +148,8 @@ func (c *Client) submitTwoFactorCode(ctx context.Context, page *htmlPage) (*html
 	if err != nil {
 		return nil, err
 	}
-	if !twoFactorCodeRejected(page) {
+	// The two-factor code form is shown again if the code is rejected.
+	if page.findForm(isTwoFactorForm) == nil {
 		return page, nil
 	}
 
@@ -180,7 +165,7 @@ func (c *Client) submitTwoFactorCode(ctx context.Context, page *htmlPage) (*html
 	if err != nil {
 		return nil, err
 	}
-	if twoFactorCodeRejected(page) {
+	if page.findForm(isTwoFactorForm) != nil {
 		return nil, fmt.Errorf("%w: %s", errTwoFactorCodeInvalid, page.errorMessage())
 	}
 	return page, nil
@@ -205,13 +190,6 @@ func (c *Client) submitTwoFactorCodeAt(ctx context.Context, page *htmlPage,
 		return nil, fmt.Errorf("submitting two-factor code: %w", err)
 	}
 	return page, nil
-}
-
-// twoFactorCodeRejected returns true if the page given, returned after
-// submitting a two-factor code, shows the two-factor code form again.
-// Note the page has no form if the login succeeded.
-func twoFactorCodeRejected(page *htmlPage) bool {
-	return page.findForm(isTwoFactorForm) != nil
 }
 
 // waitFor waits for the duration given or until the context is canceled.
@@ -262,6 +240,11 @@ func (c *Client) submitForm(ctx context.Context, page *htmlPage,
 	if err != nil {
 		return nil, fmt.Errorf("parsing form action: %w", err)
 	}
+	// The form action comes from the page, and must not
+	// send the credentials to another host.
+	if action.Scheme != c.authURL.Scheme || action.Host != c.authURL.Host {
+		return nil, fmt.Errorf("form action: %w: %s", errHostNotAllowed, action.Host)
+	}
 	return c.doAuthRequest(ctx, http.MethodPost, action.String(), values)
 }
 
@@ -270,13 +253,7 @@ func (c *Client) submitForm(ctx context.Context, page *htmlPage,
 func (c *Client) doAuthRequest(ctx context.Context, method, rawURL string,
 	form url.Values,
 ) (page *htmlPage, err error) {
-	var body *strings.Reader
-	if form != nil {
-		body = strings.NewReader(form.Encode())
-	} else {
-		body = strings.NewReader("")
-	}
-	request, err := http.NewRequestWithContext(ctx, method, rawURL, body)
+	request, err := http.NewRequestWithContext(ctx, method, rawURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}

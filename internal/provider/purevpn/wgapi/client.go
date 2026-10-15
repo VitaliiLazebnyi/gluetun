@@ -9,8 +9,8 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
-	"slices"
 	"strings"
 	"time"
 )
@@ -52,25 +52,41 @@ type Session struct {
 	AuthCookies map[string]string `json:"auth_cookies,omitempty"`
 }
 
+// WithSessionToken returns a copy of the session using the session
+// token given. A JWT token is used as the access token, and any other
+// token is used as the fusionauth.sso single sign-on cookie, in which
+// case the access token from the previous single sign-on session is
+// cleared. Other authentication cookies are kept.
+func (s Session) WithSessionToken(token string) Session {
+	updated := Session{AccessToken: s.AccessToken, AuthCookies: maps.Clone(s.AuthCookies)}
+	if IsJWT(token) {
+		updated.AccessToken = token
+		return updated
+	}
+	if updated.AuthCookies == nil {
+		updated.AuthCookies = make(map[string]string, 1)
+	}
+	updated.AuthCookies["fusionauth.sso"] = token
+	updated.AccessToken = ""
+	return updated
+}
+
 // Client is a PureVPN member area API client.
 // It is not safe for concurrent use.
 type Client struct {
+	// httpClient is a copy of the HTTP client given to [New],
+	// with its cookie jar replaced on each login.
 	httpClient  *http.Client
-	jar         *cookieJar
 	authURL     *url.URL
 	appURL      *url.URL
 	credentials Credentials
 	timeNow     func() time.Time
 
 	session Session
-	// staleTokens are access tokens which must not be
-	// considered as the result of the current login.
-	staleTokens []string
 }
 
-// New creates a new client using the HTTP client given, which should
-// not follow redirects differently than the default policy.
-// A cookie jar is set on a copy of the HTTP client given.
+// New creates a new client using a copy of the HTTP client given,
+// which refuses redirects to hosts other than the auth and app hosts.
 // authURL and appURL can be left empty to use the defaults.
 func New(httpClient *http.Client, authURL, appURL string,
 	credentials Credentials, session Session,
@@ -94,16 +110,39 @@ func New(httpClient *http.Client, authURL, appURL string,
 		return nil, fmt.Errorf("parsing app URL: %w", err)
 	}
 
-	client.jar, err = newCookieJar(client.authURL)
-	if err != nil {
-		return nil, fmt.Errorf("creating cookie jar: %w", err)
-	}
 	httpClientCopy := *httpClient
-	httpClientCopy.Jar = client.jar
+	httpClientCopy.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		err := client.checkHost(request.URL)
+		switch {
+		case err != nil:
+			return fmt.Errorf("redirect: %w", err)
+		case httpClient.CheckRedirect != nil:
+			return httpClient.CheckRedirect(request, via)
+		}
+		const maxRedirects = 10
+		if len(via) >= maxRedirects {
+			return fmt.Errorf("%w: stopped after %d redirects", errUnexpectedResponse, maxRedirects)
+		}
+		return nil
+	}
+	// The cookie jar is replaced on each login.
+	httpClientCopy.Jar = newCookieJar(client.authURL, nil)
 	client.httpClient = &httpClientCopy
-	client.setSession(session)
+	client.session = Session{AccessToken: session.AccessToken, AuthCookies: maps.Clone(session.AuthCookies)}
 
 	return client, nil
+}
+
+// checkHost returns an error if the URL given is not on the scheme
+// and host of the auth URL or of the app URL, so the credentials and
+// the access token are never sent elsewhere.
+func (c *Client) checkHost(target *url.URL) error {
+	for _, allowed := range [...]*url.URL{c.authURL, c.appURL} {
+		if target.Scheme == allowed.Scheme && target.Host == allowed.Host {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s", errHostNotAllowed, target.Host)
 }
 
 // Session returns a copy of the current session.
@@ -111,9 +150,17 @@ func (c *Client) Session() Session {
 	return Session{AccessToken: c.session.AccessToken, AuthCookies: maps.Clone(c.session.AuthCookies)}
 }
 
-func (c *Client) setSession(session Session) {
-	c.session = Session{AccessToken: session.AccessToken, AuthCookies: maps.Clone(session.AuthCookies)}
-	c.jar.restore(session.AuthCookies)
+// newCookieJar returns a cookie jar holding the auth cookies given,
+// set as host-only cookies with the path "/" for the auth URL,
+// which is how the auth server sets them.
+func newCookieJar(authURL *url.URL, authCookies map[string]string) *cookiejar.Jar {
+	jar, _ := cookiejar.New(nil) // never returns an error
+	cookies := make([]*http.Cookie, 0, len(authCookies))
+	for name, value := range authCookies {
+		cookies = append(cookies, &http.Cookie{Name: name, Value: value, Path: "/"})
+	}
+	jar.SetCookies(authURL, cookies)
+	return jar
 }
 
 // saveSession records the current access token and auth cookies
@@ -122,7 +169,7 @@ func (c *Client) saveSession(token string) {
 	c.session.AccessToken = token
 	authCookies := make(map[string]string)
 	// Cookies are sorted with the most specific path first.
-	for _, cookie := range c.jar.Cookies(joinURL(c.authURL, "/oauth2/authorize")) {
+	for _, cookie := range c.httpClient.Jar.Cookies(joinURL(c.authURL, "/oauth2/authorize")) {
 		_, alreadySet := authCookies[cookie.Name]
 		if !strings.HasPrefix(cookie.Name, "fusionauth.") || alreadySet {
 			continue
@@ -244,34 +291,15 @@ func redactURL(fullURL *url.URL) string {
 	return redacted.String()
 }
 
-// getAccessTokenCookie returns the access token cookie value,
-// ignoring stale access tokens.
+// getAccessTokenCookie returns the access token cookie value
+// from the cookie jar of the current login.
 func (c *Client) getAccessTokenCookie() string {
-	for _, cookie := range c.jar.Cookies(c.appURL) {
-		if cookie.Name == accessToken && cookie.Value != "" &&
-			!slices.Contains(c.staleTokens, cookie.Value) {
+	for _, cookie := range c.httpClient.Jar.Cookies(c.appURL) {
+		if cookie.Name == accessToken && cookie.Value != "" {
 			return cookie.Value
 		}
 	}
 	return ""
-}
-
-// clearAccessToken removes the access token cookie from the cookie jar,
-// and records the current access tokens as stale, in case the cookie
-// cannot be removed since it was set with a Domain attribute or a
-// non root path.
-func (c *Client) clearAccessToken() {
-	c.staleTokens = c.staleTokens[:0]
-	if c.session.AccessToken != "" {
-		c.staleTokens = append(c.staleTokens, c.session.AccessToken)
-	}
-	for _, cookie := range c.jar.Cookies(c.appURL) {
-		if cookie.Name == accessToken && cookie.Value != "" {
-			c.staleTokens = append(c.staleTokens, cookie.Value)
-		}
-	}
-	c.session.AccessToken = ""
-	c.jar.SetCookies(c.appURL, []*http.Cookie{{Name: accessToken, Path: "/", MaxAge: -1}})
 }
 
 // ensureAccessToken returns a valid access token, logging in if needed.
@@ -282,38 +310,28 @@ func (c *Client) ensureAccessToken(ctx context.Context) (token string, err error
 	return c.login(ctx)
 }
 
-// login obtains a new access token, first using the stored single sign-on
-// session if any, and then falling back on the account credentials.
+// login obtains a new access token, using the stored single sign-on
+// session if it is still valid, and the account credentials otherwise.
+// It uses a new cookie jar holding only the stored auth cookies, so an
+// access token cookie from a previous login cannot be mistaken for the
+// result of this login.
 func (c *Client) login(ctx context.Context) (token string, err error) {
-	c.clearAccessToken()
-	credentialsSet := c.credentials.Username != "" && c.credentials.Password != ""
-	if len(c.session.AuthCookies) > 0 {
-		token, err = c.loginWithSSO(ctx)
-		switch {
-		case err == nil:
-			c.saveSession(token)
-			return token, nil
-		case errors.Is(err, errSessionExpired),
-			errors.Is(err, errUnexpectedResponse) && credentialsSet:
-			// Fall back on the credentials.
-		default:
-			return "", fmt.Errorf("logging in with stored session: %w", err)
-		}
-	}
-
-	if !credentialsSet {
-		if len(c.session.AuthCookies) > 0 {
-			return "", fmt.Errorf("%w and %w", errSessionExpired, errCredentialsNotSet)
-		}
+	c.session.AccessToken = ""
+	if !c.credentialsSet() && len(c.session.AuthCookies) == 0 {
 		return "", errCredentialsNotSet
 	}
+	c.httpClient.Jar = newCookieJar(c.authURL, c.session.AuthCookies)
 
-	token, err = c.loginWithCredentials(ctx)
+	token, err = c.authenticate(ctx)
 	if err != nil {
 		return "", err
 	}
 	c.saveSession(token)
 	return token, nil
+}
+
+func (c *Client) credentialsSet() bool {
+	return c.credentials.Username != "" && c.credentials.Password != ""
 }
 
 // joinURL joins the absolute path given to the base URL, making
