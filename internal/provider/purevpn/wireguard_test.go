@@ -174,7 +174,7 @@ func testVPNSettings(sessionToken, privateKey string) settings.VPN {
 			Password:       new(""),
 			TOTPSecret:     new(""),
 			SessionToken:   new(sessionToken),
-			CityID:         new(uint(8778)),
+			CityID:         new(uint32(8778)),
 			SubscriptionID: new(""),
 			VPNUsername:    new(""),
 		},
@@ -441,7 +441,7 @@ func Test_settingsFingerprint(t *testing.T) {
 		"password":        func(s *settings.PureVPN) { s.Password = new("password") },
 		"totp_secret":     func(s *settings.PureVPN) { s.TOTPSecret = new("JBSWY3DP") },
 		"session_token":   func(s *settings.PureVPN) { s.SessionToken = new("other") },
-		"city_id":         func(s *settings.PureVPN) { s.CityID = new(uint(1)) },
+		"city_id":         func(s *settings.PureVPN) { s.CityID = new(uint32(1)) },
 		"subscription_id": func(s *settings.PureVPN) { s.SubscriptionID = new("s2") },
 		"vpn_username":    func(s *settings.PureVPN) { s.VPNUsername = new("purevpn0s2") },
 	}

@@ -135,7 +135,7 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	logger.Info("fetching Wireguard configuration from PureVPN for " + location)
 	config, err := client.FetchConfig(ctx, wgapi.ServerRequest{
 		CountryCode:     countryCode,
-		CityID:          uint32(*purevpnSettings.CityID), //nolint:gosec
+		CityID:          *purevpnSettings.CityID,
 		SubscriptionID:  *purevpnSettings.SubscriptionID,
 		VPNUsername:     *purevpnSettings.VPNUsername,
 		ClientPublicKey: publicKey,
@@ -211,7 +211,7 @@ func settingsFingerprint(purevpnSettings settings.PureVPN, countryCode string) s
 	return hex.EncodeToString(hash[:])
 }
 
-func describeLocation(countryCode string, cityID uint) string {
+func describeLocation(countryCode string, cityID uint32) string {
 	if cityID == 0 {
 		return "country " + countryCode
 	}

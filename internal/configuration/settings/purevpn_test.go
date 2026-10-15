@@ -198,7 +198,7 @@ func Test_PureVPN_toLinesNode(t *testing.T) {
 		Password:       new("password"),
 		TOTPSecret:     new("JBSWY3DPEHPK3PXP"),
 		SessionToken:   new("sessiontoken"),
-		CityID:         new(uint(1234)),
+		CityID:         new(uint32(1234)),
 		SubscriptionID: new("sub-1"),
 		VPNUsername:    new("purevpn0s123"),
 	}
@@ -239,7 +239,7 @@ func Test_PureVPN_read(t *testing.T) {
 		Password:       new("PassWord"),
 		TOTPSecret:     new("JBSWY3DPEHPK3PXP"),
 		SessionToken:   new("TokenValue"),
-		CityID:         new(uint(1234)),
+		CityID:         new(uint32(1234)),
 		SubscriptionID: new("Sub-1"),
 		VPNUsername:    new("PureVPN0s123"),
 	}

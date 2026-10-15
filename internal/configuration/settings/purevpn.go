@@ -36,7 +36,7 @@ type PureVPN struct {
 	// country set with the server selection countries filter.
 	// It can be 0 to let PureVPN pick a city in the country,
 	// and cannot be nil in the internal state.
-	CityID *uint `json:"city_id"`
+	CityID *uint32 `json:"city_id"`
 	// SubscriptionID is the subscription ID to use if the account
 	// has more than one subscription. It can be the empty string
 	// to use the first active subscription.
@@ -136,7 +136,7 @@ func (p *PureVPN) read(r *reader.Reader) (err error) {
 	p.Password = r.Get("PUREVPN_PASSWORD", reader.ForceLowercase(false))
 	p.TOTPSecret = r.Get("PUREVPN_TOTP_SECRET", reader.ForceLowercase(false))
 	p.SessionToken = r.Get("PUREVPN_SESSION_TOKEN", reader.ForceLowercase(false))
-	p.CityID, err = r.UintPtr("PUREVPN_CITY_ID")
+	p.CityID, err = r.Uint32Ptr("PUREVPN_CITY_ID")
 	if err != nil {
 		return err
 	}
