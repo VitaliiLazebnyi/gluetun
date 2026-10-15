@@ -11,6 +11,7 @@ import (
 	"github.com/qdm12/gluetun/internal/models"
 	"github.com/qdm12/gluetun/internal/netlink"
 	"github.com/qdm12/gluetun/internal/provider"
+	"github.com/qdm12/gluetun/internal/restrictednet"
 	"github.com/qdm12/gluetun/internal/wireguard"
 	"github.com/qdm12/gosettings"
 )
@@ -18,18 +19,18 @@ import (
 // setupWireguard sets Wireguard up using the configurators and settings given.
 // It returns a serverName for port forwarding (PIA) and an error if it fails.
 func setupWireguard(ctx context.Context, netlinker NetLinker,
-	fw Firewall, providerConf provider.Provider,
+	fw Firewall, restrictedNet *restrictednet.Client, providerConf provider.Provider,
 	settings settings.VPN, ipv6SupportLevel netlink.IPv6SupportLevel, logger wireguard.Logger) (
 	wireguarder *wireguard.Wireguard, connection models.Connection, err error,
 ) {
 	ipv6Internet := ipv6SupportLevel == netlink.IPv6Internet
-	fetcher, ok := providerConf.(wireguardConnectionFetcher)
+	fetcher, ok := providerConf.(WireguardFetcher)
 	if ok {
 		// The Wireguard configuration is generated at runtime by the
 		// provider, notably PureVPN, so it is fetched on each connection
 		// attempt, which also takes care of logging in again if needed.
 		connection, settings.Wireguard, err = fetchWireguardConnection(ctx, fetcher,
-			settings, fw, ipv6SupportLevel.IsSupported(), logger)
+			settings, restrictedNet, ipv6SupportLevel.IsSupported(), logger)
 		if err != nil {
 			return nil, models.Connection{}, fmt.Errorf("fetching Wireguard connection: %w", err)
 		}
@@ -63,11 +64,11 @@ func setupWireguard(ctx context.Context, netlinker NetLinker,
 // and returns the connection and the Wireguard settings to use, with the
 // private key, interface addresses and, if not set by the user, persistent
 // keepalive interval given by the provider.
-func fetchWireguardConnection(ctx context.Context, fetcher wireguardConnectionFetcher,
-	vpnSettings settings.VPN, fw wireguardFetcherFirewall, ipv6Supported bool,
-	logger wireguardFetcherLogger,
+func fetchWireguardConnection(ctx context.Context, fetcher WireguardFetcher,
+	vpnSettings settings.VPN, restrictedNet *restrictednet.Client, ipv6Supported bool,
+	logger wireguard.Logger,
 ) (connection models.Connection, wireguardSettings settings.Wireguard, err error) {
-	fetched, err := fetcher.FetchWireguardConnection(ctx, vpnSettings, fw, logger)
+	fetched, err := fetcher.FetchWireguardConnection(ctx, vpnSettings, restrictedNet, logger)
 	if err != nil {
 		return models.Connection{}, settings.Wireguard{}, err
 	}
@@ -87,6 +88,9 @@ func fetchWireguardConnection(ctx context.Context, fetcher wireguardConnectionFe
 	wireguardSettings = vpnSettings.Wireguard
 	wireguardSettings.PrivateKey = &fetched.PrivateKey
 	wireguardSettings.Addresses = fetched.Addresses
+	// The settings defaults set an unset persistent keepalive interval to 0,
+	// so a user set interval of 0 cannot be told apart from an unset one,
+	// and is overridden by the provider interval.
 	if *wireguardSettings.PersistentKeepaliveInterval == 0 {
 		wireguardSettings.PersistentKeepaliveInterval = &fetched.PersistentKeepalive
 	}

@@ -34,7 +34,6 @@ type chainRule struct {
 	tcpFlags        tcpFlags
 	mark            mark
 	connMark        mark
-	cgroupPath      string // cgroup v2 path matched, or "" for no cgroup match
 	setMark         uint
 	rejectWith      string // for example "tcp-reset", only used for REJECT targets
 }
@@ -289,10 +288,6 @@ func parseChainRuleOptionalFields(optionalFields []string, rule *chainRule) (err
 			}
 			rule.mark = mark
 			i += consumed
-		case "cgroup":
-			i++
-			rule.cgroupPath = firstField(optionalFields[i:]) // for example "/"
-			i++
 		case "reject-with":
 			i++
 			rule.rejectWith = optionalFields[i] // for example "tcp-reset"
@@ -529,13 +524,4 @@ func parseMetricSize(size string) (n uint64, err error) {
 	}
 	n *= multiplier
 	return n, nil
-}
-
-// firstField returns the first field of the fields given,
-// or the empty string if there is no field.
-func firstField(fields []string) string {
-	if len(fields) == 0 {
-		return ""
-	}
-	return fields[0]
 }

@@ -68,7 +68,7 @@ func (c *Config) runIP6tablesInstructionNoSave(ctx context.Context, instruction 
 	}
 
 	if isDeleteMatchInstruction(instruction) {
-		return deleteIPTablesRule(ctx, c.ip6Tables, instruction, instruction,
+		return deleteIPTablesRule(ctx, c.ip6Tables, instruction,
 			c.runner, c.logger)
 	}
 

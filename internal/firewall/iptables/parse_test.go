@@ -125,18 +125,6 @@ func Test_parseIptablesInstruction(t *testing.T) {
 				rejectWith: "tcp-reset",
 			},
 		},
-		"udp_and_cgroup_matches": {
-			s: "-A OUTPUT -p udp -m udp --dport 53 -m cgroup --path /docker -j ACCEPT",
-			instruction: iptablesInstruction{
-				table:           "filter",
-				chain:           "OUTPUT",
-				operation:       opAppend,
-				protocol:        "udp",
-				destinationPort: 53,
-				cgroupPath:      "/docker",
-				target:          "ACCEPT",
-			},
-		},
 		"connmark_match_missing_value": {
 			s: "-A OUTPUT -m connmark --mark",
 			errMessage: `parsing "-A OUTPUT -m connmark --mark": parsing match module: ` +

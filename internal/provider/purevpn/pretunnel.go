@@ -1,260 +1,76 @@
 package purevpn
 
 import (
-	"context"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
-	"net/netip"
-	"net/url"
-	"slices"
-	"strconv"
-	"syscall"
-	"time"
-
-	dnsprovider "github.com/qdm12/dns/v2/pkg/provider"
-	"github.com/qdm12/gluetun/internal/constants"
-	"github.com/qdm12/gluetun/internal/provider/purevpn/wgapi"
+	"sync"
 )
 
-// newPreTunnelMark returns a random mark to set on sockets used before
-// the VPN is up, so the temporary firewall rules only accept packets from
-// these sockets, and not from other programs sharing the network namespace,
-// such as containers using `network_mode: service:gluetun`.
-// Setting a socket mark requires the CAP_NET_ADMIN capability or, since
-// Linux 5.17, the CAP_NET_RAW capability which Docker grants by default,
-// and reading the mark of another socket or the firewall rules requires
-// the CAP_NET_ADMIN capability. The mark is therefore random and changes
-// on each fetch, so a program with CAP_NET_RAW but without CAP_NET_ADMIN
-// cannot guess it. The firewall rules also match the cgroup of gluetun
-// if supported, so the mark cannot be brute forced by other containers.
-// It must differ from other marks used: 0x567 (kill switch connection mark),
-// 4545 (TCP path MTU discovery) and 51820 (Wireguard).
-func newPreTunnelMark(randomUint32 func() uint32) (mark uint32) {
-	for {
-		mark = randomUint32()
-		const killSwitchMark = 0x567
-		const pmtudMark = 4545
-		const wireguardMark = 51820
-		switch mark {
-		case 0, killSwitchMark, pmtudMark, wireguardMark:
-			continue
-		}
-		return mark
+// restrictedTransport is an [http.RoundTripper] reaching HTTPS hosts before
+// the VPN is up, through the restricted network temporary firewall rules.
+// Each request uses its own connection and firewall rule, since a restricted
+// network HTTP client dials only once, and requests can go to different hosts,
+// for example when following redirects between the PureVPN websites.
+type restrictedTransport struct {
+	network  RestrictedNetwork
+	mutex    sync.Mutex
+	cleanups []func() error
+}
+
+func (t *restrictedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Scheme != "https" {
+		return nil, fmt.Errorf("URL scheme %q is not https", request.URL.Scheme)
 	}
-}
-
-// randomUint32 returns a cryptographically secure random number.
-func randomUint32() uint32 {
-	var buffer [4]byte
-	_, _ = rand.Read(buffer[:]) // never returns an error
-	return binary.BigEndian.Uint32(buffer[:])
-}
-
-type dohServer struct {
-	// url is the DNS over HTTPS URL, for example
-	// "https://cloudflare-dns.com/dns-query".
-	url string
-	// ips are the IPv4 addresses of the server hostname,
-	// dialed instead of resolving the hostname.
-	ips []netip.Addr
-}
-
-type preTunnelSettings struct {
-	// dohServers are the DNS over HTTPS servers used to resolve hosts.
-	dohServers []dohServer
-	// hosts are the hostnames to resolve and allow to reach.
-	hosts []string
-	// port is the TCP port to reach on the hosts.
-	port uint16
-	// mark is the mark the firewall rules require packets to have,
-	// and which dialControl should set on each socket.
-	mark uint32
-	// dialControl is run on each socket before it connects.
-	dialControl func(network, address string, rawConn syscall.RawConn) error
-	// rootCAs are the root certificate authorities to verify TLS
-	// certificates with, and nil to use the system ones.
-	rootCAs *x509.CertPool
-}
-
-const httpsPort = 443
-
-func defaultPreTunnelSettings() preTunnelSettings {
-	upstreams := [...]dnsprovider.Provider{dnsprovider.Cloudflare(), dnsprovider.Google()}
-	dohServers := make([]dohServer, len(upstreams))
-	for i, upstream := range upstreams {
-		dohServers[i] = dohServer{url: upstream.DoH.URL, ips: upstream.DoH.IPv4}
+	port := request.URL.Port()
+	if port == "" {
+		port = "443"
 	}
-	mark := newPreTunnelMark(randomUint32)
-	return preTunnelSettings{
-		dohServers:  dohServers,
-		hosts:       []string{mustHost(wgapi.DefaultAuthURL), mustHost(wgapi.DefaultAppURL)},
-		port:        httpsPort,
-		mark:        mark,
-		dialControl: newMarkControl(mark),
-	}
-}
-
-func mustHost(rawURL string) string {
-	parsedURL, err := url.Parse(rawURL)
+	hostname := net.JoinHostPort(request.URL.Hostname(), port)
+	httpClient, cleanup, err := t.network.OpenHTTPSByHostname(request.Context(), hostname)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("opening restricted HTTPS connection: %w", err)
 	}
-	return parsedURL.Hostname()
+	cleanupOnce := sync.OnceValue(cleanup)
+	t.mutex.Lock()
+	t.cleanups = append(t.cleanups, cleanupOnce)
+	t.mutex.Unlock()
+
+	// Use the transport directly so the request context and the timeout
+	// of the client using this transport apply, instead of the timeout
+	// of the restricted network HTTP client.
+	response, err := httpClient.Transport.RoundTrip(request)
+	if err != nil {
+		_ = cleanupOnce()
+		return nil, err
+	}
+	response.Body = &cleanupBody{ReadCloser: response.Body, cleanup: cleanupOnce}
+	return response, nil
 }
 
-// newPreTunnelHTTPClient returns an HTTP client able to reach the
-// PureVPN website before the VPN is up, even with the firewall enabled.
-// It temporarily allows HTTPS traffic from marked sockets to DNS over
-// HTTPS servers, resolves the PureVPN hostnames with them, and then
-// allows HTTPS traffic from marked sockets to the resolved IP addresses.
-// All connections use marked sockets, dial pinned IP addresses only, and
-// do not depend on the system DNS nor on a proxy. The cleanup function
-// returned is never nil, even if an error is returned, and must be called
-// once done. It closes idle connections and removes the firewall rules,
-// logging any error, and returns the revert functions which failed, to
-// be called again later, in order.
-func newPreTunnelHTTPClient(ctx context.Context, fw Firewall, logger Logger,
-	preTunnel preTunnelSettings,
-) (client *http.Client, resolve func(ctx context.Context, host string) ([]netip.Addr, error),
-	cleanup func() (failedReverts []func(ctx context.Context) error), err error,
-) {
-	const dialTimeout = 10 * time.Second
-	dialer := &net.Dialer{Timeout: dialTimeout, Control: preTunnel.dialControl}
-
-	var transports []*http.Transport
-	var reverts []func(ctx context.Context) error
-	cleanup = func() (failedReverts []func(ctx context.Context) error) {
-		for _, transport := range transports {
-			transport.CloseIdleConnections()
-		}
-		for _, revert := range slices.Backward(reverts) {
-			err := revert(context.Background())
-			if err != nil {
-				logger.Warn("removing temporary firewall rules: " + err.Error())
-				failedReverts = append(failedReverts, revert)
-			}
-		}
-		return failedReverts
+// cleanup closes all the connections opened and removes their firewall rules,
+// returning all the errors encountered, including ones already returned when
+// closing response bodies.
+func (t *restrictedTransport) cleanup() error {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	errs := make([]error, 0, len(t.cleanups))
+	for _, cleanup := range t.cleanups {
+		errs = append(errs, cleanup())
 	}
-
-	dohAddresses := make(map[string][]netip.AddrPort, len(preTunnel.dohServers))
-	dohURLs := make([]string, len(preTunnel.dohServers))
-	var dohAddrPorts []netip.AddrPort
-	for i, server := range preTunnel.dohServers {
-		hostPort, port, err := urlHostPort(server.url)
-		if err != nil {
-			return nil, nil, cleanup, fmt.Errorf("parsing DNS over HTTPS URL: %w", err)
-		}
-		dohURLs[i] = server.url
-		for _, ip := range server.ips {
-			addrPort := netip.AddrPortFrom(ip, port)
-			dohAddresses[hostPort] = append(dohAddresses[hostPort], addrPort)
-			dohAddrPorts = append(dohAddrPorts, addrPort)
-		}
-	}
-
-	revert, err := fw.AllowOutputTemporarily(ctx, constants.TCP, preTunnel.mark, dohAddrPorts)
-	reverts = append(reverts, revert)
-	if err != nil {
-		return nil, nil, cleanup, fmt.Errorf("allowing DNS over HTTPS traffic: %w", err)
-	}
-
-	dohTransport := newPinnedTransport(dialer, dohAddresses, preTunnel.rootCAs)
-	transports = append(transports, dohTransport)
-	const dohTimeout = 5 * time.Second
-	resolver := &dohResolver{
-		client: &http.Client{Transport: dohTransport, Timeout: dohTimeout},
-		urls:   dohURLs,
-	}
-	resolve = resolver.lookupIPv4
-
-	hostAddresses := make(map[string][]netip.AddrPort, len(preTunnel.hosts))
-	var allowed []netip.AddrPort
-	for _, host := range preTunnel.hosts {
-		ips, err := resolve(ctx, host)
-		if err != nil {
-			return nil, nil, cleanup, fmt.Errorf("resolving %s: %w", host, err)
-		}
-		hostPort := net.JoinHostPort(host, strconv.Itoa(int(preTunnel.port)))
-		for _, ip := range ips {
-			addrPort := netip.AddrPortFrom(ip, preTunnel.port)
-			hostAddresses[hostPort] = append(hostAddresses[hostPort], addrPort)
-			allowed = append(allowed, addrPort)
-		}
-	}
-
-	revert, err = fw.AllowOutputTemporarily(ctx, constants.TCP, preTunnel.mark, allowed)
-	reverts = append(reverts, revert)
-	if err != nil {
-		return nil, nil, cleanup, fmt.Errorf("allowing traffic to PureVPN website: %w", err)
-	}
-
-	transport := newPinnedTransport(dialer, hostAddresses, preTunnel.rootCAs)
-	transports = append(transports, transport)
-	const httpTimeout = 30 * time.Second
-	client = &http.Client{Transport: transport, Timeout: httpTimeout}
-	return client, resolve, cleanup, nil
+	t.cleanups = nil
+	return errors.Join(errs...)
 }
 
-// urlHostPort returns the "host:port" address and the port
-// of the URL given, defaulting to port 443.
-func urlHostPort(rawURL string) (hostPort string, port uint16, err error) {
-	parsedURL, err := url.Parse(rawURL)
-	if err != nil {
-		return "", 0, fmt.Errorf("parsing URL: %w", err)
-	}
-	port = httpsPort
-	if parsedURL.Port() != "" {
-		const base, bitSize = 10, 16
-		port64, err := strconv.ParseUint(parsedURL.Port(), base, bitSize)
-		if err != nil {
-			return "", 0, fmt.Errorf("parsing port: %w", err)
-		}
-		port = uint16(port64)
-	}
-	hostPort = net.JoinHostPort(parsedURL.Hostname(), strconv.Itoa(int(port)))
-	return hostPort, port, nil
+// cleanupBody closes the connection and removes its firewall rule
+// once the response body is closed.
+type cleanupBody struct {
+	io.ReadCloser
+	cleanup func() error
 }
 
-// newPinnedTransport returns an HTTP transport only dialing "host:port"
-// addresses present in the addresses map given, using their pinned IP
-// addresses and ports instead of resolving the host, and refusing any
-// other address. It never uses a proxy.
-func newPinnedTransport(dialer *net.Dialer, addresses map[string][]netip.AddrPort,
-	rootCAs *x509.CertPool,
-) *http.Transport {
-	const tlsHandshakeTimeout = 10 * time.Second
-	const maxIdleConns = 4
-	return &http.Transport{
-		Proxy: nil, // connections must only go to the pinned addresses
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			addrPorts, ok := addresses[address]
-			if !ok {
-				// Refuse other destinations, they are blocked by the firewall anyway.
-				return nil, fmt.Errorf("destination %s is not allowed before the VPN is up", address)
-			}
-			errs := make([]error, 0, len(addrPorts))
-			for _, addrPort := range addrPorts {
-				conn, err := dialer.DialContext(ctx, network, addrPort.String())
-				if err == nil {
-					return conn, nil
-				}
-				errs = append(errs, err)
-			}
-			return nil, errors.Join(errs...)
-		},
-		TLSClientConfig: &tls.Config{
-			RootCAs:    rootCAs,
-			MinVersion: tls.VersionTLS12,
-		},
-		ForceAttemptHTTP2:   true,
-		TLSHandshakeTimeout: tlsHandshakeTimeout,
-		MaxIdleConns:        maxIdleConns,
-	}
+func (b *cleanupBody) Close() error {
+	return errors.Join(b.ReadCloser.Close(), b.cleanup())
 }

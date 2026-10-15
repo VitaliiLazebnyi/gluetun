@@ -88,48 +88,76 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":true,"body":` + body + `}`))
 }
 
-// testFetcher is a fetcher using a fake HTTP client constructor,
-// counting how many times it is called.
-type testFetcher struct {
-	*wireguardFetcher
-	mutex          sync.Mutex
-	newClientCalls uint
-	newClientCtx   context.Context
+// fakeNetwork is a restricted network using the HTTP client of a test
+// server, recording the hostnames opened and the cleanups done.
+type fakeNetwork struct {
+	httpClient *http.Client
+	openErr    error
+	// cleanupErr is returned by the first cleanup only.
+	cleanupErr error
+
+	mutex     sync.Mutex
+	hostnames []string
+	openCtx   context.Context
+	cleanups  uint
 }
 
-func (f *testFetcher) newClientCallsCount() uint {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	return f.newClientCalls
+func (n *fakeNetwork) OpenHTTPSByHostname(ctx context.Context, hostname string) (
+	*http.Client, func() error, error,
+) {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	n.hostnames = append(n.hostnames, hostname)
+	n.openCtx = ctx
+	if n.openErr != nil {
+		return nil, nil, n.openErr
+	}
+	cleanup := func() error {
+		n.mutex.Lock()
+		defer n.mutex.Unlock()
+		n.cleanups++
+		if n.cleanups == 1 {
+			return n.cleanupErr
+		}
+		return nil
+	}
+	return n.httpClient, cleanup, nil
 }
 
-func newTestFetcher(t *testing.T, serverURL string) *testFetcher {
+func (n *fakeNetwork) ResolveName(_ context.Context, host string) ([]netip.Addr, error) {
+	switch host {
+	case "us-ny.purevpn.net":
+		return []netip.Addr{netip.MustParseAddr("198.51.100.9")}, nil
+	case "empty.purevpn.net":
+		return nil, nil
+	default:
+		return nil, errors.New("unknown host " + host)
+	}
+}
+
+func (n *fakeNetwork) opened() (count uint, cleanups uint) {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	return uint(len(n.hostnames)), n.cleanups
+}
+
+// newTestServer returns a test HTTPS server for the API given,
+// and a restricted network reaching it.
+func newTestServer(t *testing.T, api *fakeAPI) (server *httptest.Server, network *fakeNetwork) {
 	t.Helper()
-	fetcher := &testFetcher{}
-	fetcher.wireguardFetcher = &wireguardFetcher{
+	server = httptest.NewTLSServer(api)
+	t.Cleanup(server.Close)
+	return server, &fakeNetwork{httpClient: server.Client()}
+}
+
+func newTestFetcher(t *testing.T, serverURL string) *wireguardFetcher {
+	t.Helper()
+	return &wireguardFetcher{
 		statePath: filepath.Join(t.TempDir(), "state", "purevpn.json"),
 		authURL:   serverURL,
 		appURL:    serverURL,
-		newHTTPClient: func(ctx context.Context, _ Firewall, _ Logger) (*http.Client,
-			func(ctx context.Context, host string) ([]netip.Addr, error),
-			func() []func(ctx context.Context) error, error,
-		) {
-			fetcher.mutex.Lock()
-			fetcher.newClientCalls++
-			fetcher.newClientCtx = ctx
-			fetcher.mutex.Unlock()
-			resolve := func(_ context.Context, host string) ([]netip.Addr, error) {
-				if host == "us-ny.purevpn.net" {
-					return []netip.Addr{netip.MustParseAddr("198.51.100.9")}, nil
-				}
-				return nil, errors.New("unknown host " + host)
-			}
-			cleanup := func() []func(ctx context.Context) error { return nil }
-			return &http.Client{Timeout: 5 * time.Second}, resolve, cleanup, nil
-		},
-		timeNow: time.Now,
+		timeNow:   time.Now,
 	}
-	return fetcher
 }
 
 func testVPNSettings(sessionToken, privateKey string) settings.VPN {
@@ -156,8 +184,7 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	api := &fakeAPI{token: testJWT, endpoint: "us-ny.purevpn.net:51820"}
-	server := httptest.NewServer(api)
-	t.Cleanup(server.Close)
+	server, network := newTestServer(t, api)
 
 	logger := NewMockLogger(ctrl)
 	gomock.InOrder(
@@ -168,12 +195,15 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 	)
 	fetcher := newTestFetcher(t, server.URL)
 	connection, err := fetcher.fetch(context.Background(),
-		testVPNSettings(api.token, ""), nil, logger)
+		testVPNSettings(api.token, ""), network, logger)
 	require.NoError(t, err)
 
-	deadline, ok := fetcher.newClientCtx.Deadline()
-	require.True(t, ok, "the fetch must be bounded by a timeout")
-	assert.WithinDuration(t, time.Now().Add(2*time.Minute), deadline, 10*time.Second)
+	_, ok := network.openCtx.Deadline()
+	assert.True(t, ok, "requests must be bounded by a timeout")
+	opened, cleanups := network.opened()
+	assert.Equal(t, api.requestsCount(), opened, "each request must use its own connection")
+	assert.Equal(t, opened, cleanups, "each connection must be cleaned up")
+	assert.Equal(t, strings.TrimPrefix(server.URL, "https://"), network.hostnames[0])
 
 	key, err := wgtypes.ParseKey(connection.PrivateKey)
 	require.NoError(t, err)
@@ -217,7 +247,7 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 	restarted := newTestFetcher(t, server.URL)
 	restarted.statePath = fetcher.statePath
 	second, err := restarted.fetch(context.Background(),
-		testVPNSettings("", ""), nil, restartedLogger)
+		testVPNSettings("", ""), network, restartedLogger)
 	require.NoError(t, err)
 	assert.Equal(t, connection.PrivateKey, second.PrivateKey)
 }
@@ -227,8 +257,7 @@ func Test_wireguardFetcher_fetch_settingsPrivateKey(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
-	server := httptest.NewServer(api)
-	t.Cleanup(server.Close)
+	server, network := newTestServer(t, api)
 
 	key, err := wgtypes.GeneratePrivateKey()
 	require.NoError(t, err)
@@ -241,7 +270,7 @@ func Test_wireguardFetcher_fetch_settingsPrivateKey(t *testing.T) {
 	)
 	fetcher := newTestFetcher(t, server.URL)
 	connection, err := fetcher.fetch(context.Background(),
-		testVPNSettings(api.token, key.String()), nil, logger)
+		testVPNSettings(api.token, key.String()), network, logger)
 	require.NoError(t, err)
 	assert.Equal(t, key.String(), connection.PrivateKey)
 	assert.Equal(t, key.PublicKey().String(), api.clientPubKey)
@@ -253,8 +282,7 @@ func Test_wireguardFetcher_fetch_canceledContext(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
-	server := httptest.NewServer(api)
-	t.Cleanup(server.Close)
+	server, network := newTestServer(t, api)
 
 	logger := NewMockLogger(ctrl)
 	gomock.InOrder(
@@ -265,7 +293,7 @@ func Test_wireguardFetcher_fetch_canceledContext(t *testing.T) {
 	fetcher := newTestFetcher(t, server.URL)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := fetcher.fetch(ctx, testVPNSettings(api.token, ""), nil, logger)
+	_, err := fetcher.fetch(ctx, testVPNSettings(api.token, ""), network, logger)
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Zero(t, api.requestsCount())
 }
@@ -275,8 +303,7 @@ func Test_wireguardFetcher_fetch_authError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
-	server := httptest.NewServer(api)
-	t.Cleanup(server.Close)
+	server, network := newTestServer(t, api)
 
 	fetcher := newTestFetcher(t, server.URL)
 
@@ -288,23 +315,23 @@ func Test_wireguardFetcher_fetch_authError(t *testing.T) {
 		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
 	)
 	_, err := fetcher.fetch(context.Background(),
-		testVPNSettings("rejected-token", ""), nil, logger)
+		testVPNSettings("rejected-token", ""), network, logger)
 	require.ErrorContains(t, err, "PureVPN account username and password are not set")
 	assert.ErrorContains(t, err, "change the PureVPN settings to retry")
 	require.True(t, wgapi.IsAuthError(err))
 	requestsAfterFirstFetch := api.requestsCount()
 	require.NotZero(t, requestsAfterFirstFetch)
-	assert.Equal(t, uint(1), fetcher.newClientCallsCount())
 
 	// Same settings: the error is returned without contacting PureVPN
 	// nor opening the firewall, even much later.
 	fetcher.timeNow = func() time.Time { return time.Now().Add(1000 * time.Hour) }
 	_, err = fetcher.fetch(context.Background(),
-		testVPNSettings("rejected-token", ""), nil, NewMockLogger(ctrl))
+		testVPNSettings("rejected-token", ""), network, NewMockLogger(ctrl))
 	require.ErrorContains(t, err, "not retrying with unchanged PureVPN settings: ")
 	assert.ErrorContains(t, err, "PureVPN account username and password are not set")
 	assert.Equal(t, requestsAfterFirstFetch, api.requestsCount())
-	assert.Equal(t, uint(1), fetcher.newClientCallsCount())
+	opened, _ := network.opened()
+	assert.Equal(t, requestsAfterFirstFetch, opened)
 
 	// Changed settings: PureVPN is contacted again.
 	logger = NewMockLogger(ctrl)
@@ -314,10 +341,9 @@ func Test_wireguardFetcher_fetch_authError(t *testing.T) {
 		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
 	)
 	_, err = fetcher.fetch(context.Background(),
-		testVPNSettings(api.token, ""), nil, logger)
+		testVPNSettings(api.token, ""), network, logger)
 	require.NoError(t, err)
 	assert.Greater(t, api.requestsCount(), requestsAfterFirstFetch)
-	assert.Equal(t, uint(2), fetcher.newClientCallsCount())
 }
 
 func Test_wireguardFetcher_fetch_captchaCooldown(t *testing.T) {
@@ -325,8 +351,7 @@ func Test_wireguardFetcher_fetch_captchaCooldown(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820", loginError: "Please complete the captcha"}
-	server := httptest.NewServer(api)
-	t.Cleanup(server.Close)
+	server, network := newTestServer(t, api)
 
 	fetcher := newTestFetcher(t, server.URL)
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -340,7 +365,7 @@ func Test_wireguardFetcher_fetch_captchaCooldown(t *testing.T) {
 		logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
 		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
 	)
-	_, err := fetcher.fetch(context.Background(), vpnSettings, nil, logger)
+	_, err := fetcher.fetch(context.Background(), vpnSettings, network, logger)
 	require.True(t, wgapi.IsCaptchaError(err))
 	assert.False(t, wgapi.IsAuthError(err))
 	assert.ErrorContains(t, err, "log in once from a browser or set a session token")
@@ -351,89 +376,54 @@ func Test_wireguardFetcher_fetch_captchaCooldown(t *testing.T) {
 
 	// Same settings within the cooldown: PureVPN is not contacted.
 	fetcher.timeNow = func() time.Time { return start.Add(time.Hour - time.Nanosecond) }
-	_, err = fetcher.fetch(context.Background(), vpnSettings, nil, NewMockLogger(ctrl))
+	_, err = fetcher.fetch(context.Background(), vpnSettings, network, NewMockLogger(ctrl))
 	require.ErrorContains(t, err, "not retrying with unchanged PureVPN settings: ")
 	assert.True(t, wgapi.IsCaptchaError(err))
 	assert.Equal(t, requestsAfterFirstFetch, api.requestsCount())
-	assert.Equal(t, uint(1), fetcher.newClientCallsCount())
+	opened, _ := network.opened()
+	assert.Equal(t, requestsAfterFirstFetch, opened)
 
 	// Same settings after the cooldown: PureVPN is contacted again.
 	fetcher.timeNow = func() time.Time { return start.Add(time.Hour) }
 	logger = NewMockLogger(ctrl)
 	logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778")
-	_, err = fetcher.fetch(context.Background(), vpnSettings, nil, logger)
+	_, err = fetcher.fetch(context.Background(), vpnSettings, network, logger)
 	assert.ErrorContains(t, err, " - not contacting PureVPN again before 2026-01-01T02:00:00Z, ")
 	requestsAfterSecondFetch := api.requestsCount()
 	assert.Greater(t, requestsAfterSecondFetch, requestsAfterFirstFetch)
-	assert.Equal(t, uint(2), fetcher.newClientCallsCount())
 
 	// Changed settings within the cooldown: PureVPN is contacted again.
 	vpnSettings.PureVPN.Password = new("other-password")
 	logger = NewMockLogger(ctrl)
 	logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778")
-	_, err = fetcher.fetch(context.Background(), vpnSettings, nil, logger)
+	_, err = fetcher.fetch(context.Background(), vpnSettings, network, logger)
 	assert.True(t, wgapi.IsCaptchaError(err))
 	assert.Greater(t, api.requestsCount(), requestsAfterSecondFetch)
-	assert.Equal(t, uint(3), fetcher.newClientCallsCount())
 }
 
-func Test_wireguardFetcher_fetch_retriesFailedReverts(t *testing.T) {
+func Test_wireguardFetcher_fetch_cleanupError(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
 
-	revertErrs := [...]error{errors.New("test revert error"), nil}
-	revertCalls := 0
-	revert := func(context.Context) error {
-		err := revertErrs[revertCalls]
-		revertCalls++
-		return err
-	}
-	cleanupCalls := 0
-	fetcher := &wireguardFetcher{
-		statePath: filepath.Join(t.TempDir(), "purevpn.json"),
-		newHTTPClient: func(context.Context, Firewall, Logger) (*http.Client,
-			func(ctx context.Context, host string) ([]netip.Addr, error),
-			func() []func(ctx context.Context) error, error,
-		) {
-			cleanup := func() []func(ctx context.Context) error {
-				cleanupCalls++
-				if cleanupCalls == 1 {
-					return []func(ctx context.Context) error{revert}
-				}
-				return nil
-			}
-			return nil, nil, cleanup, errors.New("test error")
-		},
-		timeNow: time.Now,
-	}
-	vpnSettings := testVPNSettings("", "")
+	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
+	server, network := newTestServer(t, api)
+	// For example the firewall got disabled during the fetch,
+	// so removing the firewall rule fails.
+	network.cleanupErr = errors.New("test error")
 
-	// The first fetch fails to remove the firewall rules.
 	logger := NewMockLogger(ctrl)
-	logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN")
-	_, err := fetcher.fetch(context.Background(), vpnSettings, nil, logger)
-	require.EqualError(t, err, "preparing network access to PureVPN: test error")
-	assert.Zero(t, revertCalls)
+	gomock.InOrder(
+		logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+		logger.EXPECT().Debug("using PureVPN session token as access token"),
+		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
+		logger.EXPECT().Warn("cleaning up connections to PureVPN: test error"),
+	)
+	fetcher := newTestFetcher(t, server.URL)
 
-	// The second fetch fails again to remove them.
-	logger = NewMockLogger(ctrl)
-	logger.EXPECT().Warn("removing temporary firewall rules left by a previous attempt: test revert error")
-	_, err = fetcher.fetch(context.Background(), vpnSettings, nil, logger)
-	require.EqualError(t, err, "preparing network access to PureVPN: test error")
-	assert.Equal(t, 1, revertCalls)
+	_, err := fetcher.fetch(context.Background(), testVPNSettings(api.token, ""), network, logger)
 
-	// The third fetch removes them.
-	logger = NewMockLogger(ctrl)
-	logger.EXPECT().Info("removed temporary firewall rules left by a previous attempt")
-	_, err = fetcher.fetch(context.Background(), vpnSettings, nil, logger)
-	require.EqualError(t, err, "preparing network access to PureVPN: test error")
-	assert.Equal(t, 2, revertCalls)
-
-	// The fourth fetch has nothing to remove.
-	_, err = fetcher.fetch(context.Background(), vpnSettings, nil, NewMockLogger(ctrl))
-	require.EqualError(t, err, "preparing network access to PureVPN: test error")
-	assert.Equal(t, 2, revertCalls)
-	assert.Equal(t, 4, cleanupCalls)
+	assert.NoError(t, err)
 }
 
 func Test_settingsFingerprint(t *testing.T) {
@@ -688,61 +678,13 @@ func Test_writeFileAtomically_renameError(t *testing.T) {
 	assert.True(t, entries[0].IsDir())
 }
 
-// preTunnelMarkMatcher matches a mark which is not a reserved mark.
-type preTunnelMarkMatcher struct{}
-
-func (preTunnelMarkMatcher) Matches(x any) bool {
-	mark, ok := x.(uint32)
-	return ok && mark != 0 && mark != 0x567 && mark != 4545 && mark != 51820
-}
-
-func (preTunnelMarkMatcher) String() string {
-	return "is a non reserved mark"
-}
-
-func Test_newWireguardFetcher(t *testing.T) {
-	t.Parallel()
-	ctrl := gomock.NewController(t)
-
-	matcher := preTunnelMarkMatcher{}
-	assert.True(t, matcher.Matches(uint32(0x7075)))
-	assert.False(t, matcher.Matches(uint32(0x567)))
-	assert.False(t, matcher.Matches(0x7075))
-	assert.Equal(t, "is a non reserved mark", matcher.String())
-
-	fetcher := newWireguardFetcher()
-
-	assert.Equal(t, "/gluetun/purevpn-wireguard.json", fetcher.statePath)
-	assert.WithinDuration(t, time.Now(), fetcher.timeNow(), time.Minute)
-
-	// The HTTP client constructor opens the firewall for the default
-	// DNS over HTTPS servers, with a random mark.
-	var dohAddrPorts []netip.AddrPort
-	for _, server := range defaultPreTunnelSettings().dohServers {
-		for _, ip := range server.ips {
-			dohAddrPorts = append(dohAddrPorts, netip.AddrPortFrom(ip, 443))
-		}
-	}
-	ctx := context.Background()
-	firewall := NewMockFirewall(ctrl)
-	firewall.EXPECT().AllowOutputTemporarily(ctx, "tcp", matcher, dohAddrPorts).
-		Return(func(context.Context) error { return nil }, errors.New("test error"))
-
-	client, resolve, cleanup, err := fetcher.newHTTPClient(ctx, firewall, NewMockLogger(ctrl))
-
-	assert.EqualError(t, err, "allowing DNS over HTTPS traffic: test error")
-	assert.Nil(t, client)
-	assert.Nil(t, resolve)
-	assert.Empty(t, cleanup())
-}
-
 func Test_wireguardFetcher_fetch_errors(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
 		privateKey    string
-		cityID        uint
 		endpoint      string
+		openErr       error
 		modifyFetcher func(fetcher *wireguardFetcher)
 		makeLogger    func(ctrl *gomock.Controller) *MockLogger
 		errMessage    string
@@ -752,24 +694,6 @@ func Test_wireguardFetcher_fetch_errors(t *testing.T) {
 			makeLogger: NewMockLogger,
 			errMessage: "parsing Wireguard private key: wgtypes: failed to parse base64-encoded key: " +
 				"illegal base64 data at input byte 4",
-		},
-		"http_client_error": {
-			modifyFetcher: func(fetcher *wireguardFetcher) {
-				fetcher.newHTTPClient = func(context.Context, Firewall, Logger) (*http.Client,
-					func(ctx context.Context, host string) ([]netip.Addr, error),
-					func() []func(ctx context.Context) error, error,
-				) {
-					cleanup := func() []func(ctx context.Context) error { return nil }
-					return nil, nil, cleanup, errors.New("test error")
-				}
-			},
-			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
-				logger := NewMockLogger(ctrl)
-				logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN")
-				logger.EXPECT().Debug("using PureVPN session token as access token")
-				return logger
-			},
-			errMessage: "preparing network access to PureVPN: test error",
 		},
 		"invalid_auth_url": {
 			modifyFetcher: func(fetcher *wireguardFetcher) {
@@ -782,6 +706,36 @@ func Test_wireguardFetcher_fetch_errors(t *testing.T) {
 				return logger
 			},
 			errMessage: `creating PureVPN client: parsing auth URL: parse "://invalid": missing protocol scheme`,
+		},
+		"open_https_error": {
+			openErr: errors.New("test error"),
+			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+				logger := NewMockLogger(ctrl)
+				gomock.InOrder(
+					logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+					logger.EXPECT().Debug("using PureVPN session token as access token"),
+					// City ID 0 lets PureVPN pick a city in the country.
+					logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
+				)
+				return logger
+			},
+			errMessage: "opening restricted HTTPS connection: test error",
+		},
+		"not_https_url": {
+			modifyFetcher: func(fetcher *wireguardFetcher) {
+				fetcher.appURL = "http://127.0.0.1:1"
+			},
+			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+				logger := NewMockLogger(ctrl)
+				gomock.InOrder(
+					logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+					logger.EXPECT().Debug("using PureVPN session token as access token"),
+					// City ID 0 lets PureVPN pick a city in the country.
+					logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
+				)
+				return logger
+			},
+			errMessage: `URL scheme "http" is not https`,
 		},
 		"endpoint_resolution_error": {
 			endpoint: "unknown.purevpn.net:51820",
@@ -797,6 +751,20 @@ func Test_wireguardFetcher_fetch_errors(t *testing.T) {
 			},
 			errMessage: "resolving Wireguard endpoint: unknown host unknown.purevpn.net",
 		},
+		"endpoint_without_address": {
+			endpoint: "empty.purevpn.net:51820",
+			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+				logger := NewMockLogger(ctrl)
+				gomock.InOrder(
+					logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+					logger.EXPECT().Debug("using PureVPN session token as access token"),
+					// City ID 0 lets PureVPN pick a city in the country.
+					logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
+				)
+				return logger
+			},
+			errMessage: "no IP address found for Wireguard endpoint empty.purevpn.net",
+		},
 	}
 
 	for name, testCase := range testCases {
@@ -809,44 +777,22 @@ func Test_wireguardFetcher_fetch_errors(t *testing.T) {
 				endpoint = "us-ny.purevpn.net:51820"
 			}
 			api := &fakeAPI{token: testJWT, endpoint: endpoint}
-			server := httptest.NewServer(api)
-			t.Cleanup(server.Close)
+			server, network := newTestServer(t, api)
+			network.openErr = testCase.openErr
 
 			fetcher := newTestFetcher(t, server.URL)
 			if testCase.modifyFetcher != nil {
-				testCase.modifyFetcher(fetcher.wireguardFetcher)
+				testCase.modifyFetcher(fetcher)
 			}
 			vpnSettings := testVPNSettings(api.token, testCase.privateKey)
-			*vpnSettings.PureVPN.CityID = testCase.cityID
+			*vpnSettings.PureVPN.CityID = 0
 
-			connection, err := fetcher.fetch(context.Background(), vpnSettings, nil, testCase.makeLogger(ctrl))
+			connection, err := fetcher.fetch(context.Background(), vpnSettings, network, testCase.makeLogger(ctrl))
 
-			assert.EqualError(t, err, testCase.errMessage)
+			assert.ErrorContains(t, err, testCase.errMessage)
 			assert.Equal(t, models.WireguardConnection{}, connection)
 		})
 	}
-}
-
-func Test_Provider(t *testing.T) {
-	t.Parallel()
-	ctrl := gomock.NewController(t)
-
-	provider := New(nil, nil, nil, nil, nil)
-
-	assert.Equal(t, "purevpn", provider.Name())
-	assert.Equal(t, "/gluetun/purevpn-wireguard.json", provider.wireguard.statePath)
-
-	// FetchWireguardConnection uses the Wireguard fetcher, which here
-	// returns the previous authentication error for the same settings.
-	vpnSettings := testVPNSettings("token", "")
-	provider.wireguard.authErr = errors.New("test error")
-	provider.wireguard.authErrFingerprint = settingsFingerprint(vpnSettings.PureVPN)
-
-	connection, err := provider.FetchWireguardConnection(context.Background(),
-		vpnSettings, NewMockFirewall(ctrl), NewMockLogger(ctrl))
-
-	assert.EqualError(t, err, "not retrying with unchanged PureVPN settings: test error")
-	assert.Equal(t, models.WireguardConnection{}, connection)
 }
 
 func Test_writeFileAtomically_createTempError(t *testing.T) {

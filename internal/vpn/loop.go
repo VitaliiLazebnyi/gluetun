@@ -9,6 +9,7 @@ import (
 	"github.com/qdm12/gluetun/internal/loopstate"
 	"github.com/qdm12/gluetun/internal/models"
 	"github.com/qdm12/gluetun/internal/netlink"
+	"github.com/qdm12/gluetun/internal/restrictednet"
 	"github.com/qdm12/gluetun/internal/vpn/state"
 	"github.com/qdm12/log"
 )
@@ -30,11 +31,14 @@ type Loop struct {
 	openvpnConf OpenVPN
 	netLinker   NetLinker
 	fw          Firewall
-	routing     Routing
-	portForward PortForward
-	publicip    PublicIPLoop
-	dnsLooper   DNSLoop
-	boringPoll  Service
+	// restrictedNet is used by providers fetching their
+	// configuration before the VPN is up.
+	restrictedNet *restrictednet.Client
+	routing       Routing
+	portForward   PortForward
+	publicip      PublicIPLoop
+	dnsLooper     DNSLoop
+	boringPoll    Service
 	// Other objects
 	cmder  Cmder // for OpenVPN and up/down commands
 	logger log.LoggerInterface
@@ -57,7 +61,8 @@ const (
 func NewLoop(vpnSettings settings.VPN, ipv6SupportLevel netlink.IPv6SupportLevel, vpnInputPorts []uint16,
 	providers Providers, storage Storage, boringPoll Service,
 	healthSettings settings.Health, healthChecker HealthChecker, healthServer HealthServer,
-	openvpnConf OpenVPN, netLinker NetLinker, fw Firewall, routing Routing,
+	openvpnConf OpenVPN, netLinker NetLinker, fw Firewall,
+	restrictedNet *restrictednet.Client, routing Routing,
 	portForward PortForward, cmder Cmder,
 	publicip PublicIPLoop, dnsLooper DNSLoop,
 	logger log.LoggerInterface, client *http.Client,
@@ -92,6 +97,7 @@ func NewLoop(vpnSettings settings.VPN, ipv6SupportLevel netlink.IPv6SupportLevel
 		openvpnConf:      openvpnConf,
 		netLinker:        netLinker,
 		fw:               fw,
+		restrictedNet:    restrictedNet,
 		routing:          routing,
 		portForward:      portForward,
 		publicip:         publicip,

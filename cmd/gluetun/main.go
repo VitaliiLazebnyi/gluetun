@@ -40,6 +40,7 @@ import (
 	"github.com/qdm12/gluetun/internal/pprof"
 	"github.com/qdm12/gluetun/internal/provider"
 	"github.com/qdm12/gluetun/internal/publicip"
+	"github.com/qdm12/gluetun/internal/restrictednet"
 	"github.com/qdm12/gluetun/internal/routing"
 	"github.com/qdm12/gluetun/internal/server"
 	"github.com/qdm12/gluetun/internal/shadowsocks"
@@ -443,10 +444,27 @@ func _main(ctx context.Context, buildInfo models.BuildInformation,
 	boringPollLogger := logger.New(log.SetComponent("boring poll"))
 	boringPoll := boringpoll.New(httpClient, boringPollLogger, allSettings.BoringPoll)
 
+	// The restricted network is used to reach VPN provider APIs before the VPN is up.
+	// Only IPv4 is used, through the IPv4 default route interface, since the
+	// IPv6 default route interface, if any, may differ.
+	restrictedNetInterface := defaultRoutes[0].NetInterface // there is at least one default route
+	for _, defaultRoute := range defaultRoutes {
+		if defaultRoute.Family == netlink.FamilyV4 {
+			restrictedNetInterface = defaultRoute.NetInterface
+			break
+		}
+	}
+	restrictedNet := restrictednet.New(restrictednet.Settings{
+		DefaultInterface:  restrictedNetInterface,
+		IPv6Supported:     new(false),
+		Firewall:          firewallConf,
+		UpstreamResolvers: []dnsprovider.Provider{dnsprovider.Cloudflare(), dnsprovider.Google()},
+	})
+
 	vpnLogger := logger.New(log.SetComponent("vpn"))
 	vpnLooper := vpn.NewLoop(allSettings.VPN, ipv6SupportLevel, allSettings.Firewall.VPNInputPorts,
 		providers, storage, boringPoll, allSettings.Health, healthChecker, healthcheckServer,
-		ovpnConf, netLinker, firewallConf, routingConf, portForwardLooper, cmder, publicIPLooper,
+		ovpnConf, netLinker, firewallConf, restrictedNet, routingConf, portForwardLooper, cmder, publicIPLooper,
 		dnsLooper, vpnLogger, httpClient, buildInfo, *allSettings.Version.Enabled)
 	vpnHandler, vpnCtx, vpnDone := goshutdown.NewGoRoutineHandler(
 		"vpn", goroutine.OptionTimeout(time.Second))

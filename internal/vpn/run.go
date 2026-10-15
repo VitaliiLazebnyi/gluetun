@@ -45,7 +45,7 @@ func (l *Loop) Run(ctx context.Context, done chan<- struct{}) {
 		case vpn.Wireguard:
 			vpnInterface = settings.Wireguard.Interface
 			vpnRunner, connection, err = setupWireguard(ctx, l.netLinker, l.fw,
-				providerConf, settings, l.ipv6SupportLevel, subLogger)
+				l.restrictedNet, providerConf, settings, l.ipv6SupportLevel, subLogger)
 		default:
 			panic("vpn type not implemented: " + settings.Type)
 		}

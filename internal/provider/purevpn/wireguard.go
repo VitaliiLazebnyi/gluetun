@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +20,8 @@ import (
 	"github.com/qdm12/gluetun/internal/constants/vpn"
 	"github.com/qdm12/gluetun/internal/models"
 	"github.com/qdm12/gluetun/internal/provider/purevpn/wgapi"
+	"github.com/qdm12/gluetun/internal/restrictednet"
+	"github.com/qdm12/gluetun/internal/wireguard"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
@@ -37,22 +38,15 @@ type wireguardState struct {
 
 type wireguardFetcher struct {
 	statePath string
-	authURL   string
-	appURL    string
-	// newHTTPClient creates an HTTP client able to reach the PureVPN
-	// website, and returns a function to call once done with it, even
-	// on error, returning the revert functions which failed.
-	newHTTPClient func(ctx context.Context, fw Firewall, logger Logger) (client *http.Client,
-		resolve func(ctx context.Context, host string) ([]netip.Addr, error),
-		cleanup func() (failedReverts []func(ctx context.Context) error), err error)
+	// authURL and appURL are the PureVPN websites base URLs,
+	// and are left empty to use the default ones.
+	authURL string
+	appURL  string
 	timeNow func() time.Time
 
 	mutex       sync.Mutex
 	state       wireguardState
 	stateLoaded bool
-	// failedReverts are the functions removing temporary firewall rules
-	// which failed, called again at the start of the next fetch.
-	failedReverts []func(ctx context.Context) error
 	// authErr is the last authentication error, returned again without
 	// contacting PureVPN as long as the PureVPN settings fingerprint is
 	// authErrFingerprint and, if set, until authErrUntil, to avoid having
@@ -66,32 +60,25 @@ type wireguardFetcher struct {
 func newWireguardFetcher() *wireguardFetcher {
 	return &wireguardFetcher{
 		statePath: "/gluetun/purevpn-wireguard.json",
-		newHTTPClient: func(ctx context.Context, fw Firewall, logger Logger) (*http.Client,
-			func(ctx context.Context, host string) ([]netip.Addr, error),
-			func() []func(ctx context.Context) error, error,
-		) {
-			return newPreTunnelHTTPClient(ctx, fw, logger, defaultPreTunnelSettings())
-		},
-		timeNow: time.Now,
+		timeNow:   time.Now,
 	}
 }
 
 // FetchWireguardConnection logs in the PureVPN member area if needed,
 // and requests a new Wireguard configuration. It should be called on
 // every connection attempt, since PureVPN removes unused peers.
-func (p *Provider) FetchWireguardConnection(ctx context.Context,
-	vpnSettings settings.VPN, fw Firewall, logger Logger,
+// The restricted network given is used to reach PureVPN before the VPN is up.
+func (p *Provider) FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN,
+	network *restrictednet.Client, logger wireguard.Logger,
 ) (connection models.WireguardConnection, err error) {
-	return p.wireguard.fetch(ctx, vpnSettings, fw, logger)
+	return p.wireguard.fetch(ctx, vpnSettings, network, logger)
 }
 
 func (f *wireguardFetcher) fetch(ctx context.Context,
-	vpnSettings settings.VPN, fw Firewall, logger Logger,
+	vpnSettings settings.VPN, network RestrictedNetwork, logger Logger,
 ) (connection models.WireguardConnection, err error) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
-
-	f.retryFailedReverts(ctx, logger)
 
 	purevpnSettings := vpnSettings.PureVPN
 	fingerprint := settingsFingerprint(purevpnSettings)
@@ -120,13 +107,17 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	}
 	f.applySessionToken(*purevpnSettings.SessionToken, logger)
 
-	httpClient, resolve, cleanup, err := f.newHTTPClient(ctx, fw, logger)
+	transport := &restrictedTransport{network: network}
 	defer func() {
-		f.failedReverts = append(f.failedReverts, cleanup()...)
+		// Failing to remove a firewall rule is not fatal, for example
+		// if the firewall got disabled during the fetch, removing all rules.
+		cleanupErr := transport.cleanup()
+		if cleanupErr != nil {
+			logger.Warn("cleaning up connections to PureVPN: " + cleanupErr.Error())
+		}
 	}()
-	if err != nil {
-		return models.WireguardConnection{}, fmt.Errorf("preparing network access to PureVPN: %w", err)
-	}
+	const httpTimeout = 30 * time.Second
+	httpClient := &http.Client{Transport: transport, Timeout: httpTimeout}
 
 	credentials := wgapi.Credentials{
 		Username:   *purevpnSettings.Username,
@@ -170,9 +161,13 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 
 	endpointIP, ok := config.EndpointIP()
 	if !ok {
-		ips, err := resolve(ctx, config.EndpointHost)
-		if err != nil {
+		ips, err := network.ResolveName(ctx, config.EndpointHost)
+		switch {
+		case err != nil:
 			return models.WireguardConnection{}, fmt.Errorf("resolving Wireguard endpoint: %w", err)
+		case len(ips) == 0:
+			return models.WireguardConnection{}, fmt.Errorf("no IP address found for Wireguard endpoint %s",
+				config.EndpointHost)
 		}
 		endpointIP = ips[0]
 	}
@@ -194,23 +189,6 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 		Addresses:           config.Addresses,
 		PersistentKeepalive: config.PersistentKeepalive,
 	}, nil
-}
-
-// retryFailedReverts calls again the functions removing temporary
-// firewall rules which failed during previous fetches, keeping the
-// ones failing again.
-func (f *wireguardFetcher) retryFailedReverts(ctx context.Context, logger Logger) {
-	var failedReverts []func(ctx context.Context) error
-	for _, revert := range f.failedReverts {
-		err := revert(ctx)
-		if err != nil {
-			logger.Warn("removing temporary firewall rules left by a previous attempt: " + err.Error())
-			failedReverts = append(failedReverts, revert)
-			continue
-		}
-		logger.Info("removed temporary firewall rules left by a previous attempt")
-	}
-	f.failedReverts = failedReverts
 }
 
 // settingsFingerprint returns a hash of the PureVPN settings, to detect

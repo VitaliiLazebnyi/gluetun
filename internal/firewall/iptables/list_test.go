@@ -36,47 +36,6 @@ num pkts bytes target     prot opt in     out     source`,
 				"\"num pkts bytes target     prot opt in     out     source\" " +
 				"is not the expected \"num pkts bytes target prot opt in out source destination\"",
 		},
-		"cgroup_rule": {
-			iptablesOutput: "Chain OUTPUT (policy DROP 0 packets, 0 bytes)\n" +
-				"num pkts bytes target     prot opt in     out     source               destination\n" +
-				"1   0     0 ACCEPT     tcp  --  *      eth0    0.0.0.0/0            1.2.3.4" +
-				"              tcp dpt:443 cgroup / mark match 0x1234\n",
-			table: chain{
-				name:   "OUTPUT",
-				policy: "DROP",
-				rules: []chainRule{{
-					lineNumber:      1,
-					target:          "ACCEPT",
-					protocol:        "tcp",
-					inputInterface:  "*",
-					outputInterface: "eth0",
-					source:          netip.MustParsePrefix("0.0.0.0/0"),
-					destination:     netip.MustParsePrefix("1.2.3.4/32"),
-					destinationPort: 443,
-					cgroupPath:      "/",
-					mark:            mark{value: 0x1234},
-				}},
-			},
-		},
-		"cgroup_missing_value": {
-			iptablesOutput: `Chain OUTPUT (policy DROP 0 packets, 0 bytes)
-num pkts bytes target     prot opt in     out     source               destination
-1   0     0 ACCEPT     tcp  --  *      eth0    0.0.0.0/0            1.2.3.4              cgroup
-`,
-			table: chain{
-				name:   "OUTPUT",
-				policy: "DROP",
-				rules: []chainRule{{
-					lineNumber:      1,
-					target:          "ACCEPT",
-					protocol:        "tcp",
-					inputInterface:  "*",
-					outputInterface: "eth0",
-					source:          netip.MustParsePrefix("0.0.0.0/0"),
-					destination:     netip.MustParsePrefix("1.2.3.4/32"),
-				}},
-			},
-		},
 		"no_rule": {
 			iptablesOutput: `Chain INPUT (policy ACCEPT 140K packets, 226M bytes)
 num pkts bytes target     prot opt in     out     source               destination`,
