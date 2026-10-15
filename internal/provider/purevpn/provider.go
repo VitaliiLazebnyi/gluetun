@@ -10,6 +10,7 @@ import (
 type Provider struct {
 	storage    common.Storage
 	connPicker *utils.ConnectionPicker
+	wireguard  *wireguardFetcher
 	common.Fetcher
 }
 
@@ -19,6 +20,7 @@ func New(storage common.Storage, ipFetcher common.IPFetcher, unzipper common.Unz
 	return &Provider{
 		storage:    storage,
 		connPicker: utils.NewConnectionPicker(),
+		wireguard:  newWireguardFetcher(),
 		Fetcher:    updater.New(ipFetcher, unzipper, updaterWarner, parallelResolver),
 	}
 }

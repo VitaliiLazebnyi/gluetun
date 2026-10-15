@@ -9,6 +9,7 @@ import (
 	"github.com/qdm12/gluetun/internal/models"
 	"github.com/qdm12/gluetun/internal/netlink"
 	"github.com/qdm12/gluetun/internal/provider"
+	"github.com/qdm12/gluetun/internal/provider/purevpn"
 	"github.com/qdm12/gluetun/internal/wireguard"
 	"github.com/qdm12/gosettings"
 )
@@ -21,9 +22,27 @@ func setupWireguard(ctx context.Context, netlinker NetLinker,
 	wireguarder *wireguard.Wireguard, connection models.Connection, err error,
 ) {
 	ipv6Internet := ipv6SupportLevel == netlink.IPv6Internet
-	connection, err = providerConf.GetConnection(settings.Provider.ServerSelection, ipv6Internet)
-	if err != nil {
-		return nil, models.Connection{}, fmt.Errorf("finding a VPN server: %w", err)
+	fetcher, ok := providerConf.(wireguardConnectionFetcher)
+	if ok {
+		// The Wireguard configuration is generated at runtime by the
+		// provider, notably PureVPN, so it is fetched on each connection
+		// attempt, which also takes care of logging in again if needed.
+		var fetched purevpn.WireguardConnection
+		fetched, err = fetcher.FetchWireguardConnection(ctx, settings, fw, logger)
+		if err != nil {
+			return nil, models.Connection{}, err
+		}
+		connection = fetched.Connection
+		settings.Wireguard.PrivateKey = &fetched.PrivateKey
+		settings.Wireguard.Addresses = fetched.Addresses
+		if *settings.Wireguard.PersistentKeepaliveInterval == 0 {
+			settings.Wireguard.PersistentKeepaliveInterval = &fetched.PersistentKeepalive
+		}
+	} else {
+		connection, err = providerConf.GetConnection(settings.Provider.ServerSelection, ipv6Internet)
+		if err != nil {
+			return nil, models.Connection{}, fmt.Errorf("finding a VPN server: %w", err)
+		}
 	}
 
 	wireguardSettings := buildWireguardSettings(connection, settings.Wireguard, ipv6SupportLevel.IsSupported())

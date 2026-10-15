@@ -12,6 +12,7 @@ import (
 	"github.com/qdm12/gluetun/internal/pmtud/tcp"
 	portforward "github.com/qdm12/gluetun/internal/portforward"
 	"github.com/qdm12/gluetun/internal/provider"
+	"github.com/qdm12/gluetun/internal/provider/purevpn"
 	"github.com/qdm12/gluetun/internal/provider/utils"
 )
 
@@ -19,6 +20,8 @@ type Firewall interface {
 	SetVPNConnection(ctx context.Context, connection models.Connection, interfaceName string) error
 	SetAllowedPort(ctx context.Context, port uint16, interfaceName string) error
 	RemoveAllowedPort(ctx context.Context, port uint16) error
+	AllowOutputTemporarily(ctx context.Context, protocol string,
+		addrPorts []netip.AddrPort) (revert func(ctx context.Context) error, err error)
 	tcp.Firewall
 }
 
@@ -45,6 +48,13 @@ type Provider interface {
 	GetConnection(selection settings.ServerSelection, ipv6Supported bool) (connection models.Connection, err error)
 	OpenVPNConfig(connection models.Connection, settings settings.OpenVPN, ipv6Supported bool) (lines []string)
 	Name() string
+}
+
+// wireguardConnectionFetcher is implemented by providers generating
+// Wireguard configurations at runtime through their API.
+type wireguardConnectionFetcher interface {
+	FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN,
+		fw purevpn.Firewall, logger purevpn.Logger) (connection purevpn.WireguardConnection, err error)
 }
 
 type PortForwarder interface {

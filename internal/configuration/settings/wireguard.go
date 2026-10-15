@@ -60,12 +60,17 @@ var regexpInterfaceName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 // Validate validates Wireguard settings.
 // It should only be ran if the VPN type chosen is Wireguard or AmneziaWg.
 func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (err error) {
+	// PureVPN Wireguard configurations are fetched at runtime,
+	// with a private key generated if not set, and the interface
+	// addresses assigned by PureVPN.
+	purevpn := vpnProvider == providers.Purevpn
+
 	// Validate PrivateKey
-	if *w.PrivateKey == "" {
+	if *w.PrivateKey == "" && !purevpn {
 		return errors.New("private key is not set")
 	}
 	_, err = wgtypes.ParseKey(*w.PrivateKey)
-	if err != nil {
+	if err != nil && *w.PrivateKey != "" {
 		err = fmt.Errorf("private key is not valid: %w", err)
 		if vpnProvider == providers.Nordvpn &&
 			err.Error() == "wgtypes: incorrect key size: 48" {
@@ -89,7 +94,7 @@ func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (
 	}
 
 	// Validate Addresses
-	if len(w.Addresses) == 0 {
+	if len(w.Addresses) == 0 && !purevpn {
 		return errors.New("interface address is not set")
 	}
 
@@ -102,7 +107,7 @@ func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (
 			hasIPv4 = true
 		}
 	}
-	if !hasIPv4 && !ipv6Supported {
+	if !hasIPv4 && !ipv6Supported && !purevpn {
 		return fmt.Errorf("no IPv4 interface addresses in %v but IPv6 is not supported",
 			w.Addresses)
 	}
