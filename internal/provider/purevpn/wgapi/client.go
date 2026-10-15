@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -54,7 +53,7 @@ type Session struct {
 }
 
 // Client is a PureVPN member area API client.
-// It is safe for concurrent use.
+// It is not safe for concurrent use.
 type Client struct {
 	httpClient  *http.Client
 	jar         *cookieJar
@@ -63,7 +62,6 @@ type Client struct {
 	credentials Credentials
 	timeNow     func() time.Time
 
-	mutex   sync.Mutex
 	session Session
 	// staleTokens are access tokens which must not be
 	// considered as the result of the current login.
@@ -110,12 +108,6 @@ func New(httpClient *http.Client, authURL, appURL string,
 
 // Session returns a copy of the current session.
 func (c *Client) Session() Session {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	return c.copySession()
-}
-
-func (c *Client) copySession() Session {
 	return Session{AccessToken: c.session.AccessToken, AuthCookies: maps.Clone(c.session.AuthCookies)}
 }
 
@@ -217,7 +209,7 @@ func checkBlocked(response *http.Response, body []byte) error {
 		return nil
 	}
 	lowerBody := strings.ToLower(string(body))
-	for _, marker := range []string{"cf-chl", "just a moment", "attention required", "cf-error-details"} {
+	for _, marker := range [...]string{"cf-chl", "just a moment", "attention required", "cf-error-details"} {
 		if strings.Contains(lowerBody, marker) {
 			return fmt.Errorf("%w: Cloudflare returned %s for %s",
 				errBlocked, response.Status, response.Request.URL.Hostname())
@@ -283,7 +275,6 @@ func (c *Client) clearAccessToken() {
 }
 
 // ensureAccessToken returns a valid access token, logging in if needed.
-// The caller must hold the client mutex.
 func (c *Client) ensureAccessToken(ctx context.Context) (token string, err error) {
 	if accessTokenValid(c.session.AccessToken, c.timeNow()) {
 		return c.session.AccessToken, nil
@@ -293,7 +284,6 @@ func (c *Client) ensureAccessToken(ctx context.Context) (token string, err error
 
 // login obtains a new access token, first using the stored single sign-on
 // session if any, and then falling back on the account credentials.
-// The caller must hold the client mutex.
 func (c *Client) login(ctx context.Context) (token string, err error) {
 	c.clearAccessToken()
 	credentialsSet := c.credentials.Username != "" && c.credentials.Password != ""

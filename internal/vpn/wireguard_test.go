@@ -12,28 +12,12 @@ import (
 	"github.com/qdm12/gluetun/internal/provider/purevpn"
 	"github.com/qdm12/gluetun/internal/wireguard"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 )
 
 // The PureVPN provider must implement wireguardConnectionFetcher, or the
 // type assertion in setupWireguard silently falls back to GetConnection.
 var _ wireguardConnectionFetcher = (*purevpn.Provider)(nil)
-
-type fakeWireguardFetcher struct {
-	connection models.WireguardConnection
-	err        error
-}
-
-func (f *fakeWireguardFetcher) FetchWireguardConnection(context.Context, settings.VPN,
-	wireguardFetcherFirewall, wireguardFetcherLogger,
-) (models.WireguardConnection, error) {
-	return f.connection, f.err
-}
-
-type noopLogger struct{}
-
-func (noopLogger) Debug(string) {}
-func (noopLogger) Info(string)  {}
-func (noopLogger) Warn(string)  {}
 
 func Test_fetchWireguardConnection(t *testing.T) {
 	t.Parallel()
@@ -48,7 +32,8 @@ func Test_fetchWireguardConnection(t *testing.T) {
 	ipv6Address := netip.MustParsePrefix("fd00::9/128")
 
 	testCases := map[string]struct {
-		fetcher        *fakeWireguardFetcher
+		fetched        models.WireguardConnection
+		fetchErr       error
 		userPrivateKey string
 		userAddresses  []netip.Prefix
 		userKeepalive  time.Duration
@@ -60,16 +45,16 @@ func Test_fetchWireguardConnection(t *testing.T) {
 		errMessage     string
 	}{
 		"fetch_error": {
-			fetcher:    &fakeWireguardFetcher{err: errors.New("test error")},
+			fetchErr:   errors.New("test error"),
 			errMessage: "test error",
 		},
 		"overrides_and_provider_keepalive": {
-			fetcher: &fakeWireguardFetcher{connection: models.WireguardConnection{
+			fetched: models.WireguardConnection{
 				Connection:          serverConnection,
 				PrivateKey:          "fetched-private-key",
 				Addresses:           []netip.Prefix{ipv4Address},
 				PersistentKeepalive: 21 * time.Second,
-			}},
+			},
 			userPrivateKey: "",
 			userAddresses:  []netip.Prefix{netip.MustParsePrefix("10.0.0.1/32")},
 			connection:     serverConnection,
@@ -78,12 +63,12 @@ func Test_fetchWireguardConnection(t *testing.T) {
 			keepalive:      21 * time.Second,
 		},
 		"user_keepalive_kept": {
-			fetcher: &fakeWireguardFetcher{connection: models.WireguardConnection{
+			fetched: models.WireguardConnection{
 				Connection:          serverConnection,
 				PrivateKey:          "user-private-key",
 				Addresses:           []netip.Prefix{ipv4Address, ipv6Address},
 				PersistentKeepalive: 21 * time.Second,
-			}},
+			},
 			userPrivateKey: "user-private-key",
 			userKeepalive:  time.Minute,
 			connection:     serverConnection,
@@ -92,27 +77,27 @@ func Test_fetchWireguardConnection(t *testing.T) {
 			keepalive:      time.Minute,
 		},
 		"no_address": {
-			fetcher: &fakeWireguardFetcher{connection: models.WireguardConnection{
+			fetched: models.WireguardConnection{
 				Connection: serverConnection,
 				PrivateKey: "fetched-private-key",
-			}},
+			},
 			errMessage: "no interface address assigned by the provider",
 		},
 		"ipv6_only_address_without_ipv6_support": {
-			fetcher: &fakeWireguardFetcher{connection: models.WireguardConnection{
+			fetched: models.WireguardConnection{
 				Connection: serverConnection,
 				PrivateKey: "fetched-private-key",
 				Addresses:  []netip.Prefix{ipv6Address},
-			}},
+			},
 			errMessage: "no IPv4 interface address assigned by the provider in [fd00::9/128] " +
 				"and IPv6 is not supported",
 		},
 		"ipv6_only_address_with_ipv6_support": {
-			fetcher: &fakeWireguardFetcher{connection: models.WireguardConnection{
+			fetched: models.WireguardConnection{
 				Connection: serverConnection,
 				PrivateKey: "fetched-private-key",
 				Addresses:  []netip.Prefix{ipv6Address},
-			}},
+			},
 			ipv6Supported: true,
 			connection:    serverConnection,
 			privateKey:    "fetched-private-key",
@@ -124,17 +109,25 @@ func Test_fetchWireguardConnection(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
+			ctrl := gomock.NewController(t)
+
 			vpnSettings := settings.VPN{
 				Wireguard: settings.Wireguard{
-					PrivateKey:                  ptrTo(testCase.userPrivateKey),
+					PrivateKey:                  new(testCase.userPrivateKey),
 					Addresses:                   testCase.userAddresses,
-					PersistentKeepaliveInterval: ptrTo(testCase.userKeepalive),
+					PersistentKeepaliveInterval: new(testCase.userKeepalive),
 					Interface:                   "wg0",
 				},
 			}
+			ctx := context.Background()
+			firewall := NewMockwireguardFetcherFirewall(ctrl)
+			logger := NewMockwireguardFetcherLogger(ctrl)
+			fetcher := NewMockwireguardConnectionFetcher(ctrl)
+			fetcher.EXPECT().FetchWireguardConnection(ctx, vpnSettings, firewall, logger).
+				Return(testCase.fetched, testCase.fetchErr)
 
-			connection, wireguardSettings, err := fetchWireguardConnection(context.Background(),
-				testCase.fetcher, vpnSettings, nil, testCase.ipv6Supported, noopLogger{})
+			connection, wireguardSettings, err := fetchWireguardConnection(ctx,
+				fetcher, vpnSettings, firewall, testCase.ipv6Supported, logger)
 
 			if testCase.errMessage != "" {
 				assert.ErrorContains(t, err, testCase.errMessage)

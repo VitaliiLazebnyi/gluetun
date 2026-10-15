@@ -36,6 +36,10 @@ func Test_parseHTML(t *testing.T) {
 <p class="alert-error">Visible <script>var captcha = 1;</script>error</p>`,
 			errorMessages: []string{"Visible error"},
 		},
+		"input_outside_form_and_alert": {
+			body:          `<input name="ignored"><div role="alert">Alert <b>text</b></div>`,
+			errorMessages: []string{"Alert text"},
+		},
 		"labels": {
 			body: `<form action="/methods">
 <label><input type="radio" name="methodId" value="m-email" checked> Email</label>
@@ -92,6 +96,38 @@ func Test_loginPageError(t *testing.T) {
 			err := loginPageError(&htmlPage{errors: testCase.errors})
 			assert.ErrorIs(t, err, testCase.errWrapped)
 			assert.ErrorContains(t, err, testCase.errMessage)
+		})
+	}
+}
+
+func Test_isTwoFactorMethodsForm(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		inputs  []htmlInput
+		matches bool
+	}{
+		"no_input": {},
+		"hidden_method": {
+			inputs: []htmlInput{{name: "methodId", value: "m-email", inputType: "hidden"}},
+		},
+		"other_radio": {
+			inputs: []htmlInput{{name: "choice", value: "m-email", inputType: "radio"}},
+		},
+		"radio_methods": {
+			inputs: []htmlInput{
+				{name: "twoFactorId", value: "tf-1", inputType: "hidden"},
+				{name: "methodId", value: "m-auth", inputType: "radio"},
+			},
+			matches: true,
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			form := &htmlForm{inputs: testCase.inputs}
+			assert.Equal(t, testCase.matches, isTwoFactorMethodsForm(form))
 		})
 	}
 }

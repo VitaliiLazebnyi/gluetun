@@ -56,14 +56,21 @@ var (
 // credentials or login session, such that retrying without
 // changing the settings is pointless.
 func IsAuthError(err error) bool {
-	for _, target := range []error{
+	for _, target := range [...]error{
 		errCredentialsNotSet, errInvalidCredentials,
 		errTwoFactorRequired, errTwoFactorCodeInvalid,
-		errTwoFactorMethodUnsupported, errCaptchaRequired,
+		errTwoFactorMethodUnsupported,
 	} {
 		if errors.Is(err, target) {
 			return true
 		}
 	}
 	return false
+}
+
+// IsCaptchaError returns true if the error is due to PureVPN
+// requiring a captcha to log in, which may no longer be the
+// case after some time without login attempts.
+func IsCaptchaError(err error) bool {
+	return errors.Is(err, errCaptchaRequired)
 }

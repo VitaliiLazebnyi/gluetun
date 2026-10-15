@@ -19,48 +19,8 @@ import (
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
-
-// fakeFirewall records AllowOutputTemporarily and revert calls.
-type fakeFirewall struct {
-	// allowErrs are the errors to return for each AllowOutputTemporarily call.
-	allowErrs []error
-	// revertErrs are the errors to return for each revert, indexed by
-	// AllowOutputTemporarily call index.
-	revertErrs []error
-
-	mutex   sync.Mutex
-	allowed []string
-	reverts []int
-}
-
-func (f *fakeFirewall) AllowOutputTemporarily(_ context.Context, protocol string, mark uint32,
-	addrPorts []netip.AddrPort,
-) (revert func(ctx context.Context) error, err error) {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	index := len(f.allowed)
-	f.allowed = append(f.allowed, fmt.Sprintf("%s mark %d %v", protocol, mark, addrPorts))
-	revert = func(context.Context) error {
-		f.mutex.Lock()
-		defer f.mutex.Unlock()
-		f.reverts = append(f.reverts, index)
-		if index < len(f.revertErrs) {
-			return f.revertErrs[index]
-		}
-		return nil
-	}
-	if index < len(f.allowErrs) {
-		err = f.allowErrs[index]
-	}
-	return revert, err
-}
-
-func (f *fakeFirewall) calls() (allowed []string, reverts []int) {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	return append([]string(nil), f.allowed...), append([]int(nil), f.reverts...)
-}
 
 // newTestDoHServer returns a DNS over HTTPS server answering
 // 127.0.0.1 for A queries of the hosts given, and NXDOMAIN otherwise.
@@ -134,13 +94,14 @@ func (m *markRecorder) dialed() []string {
 
 func Test_newPreTunnelHTTPClient(t *testing.T) {
 	t.Parallel()
+	ctrl := gomock.NewController(t)
 
 	testDoHServer := newTestDoHServer(t, "auth.example.com")
 	dohPort := serverPort(t, testDoHServer)
 	purevpnServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("purevpn"))
 	}))
-	defer purevpnServer.Close()
+	t.Cleanup(purevpnServer.Close)
 	purevpnPort := serverPort(t, purevpnServer)
 
 	rootCAs := x509.NewCertPool()
@@ -160,17 +121,30 @@ func Test_newPreTunnelHTTPClient(t *testing.T) {
 		dialControl: marks.control,
 		rootCAs:     rootCAs,
 	}
-	firewall := &fakeFirewall{revertErrs: []error{nil, errors.New("test revert error")}}
-	logger := &recordingLogger{}
+	var reverts []string
+	revertDoH := func(context.Context) error {
+		reverts = append(reverts, "DoH")
+		return nil
+	}
+	revertPureVPN := func(context.Context) error {
+		reverts = append(reverts, "PureVPN")
+		return errors.New("test revert error")
+	}
+	ctx := context.Background()
+	firewall := NewMockFirewall(ctrl)
+	gomock.InOrder(
+		firewall.EXPECT().AllowOutputTemporarily(ctx, "tcp", uint32(0x7075),
+			[]netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), dohPort)}).
+			Return(revertDoH, nil),
+		firewall.EXPECT().AllowOutputTemporarily(ctx, "tcp", uint32(0x7075),
+			[]netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), purevpnPort)}).
+			Return(revertPureVPN, nil),
+	)
+	logger := NewMockLogger(ctrl)
 
-	client, resolve, cleanup, err := newPreTunnelHTTPClient(context.Background(), firewall, logger, preTunnel)
+	client, resolve, cleanup, err := newPreTunnelHTTPClient(ctx, firewall, logger, preTunnel)
 	require.NoError(t, err)
 
-	allowed, reverts := firewall.calls()
-	assert.Equal(t, []string{
-		fmt.Sprintf("tcp mark 28789 [127.0.0.1:%d]", dohPort),
-		fmt.Sprintf("tcp mark 28789 [127.0.0.1:%d]", purevpnPort),
-	}, allowed)
 	assert.Empty(t, reverts)
 	assert.Equal(t, []string{fmt.Sprintf("127.0.0.1:%d", dohPort)}, marks.dialed(),
 		"DNS over HTTPS connection must be marked")
@@ -211,10 +185,13 @@ func Test_newPreTunnelHTTPClient(t *testing.T) {
 	assert.Equal(t, []netip.Addr{netip.MustParseAddr("127.0.0.1")}, ips)
 
 	t.Cleanup(func() {
-		cleanup()
-		_, reverts = firewall.calls()
-		assert.Equal(t, []int{1, 0}, reverts, "reverts must be done in reverse order")
-		assert.Equal(t, []string{"removing temporary firewall rules: test revert error"}, logger.warnings())
+		logger.EXPECT().Warn("removing temporary firewall rules: test revert error")
+		failedReverts := cleanup()
+		assert.Equal(t, []string{"PureVPN", "DoH"}, reverts, "reverts must be done in reverse order")
+		require.Len(t, failedReverts, 1)
+		err := failedReverts[0](context.Background())
+		assert.EqualError(t, err, "test revert error")
+		assert.Equal(t, []string{"PureVPN", "DoH", "PureVPN"}, reverts, "failed revert must be returned")
 	})
 }
 
@@ -222,30 +199,44 @@ func Test_newPreTunnelHTTPClient_errors(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
+		dohURL string // defaults to the test DNS over HTTPS server URL
+		host   string
+		// allowErrs are the errors returned by each AllowOutputTemporarily call expected.
 		allowErrs  []error
-		host       string
-		allowed    int
-		reverts    []int
+		revertErr  error
+		warning    string
+		reverts    []string
 		errMessage string
 	}{
+		"invalid_DoH_URL": {
+			dohURL:     "https://doh.example.com:99999/dns-query",
+			host:       "auth.example.com",
+			errMessage: "parsing DNS over HTTPS URL: parsing port: ",
+		},
 		"allow_DoH_error": {
 			allowErrs:  []error{errors.New("test error")},
 			host:       "auth.example.com",
-			allowed:    1,
-			reverts:    []int{0},
+			reverts:    []string{"revert 0"},
 			errMessage: "allowing DNS over HTTPS traffic: test error",
 		},
 		"resolution_error": {
+			allowErrs:  []error{nil},
 			host:       "unknown.example.com",
-			allowed:    1,
-			reverts:    []int{0},
+			reverts:    []string{"revert 0"},
+			errMessage: "resolving unknown.example.com: querying https://doh.example.com:",
+		},
+		"resolution_error_and_revert_error": {
+			allowErrs:  []error{nil},
+			host:       "unknown.example.com",
+			revertErr:  errors.New("test revert error"),
+			warning:    "removing temporary firewall rules: test revert error",
+			reverts:    []string{"revert 0"},
 			errMessage: "resolving unknown.example.com: querying https://doh.example.com:",
 		},
 		"allow_PureVPN_error": {
 			allowErrs:  []error{nil, errors.New("test error")},
 			host:       "auth.example.com",
-			allowed:    2,
-			reverts:    []int{1, 0},
+			reverts:    []string{"revert 1", "revert 0"},
 			errMessage: "allowing traffic to PureVPN website: test error",
 		},
 	}
@@ -253,15 +244,21 @@ func Test_newPreTunnelHTTPClient_errors(t *testing.T) {
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+			ctrl := gomock.NewController(t)
 
 			testDoHServer := newTestDoHServer(t, "auth.example.com")
+			dohPort := serverPort(t, testDoHServer)
 			rootCAs := x509.NewCertPool()
 			rootCAs.AddCert(testDoHServer.Certificate())
 			marks := &markRecorder{}
+			dohURL := testCase.dohURL
+			if dohURL == "" {
+				dohURL = "https://doh.example.com:" + fmt.Sprint(dohPort) + "/dns-query"
+			}
 			preTunnel := preTunnelSettings{
 				dohServers: []dohServer{
 					{
-						url: "https://doh.example.com:" + fmt.Sprint(serverPort(t, testDoHServer)) + "/dns-query",
+						url: dohURL,
 						ips: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
 					},
 				},
@@ -271,18 +268,40 @@ func Test_newPreTunnelHTTPClient_errors(t *testing.T) {
 				dialControl: marks.control,
 				rootCAs:     rootCAs,
 			}
-			firewall := &fakeFirewall{allowErrs: testCase.allowErrs}
+			ctx := context.Background()
+			var reverts []string
+			firewall := NewMockFirewall(ctrl)
+			allowedAddrPorts := [...][]netip.AddrPort{
+				{netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), dohPort)},
+				{netip.MustParseAddrPort("127.0.0.1:443")},
+			}
+			for i, allowErr := range testCase.allowErrs {
+				revert := func(context.Context) error {
+					reverts = append(reverts, fmt.Sprintf("revert %d", i))
+					return testCase.revertErr
+				}
+				firewall.EXPECT().AllowOutputTemporarily(ctx, "tcp", uint32(0x7075), allowedAddrPorts[i]).
+					Return(revert, allowErr)
+			}
+			logger := NewMockLogger(ctrl)
+			if testCase.warning != "" {
+				logger.EXPECT().Warn(testCase.warning)
+			}
 
-			client, resolve, cleanup, err := newPreTunnelHTTPClient(context.Background(),
-				firewall, &recordingLogger{}, preTunnel)
+			client, resolve, cleanup, err := newPreTunnelHTTPClient(ctx, firewall, logger, preTunnel)
 
 			assert.ErrorContains(t, err, testCase.errMessage)
 			assert.Nil(t, client)
 			assert.Nil(t, resolve)
-			assert.Nil(t, cleanup)
-			allowed, reverts := firewall.calls()
-			assert.Len(t, allowed, testCase.allowed)
+			require.NotNil(t, cleanup)
+			assert.Empty(t, reverts, "reverts must only be done by the cleanup")
+			failedReverts := cleanup()
 			assert.Equal(t, testCase.reverts, reverts)
+			if testCase.revertErr != nil {
+				assert.Len(t, failedReverts, 1)
+			} else {
+				assert.Empty(t, failedReverts)
+			}
 		})
 	}
 }
@@ -309,6 +328,10 @@ func Test_urlHostPort(t *testing.T) {
 		"invalid_port": {
 			rawURL:     "https://dns.google:99999/dns-query",
 			errMessage: "parsing port: ",
+		},
+		"invalid_URL": {
+			rawURL:     "https://[::1/dns-query",
+			errMessage: "parsing URL: ",
 		},
 	}
 
@@ -337,7 +360,6 @@ func Test_defaultPreTunnelSettings(t *testing.T) {
 	assert.Equal(t, []string{"auth.purevpn.com", "my.purevpn.com"}, preTunnel.hosts)
 	assert.Equal(t, uint16(443), preTunnel.port)
 	assert.NotZero(t, preTunnel.mark)
-	assert.NotEqual(t, preTunnel.mark, defaultPreTunnelSettings().mark, "mark must be random")
 	assert.NotNil(t, preTunnel.dialControl)
 	assert.Nil(t, preTunnel.rootCAs)
 	require.Len(t, preTunnel.dohServers, 2)
@@ -352,10 +374,35 @@ func Test_defaultPreTunnelSettings(t *testing.T) {
 func Test_newPreTunnelMark(t *testing.T) {
 	t.Parallel()
 
-	reserved := map[uint32]struct{}{0: {}, 0x567: {}, 4545: {}, 51820: {}}
-	for range 1000 {
-		mark := newPreTunnelMark()
-		_, isReserved := reserved[mark]
-		assert.False(t, isReserved)
+	testCases := map[string]struct {
+		randomValues []uint32
+		mark         uint32
+	}{
+		"first_value": {
+			randomValues: []uint32{0x7075},
+			mark:         0x7075,
+		},
+		"reserved_values_skipped": {
+			randomValues: []uint32{0, 0x567, 4545, 51820, 0x7075},
+			mark:         0x7075,
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			calls := 0
+			randomUint32 := func() uint32 {
+				value := testCase.randomValues[calls]
+				calls++
+				return value
+			}
+
+			mark := newPreTunnelMark(randomUint32)
+
+			assert.Equal(t, testCase.mark, mark)
+			assert.Equal(t, len(testCase.randomValues), calls)
+		})
 	}
 }

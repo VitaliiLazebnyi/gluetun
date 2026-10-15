@@ -82,14 +82,28 @@ func Test_PureVPN_validate(t *testing.T) {
 func Test_Wireguard_validate_purevpn(t *testing.T) {
 	t.Parallel()
 
+	const validKey = "Y0QnWR6mhgxOjNkPUkRdPYKYrB+pERhKFAuhkBapHw8="
 	testCases := map[string]struct {
-		provider   string
-		privateKey string
-		addresses  []netip.Prefix
-		errMessage string
+		provider     string
+		privateKey   string
+		preSharedKey string
+		addresses    []netip.Prefix
+		errMessage   string
 	}{
 		"purevpn_defaults": {
 			provider: providers.Purevpn,
+		},
+		"purevpn_preshared_key_set": {
+			provider:     providers.Purevpn,
+			preSharedKey: validKey,
+			errMessage: "pre-shared key cannot be set for PureVPN, " +
+				"since PureVPN Wireguard servers do not use one",
+		},
+		"other_provider_preshared_key_set": {
+			provider:     providers.Mullvad,
+			privateKey:   validKey,
+			preSharedKey: validKey,
+			addresses:    []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")},
 		},
 		"other_provider_private_key_missing": {
 			provider:   providers.Mullvad,
@@ -113,8 +127,9 @@ func Test_Wireguard_validate_purevpn(t *testing.T) {
 			t.Parallel()
 
 			wireguardSettings := Wireguard{
-				PrivateKey: &testCase.privateKey,
-				Addresses:  testCase.addresses,
+				PrivateKey:   new(testCase.privateKey),
+				PreSharedKey: new(testCase.preSharedKey),
+				Addresses:    testCase.addresses,
 			}
 			wireguardSettings.setDefaults(testCase.provider)
 
@@ -227,6 +242,57 @@ func Test_ServerSelection_validate_purevpnWireguardFilters(t *testing.T) {
 			err := selection.validate(providers.Purevpn, pureVPNFilterChoicesGetter{}, warner)
 
 			assert.NoError(t, err)
+		})
+	}
+}
+
+func Test_validatePreSharedKey(t *testing.T) {
+	t.Parallel()
+
+	const validKey = "Y0QnWR6mhgxOjNkPUkRdPYKYrB+pERhKFAuhkBapHw8="
+	testCases := map[string]struct {
+		provider     string
+		preSharedKey string
+		errMessage   string
+	}{
+		"airvpn_missing": {
+			provider:   providers.Airvpn,
+			errMessage: "pre-shared key is not set",
+		},
+		"airvpn_valid": {
+			provider:     providers.Airvpn,
+			preSharedKey: validKey,
+		},
+		"purevpn_set": {
+			provider:     providers.Purevpn,
+			preSharedKey: validKey,
+			errMessage: "pre-shared key cannot be set for PureVPN, " +
+				"since PureVPN Wireguard servers do not use one",
+		},
+		"purevpn_empty": {
+			provider: providers.Purevpn,
+		},
+		"optional_empty": {
+			provider: providers.Mullvad,
+		},
+		"invalid": {
+			provider:     providers.Mullvad,
+			preSharedKey: "invalid",
+			errMessage:   "pre-shared key is not valid: ",
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validatePreSharedKey(testCase.provider, testCase.preSharedKey)
+
+			if testCase.errMessage == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, testCase.errMessage)
 		})
 	}
 }

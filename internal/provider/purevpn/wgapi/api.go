@@ -34,9 +34,6 @@ type ServerRequest struct {
 func (c *Client) FetchConfig(ctx context.Context, request ServerRequest) (
 	config Config, err error,
 ) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	config, err = c.fetchConfig(ctx, request)
 	if !errors.Is(err, errUnauthorized) {
 		return config, err
@@ -237,6 +234,9 @@ func (c *Client) selectSubscription(ctx context.Context, token,
 // getSubscriptions gets the account subscriptions, trying the
 // subscription endpoint first and then the on-boarding endpoint,
 // since both have been used by the member area.
+// The returned error only wraps errUnauthorized if the on-boarding
+// endpoint rejects the access token, so a subscription endpoint
+// rejecting it alone does not trigger a new login.
 func (c *Client) getSubscriptions(ctx context.Context, token string) (
 	subscriptions []subscription, err error,
 ) {
@@ -244,7 +244,8 @@ func (c *Client) getSubscriptions(ctx context.Context, token string) (
 	switch {
 	case err == nil:
 		return subscriptions, nil
-	case !errors.Is(err, errAPI) && !errors.Is(err, errUnexpectedResponse):
+	case !errors.Is(err, errAPI) && !errors.Is(err, errUnexpectedResponse) &&
+		!errors.Is(err, errUnauthorized):
 		return nil, fmt.Errorf("requesting subscriptions: %w", err)
 	}
 	subscriptionErr := err
@@ -253,11 +254,16 @@ func (c *Client) getSubscriptions(ctx context.Context, token string) (
 		Subscriptions []subscription `json:"subscriptions"`
 	}
 	err = c.apiRequest(ctx, token, "/v2/api/on-boarding", nil, &onBoarding)
-	if err != nil {
+	switch {
+	case err == nil:
+		return onBoarding.Subscriptions, nil
+	case errors.Is(subscriptionErr, errUnauthorized) && !errors.Is(err, errUnauthorized):
+		return nil, fmt.Errorf("requesting on-boarding after subscriptions endpoint "+
+			"rejected the access token: %w", err)
+	default:
 		return nil, fmt.Errorf("requesting subscriptions: %w; requesting on-boarding: %w",
 			subscriptionErr, err)
 	}
-	return onBoarding.Subscriptions, nil
 }
 
 func describeSubscriptions(subscriptions []subscription) string {

@@ -31,16 +31,29 @@ import (
 // and reading the mark of another socket or the firewall rules requires
 // the CAP_NET_ADMIN capability. The mark is therefore random and changes
 // on each fetch, so a program with CAP_NET_RAW but without CAP_NET_ADMIN
-// cannot guess it. It must differ from other marks used: 0x567 (kill switch
-// connection mark), 4545 (TCP path MTU discovery) and 51820 (Wireguard).
-func newPreTunnelMark() (mark uint32) {
-	const killSwitchMark, pmtudMark, wireguardMark = 0x567, 4545, 51820
-	for mark == 0 || mark == killSwitchMark || mark == pmtudMark || mark == wireguardMark {
-		var buffer [4]byte
-		_, _ = rand.Read(buffer[:]) // never returns an error
-		mark = binary.BigEndian.Uint32(buffer[:])
+// cannot guess it. The firewall rules also match the cgroup of gluetun
+// if supported, so the mark cannot be brute forced by other containers.
+// It must differ from other marks used: 0x567 (kill switch connection mark),
+// 4545 (TCP path MTU discovery) and 51820 (Wireguard).
+func newPreTunnelMark(randomUint32 func() uint32) (mark uint32) {
+	for {
+		mark = randomUint32()
+		const killSwitchMark = 0x567
+		const pmtudMark = 4545
+		const wireguardMark = 51820
+		switch mark {
+		case 0, killSwitchMark, pmtudMark, wireguardMark:
+			continue
+		}
+		return mark
 	}
-	return mark
+}
+
+// randomUint32 returns a cryptographically secure random number.
+func randomUint32() uint32 {
+	var buffer [4]byte
+	_, _ = rand.Read(buffer[:]) // never returns an error
+	return binary.BigEndian.Uint32(buffer[:])
 }
 
 type dohServer struct {
@@ -69,18 +82,19 @@ type preTunnelSettings struct {
 	rootCAs *x509.CertPool
 }
 
+const httpsPort = 443
+
 func defaultPreTunnelSettings() preTunnelSettings {
 	upstreams := [...]dnsprovider.Provider{dnsprovider.Cloudflare(), dnsprovider.Google()}
 	dohServers := make([]dohServer, len(upstreams))
 	for i, upstream := range upstreams {
 		dohServers[i] = dohServer{url: upstream.DoH.URL, ips: upstream.DoH.IPv4}
 	}
-	const https = 443
-	mark := newPreTunnelMark()
+	mark := newPreTunnelMark(randomUint32)
 	return preTunnelSettings{
 		dohServers:  dohServers,
 		hosts:       []string{mustHost(wgapi.DefaultAuthURL), mustHost(wgapi.DefaultAppURL)},
-		port:        https,
+		port:        httpsPort,
 		mark:        mark,
 		dialControl: newMarkControl(mark),
 	}
@@ -101,19 +115,21 @@ func mustHost(rawURL string) string {
 // allows HTTPS traffic from marked sockets to the resolved IP addresses.
 // All connections use marked sockets, dial pinned IP addresses only, and
 // do not depend on the system DNS nor on a proxy. The cleanup function
-// returned closes idle connections and removes the firewall rules, logging
-// any error.
+// returned is never nil, even if an error is returned, and must be called
+// once done. It closes idle connections and removes the firewall rules,
+// logging any error, and returns the revert functions which failed, to
+// be called again later, in order.
 func newPreTunnelHTTPClient(ctx context.Context, fw Firewall, logger Logger,
 	preTunnel preTunnelSettings,
 ) (client *http.Client, resolve func(ctx context.Context, host string) ([]netip.Addr, error),
-	cleanup func(), err error,
+	cleanup func() (failedReverts []func(ctx context.Context) error), err error,
 ) {
 	const dialTimeout = 10 * time.Second
 	dialer := &net.Dialer{Timeout: dialTimeout, Control: preTunnel.dialControl}
 
 	var transports []*http.Transport
 	var reverts []func(ctx context.Context) error
-	cleanup = func() {
+	cleanup = func() (failedReverts []func(ctx context.Context) error) {
 		for _, transport := range transports {
 			transport.CloseIdleConnections()
 		}
@@ -121,8 +137,10 @@ func newPreTunnelHTTPClient(ctx context.Context, fw Firewall, logger Logger,
 			err := revert(context.Background())
 			if err != nil {
 				logger.Warn("removing temporary firewall rules: " + err.Error())
+				failedReverts = append(failedReverts, revert)
 			}
 		}
+		return failedReverts
 	}
 
 	dohAddresses := make(map[string][]netip.AddrPort, len(preTunnel.dohServers))
@@ -131,7 +149,7 @@ func newPreTunnelHTTPClient(ctx context.Context, fw Firewall, logger Logger,
 	for i, server := range preTunnel.dohServers {
 		hostPort, port, err := urlHostPort(server.url)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("parsing DNS over HTTPS URL: %w", err)
+			return nil, nil, cleanup, fmt.Errorf("parsing DNS over HTTPS URL: %w", err)
 		}
 		dohURLs[i] = server.url
 		for _, ip := range server.ips {
@@ -144,8 +162,7 @@ func newPreTunnelHTTPClient(ctx context.Context, fw Firewall, logger Logger,
 	revert, err := fw.AllowOutputTemporarily(ctx, constants.TCP, preTunnel.mark, dohAddrPorts)
 	reverts = append(reverts, revert)
 	if err != nil {
-		cleanup()
-		return nil, nil, nil, fmt.Errorf("allowing DNS over HTTPS traffic: %w", err)
+		return nil, nil, cleanup, fmt.Errorf("allowing DNS over HTTPS traffic: %w", err)
 	}
 
 	dohTransport := newPinnedTransport(dialer, dohAddresses, preTunnel.rootCAs)
@@ -162,8 +179,7 @@ func newPreTunnelHTTPClient(ctx context.Context, fw Firewall, logger Logger,
 	for _, host := range preTunnel.hosts {
 		ips, err := resolve(ctx, host)
 		if err != nil {
-			cleanup()
-			return nil, nil, nil, fmt.Errorf("resolving %s: %w", host, err)
+			return nil, nil, cleanup, fmt.Errorf("resolving %s: %w", host, err)
 		}
 		hostPort := net.JoinHostPort(host, strconv.Itoa(int(preTunnel.port)))
 		for _, ip := range ips {
@@ -176,8 +192,7 @@ func newPreTunnelHTTPClient(ctx context.Context, fw Firewall, logger Logger,
 	revert, err = fw.AllowOutputTemporarily(ctx, constants.TCP, preTunnel.mark, allowed)
 	reverts = append(reverts, revert)
 	if err != nil {
-		cleanup()
-		return nil, nil, nil, fmt.Errorf("allowing traffic to PureVPN website: %w", err)
+		return nil, nil, cleanup, fmt.Errorf("allowing traffic to PureVPN website: %w", err)
 	}
 
 	transport := newPinnedTransport(dialer, hostAddresses, preTunnel.rootCAs)
@@ -192,10 +207,9 @@ func newPreTunnelHTTPClient(ctx context.Context, fw Firewall, logger Logger,
 func urlHostPort(rawURL string) (hostPort string, port uint16, err error) {
 	parsedURL, err := url.Parse(rawURL)
 	if err != nil {
-		return "", 0, err
+		return "", 0, fmt.Errorf("parsing URL: %w", err)
 	}
-	const https = 443
-	port = https
+	port = httpsPort
 	if parsedURL.Port() != "" {
 		const base, bitSize = 10, 16
 		port64, err := strconv.ParseUint(parsedURL.Port(), base, bitSize)

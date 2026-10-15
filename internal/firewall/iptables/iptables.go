@@ -81,21 +81,50 @@ func (c *Config) runIptablesInstruction(ctx context.Context, instruction string)
 	return err
 }
 
+// runRedactedIptablesInstruction is like runIptablesInstruction, but logs
+// and reports errors with logInstruction instead of instruction, for
+// instructions containing a secret, and restores the iptables rules on
+// error even if the context is canceled, since the instruction may have
+// been applied before the context got canceled.
+func (c *Config) runRedactedIptablesInstruction(ctx context.Context, instruction, logInstruction string) error {
+	c.iptablesMutex.Lock() // only one iptables command at once
+	defer c.iptablesMutex.Unlock()
+
+	restore, err := c.saveAndRestoreIPv4(ctx)
+	if err != nil {
+		return err
+	}
+
+	err = c.runRedactedIptablesInstructionNoSave(ctx, instruction, logInstruction)
+	if err != nil {
+		restore(context.WithoutCancel(ctx))
+	}
+	return err
+}
+
 func (c *Config) runIptablesInstructionNoSave(ctx context.Context, instruction string) error {
+	return c.runRedactedIptablesInstructionNoSave(ctx, instruction, instruction)
+}
+
+// runRedactedIptablesInstructionNoSave runs the iptables instruction given,
+// logging and reporting errors with logInstruction instead of instruction.
+func (c *Config) runRedactedIptablesInstructionNoSave(ctx context.Context,
+	instruction, logInstruction string,
+) error {
 	if isDeleteMatchInstruction(instruction) {
-		return deleteIPTablesRule(ctx, c.ipTables, instruction,
+		return deleteIPTablesRule(ctx, c.ipTables, instruction, logInstruction,
 			c.runner, c.logger)
 	}
 
 	flags := strings.Fields(instruction)
 	cmd := exec.CommandContext(ctx, c.ipTables, flags...) // #nosec G204
-	c.logger.Debug(cmd.String())
+	c.logger.Debug(cmd.Path + " " + strings.Join(strings.Fields(logInstruction), " "))
 	if output, err := c.runner.Run(cmd); err != nil {
 		if strings.Contains(output, "missing kernel module") {
 			err = ErrKernelModuleMissing
 		}
 		return fmt.Errorf("command failed: \"%s %s\": %s: %w",
-			c.ipTables, instruction, output, err)
+			c.ipTables, logInstruction, output, err)
 	}
 	return nil
 }
@@ -348,21 +377,29 @@ func (c *Config) AcceptOutput(ctx context.Context,
 // packets carrying the given mark, which is for example set on sockets with
 // the SO_MARK socket option. This allows only the program marking its sockets
 // to reach the destination, and not other programs sharing the network namespace.
+// If the cgroup path given is not empty, packets must also come from a socket
+// of a process in this cgroup v2 path (or a descendant), relative to the cgroup
+// namespace of the program. The mark is a secret and is not logged.
 func (c *Config) AcceptOutputMarked(ctx context.Context, protocol, intf string,
-	ip netip.Addr, port uint16, mark uint32, remove bool,
+	ip netip.Addr, port uint16, cgroupPath string, mark uint32, remove bool,
 ) error {
 	if !ip.Is4() {
 		return fmt.Errorf("IP address is not IPv4: %s", ip)
 	}
-	instruction := acceptOutputMarkedInstruction(protocol, intf, ip, port, mark, remove)
-	return c.runIptablesInstruction(ctx, instruction)
+	instruction := acceptOutputMarkedInstruction(protocol, intf, ip, port, cgroupPath, fmt.Sprint(mark), remove)
+	logInstruction := acceptOutputMarkedInstruction(protocol, intf, ip, port, cgroupPath, "<redacted>", remove)
+	return c.runRedactedIptablesInstruction(ctx, instruction, logInstruction)
 }
 
 func acceptOutputMarkedInstruction(protocol, intf string,
-	ip netip.Addr, port uint16, mark uint32, remove bool,
+	ip netip.Addr, port uint16, cgroupPath, mark string, remove bool,
 ) string {
-	return fmt.Sprintf("%s OUTPUT -d %s -o %s -p %s -m %s --dport %d -m mark --mark %d -j ACCEPT",
-		appendOrDelete(remove), ip, intf, protocol, protocol, port, mark)
+	cgroupMatch := ""
+	if cgroupPath != "" {
+		cgroupMatch = " -m cgroup --path " + cgroupPath
+	}
+	return fmt.Sprintf("%s OUTPUT -d %s -o %s -p %s -m %s --dport %d%s -m mark --mark %s -j ACCEPT",
+		appendOrDelete(remove), ip, intf, protocol, protocol, port, cgroupMatch, mark)
 }
 
 func (c *Config) AcceptOutputFromIPPortToIPPort(ctx context.Context,

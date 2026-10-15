@@ -22,6 +22,13 @@ type Config struct {
 	impl            firewallImpl
 	customRulesPath string
 
+	// cgroupPath is the cgroup v2 path of this program, matched by the
+	// temporary firewall rules, or "" if not found or not supported.
+	cgroupPath string
+	// cgroupMatchWarned is true once a warning was logged about
+	// the cgroup match not being used by temporary firewall rules.
+	cgroupMatchWarned bool
+
 	// State
 	enabled bool
 	// disabledCount is incremented each time the firewall is disabled,
@@ -57,5 +64,6 @@ func NewConfig(ctx context.Context, logger, iptablesLogger Logger,
 		localNetworks:   localNetworks,
 		impl:            impl,
 		customRulesPath: "/iptables/post-rules.txt",
+		cgroupPath:      readCgroupPath("/proc/self/cgroup"),
 	}, nil
 }

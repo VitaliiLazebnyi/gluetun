@@ -79,18 +79,9 @@ func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (
 		return err
 	}
 
-	if vpnProvider == providers.Airvpn {
-		if *w.PreSharedKey == "" {
-			return errors.New("pre-shared key is not set")
-		}
-	}
-
-	// Validate PreSharedKey
-	if *w.PreSharedKey != "" { // Note: this is optional
-		_, err = wgtypes.ParseKey(*w.PreSharedKey)
-		if err != nil {
-			return fmt.Errorf("pre-shared key is not valid: %w", err)
-		}
+	err = validatePreSharedKey(vpnProvider, *w.PreSharedKey)
+	if err != nil {
+		return err
 	}
 
 	// Validate Addresses
@@ -144,6 +135,23 @@ func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (
 		}
 	}
 
+	return nil
+}
+
+func validatePreSharedKey(vpnProvider, preSharedKey string) error {
+	switch {
+	case vpnProvider == providers.Airvpn && preSharedKey == "":
+		return errors.New("pre-shared key is not set")
+	case vpnProvider == providers.Purevpn && preSharedKey != "":
+		return errors.New("pre-shared key cannot be set for PureVPN, " +
+			"since PureVPN Wireguard servers do not use one")
+	case preSharedKey == "": // Note: this is optional
+		return nil
+	}
+	_, err := wgtypes.ParseKey(preSharedKey)
+	if err != nil {
+		return fmt.Errorf("pre-shared key is not valid: %w", err)
+	}
 	return nil
 }
 

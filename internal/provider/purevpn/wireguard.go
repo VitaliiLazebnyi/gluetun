@@ -40,30 +40,39 @@ type wireguardFetcher struct {
 	authURL   string
 	appURL    string
 	// newHTTPClient creates an HTTP client able to reach the PureVPN
-	// website, and returns a function to call once done with it.
+	// website, and returns a function to call once done with it, even
+	// on error, returning the revert functions which failed.
 	newHTTPClient func(ctx context.Context, fw Firewall, logger Logger) (client *http.Client,
 		resolve func(ctx context.Context, host string) ([]netip.Addr, error),
-		cleanup func(), err error)
+		cleanup func() (failedReverts []func(ctx context.Context) error), err error)
+	timeNow func() time.Time
 
 	mutex       sync.Mutex
 	state       wireguardState
 	stateLoaded bool
+	// failedReverts are the functions removing temporary firewall rules
+	// which failed, called again at the start of the next fetch.
+	failedReverts []func(ctx context.Context) error
 	// authErr is the last authentication error, returned again without
 	// contacting PureVPN as long as the PureVPN settings fingerprint is
-	// authErrFingerprint, to avoid having the account locked out or
-	// requiring a captcha because of repeated failed logins.
+	// authErrFingerprint and, if set, until authErrUntil, to avoid having
+	// the account locked out or requiring a captcha because of repeated
+	// failed logins.
 	authErr            error
 	authErrFingerprint string
+	authErrUntil       time.Time
 }
 
 func newWireguardFetcher() *wireguardFetcher {
 	return &wireguardFetcher{
 		statePath: "/gluetun/purevpn-wireguard.json",
 		newHTTPClient: func(ctx context.Context, fw Firewall, logger Logger) (*http.Client,
-			func(ctx context.Context, host string) ([]netip.Addr, error), func(), error,
+			func(ctx context.Context, host string) ([]netip.Addr, error),
+			func() []func(ctx context.Context) error, error,
 		) {
 			return newPreTunnelHTTPClient(ctx, fw, logger, defaultPreTunnelSettings())
 		},
+		timeNow: time.Now,
 	}
 }
 
@@ -82,15 +91,19 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
+	f.retryFailedReverts(ctx, logger)
+
 	purevpnSettings := vpnSettings.PureVPN
 	fingerprint := settingsFingerprint(purevpnSettings)
 	if f.authErr != nil {
-		if fingerprint == f.authErrFingerprint {
+		if fingerprint == f.authErrFingerprint &&
+			(f.authErrUntil.IsZero() || f.timeNow().Before(f.authErrUntil)) {
 			return models.WireguardConnection{}, fmt.Errorf(
 				"not retrying with unchanged PureVPN settings: %w", f.authErr)
 		}
 		f.authErr = nil
 		f.authErrFingerprint = ""
+		f.authErrUntil = time.Time{}
 	}
 
 	// Bound the whole fetch so it does not block the VPN loop for too long,
@@ -108,10 +121,12 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	f.applySessionToken(*purevpnSettings.SessionToken, logger)
 
 	httpClient, resolve, cleanup, err := f.newHTTPClient(ctx, fw, logger)
+	defer func() {
+		f.failedReverts = append(f.failedReverts, cleanup()...)
+	}()
 	if err != nil {
 		return models.WireguardConnection{}, fmt.Errorf("preparing network access to PureVPN: %w", err)
 	}
-	defer cleanup()
 
 	credentials := wgapi.Credentials{
 		Username:   *purevpnSettings.Username,
@@ -135,7 +150,16 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	f.saveState(logger) // save even on error, the session may have changed
 	if err != nil {
 		err = fmt.Errorf("requesting configuration from PureVPN: %w", err)
-		if wgapi.IsAuthError(err) {
+		switch {
+		case wgapi.IsCaptchaError(err):
+			// The captcha may no longer be required after some time without login attempts.
+			const captchaCooldown = time.Hour
+			f.authErrUntil = f.timeNow().Add(captchaCooldown)
+			err = fmt.Errorf("%w - not contacting PureVPN again before %s, unless the PureVPN settings change",
+				err, f.authErrUntil.Format(time.RFC3339))
+			f.authErr = err
+			f.authErrFingerprint = fingerprint
+		case wgapi.IsAuthError(err):
 			err = fmt.Errorf("%w - change the PureVPN settings to retry, through the control "+
 				"server or by restarting with fixed settings", err)
 			f.authErr = err
@@ -170,6 +194,23 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 		Addresses:           config.Addresses,
 		PersistentKeepalive: config.PersistentKeepalive,
 	}, nil
+}
+
+// retryFailedReverts calls again the functions removing temporary
+// firewall rules which failed during previous fetches, keeping the
+// ones failing again.
+func (f *wireguardFetcher) retryFailedReverts(ctx context.Context, logger Logger) {
+	var failedReverts []func(ctx context.Context) error
+	for _, revert := range f.failedReverts {
+		err := revert(ctx)
+		if err != nil {
+			logger.Warn("removing temporary firewall rules left by a previous attempt: " + err.Error())
+			failedReverts = append(failedReverts, revert)
+			continue
+		}
+		logger.Info("removed temporary firewall rules left by a previous attempt")
+	}
+	f.failedReverts = failedReverts
 }
 
 // settingsFingerprint returns a hash of the PureVPN settings, to detect

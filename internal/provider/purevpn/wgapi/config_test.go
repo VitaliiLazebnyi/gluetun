@@ -27,14 +27,13 @@ func Test_parseConfig(t *testing.T) {
 					netip.MustParsePrefix("10.14.0.3/32"),
 					netip.MustParsePrefix("fd00::3/128"),
 				},
-				DNS:             []netip.Addr{netip.MustParseAddr("1.1.1.1")},
 				ServerPublicKey: testServerKey,
 				EndpointHost:    "198.51.100.1",
 				EndpointPort:    51820,
 			},
 		},
 		"keepalive": {
-			content: "[Interface]\nAddress=172.21.6.133\n[Peer]\nPublicKey=" + testServerKey +
+			content: "[Interface]\nAddress=172.21.6.133,\nNoValue\n[Peer]\nPublicKey=" + testServerKey +
 				"\nEndpoint=host.example:51820\nPersistentKeepalive=25",
 			config: Config{
 				Addresses:           []netip.Prefix{netip.MustParsePrefix("172.21.6.133/32")},
@@ -51,6 +50,30 @@ func Test_parseConfig(t *testing.T) {
 		"invalid_public_key": {
 			content:    "[Interface]\nAddress=10.0.0.1\n[Peer]\nPublicKey=abc\nEndpoint=1.2.3.4:51820",
 			errMessage: "parsing peer publickey: wgtypes: failed to parse base64-encoded key",
+		},
+		"invalid_address": {
+			content:    "[Interface]\nAddress=10.0.0.300\n",
+			errMessage: "parsing interface address: parsing address: ParseAddr(\"10.0.0.300\")",
+		},
+		"invalid_prefix": {
+			content:    "[Interface]\nAddress=10.0.0.1/33\n",
+			errMessage: "parsing interface address: parsing prefix: netip.ParsePrefix(\"10.0.0.1/33\")",
+		},
+		"invalid_endpoint": {
+			content:    "[Peer]\nEndpoint=1.2.3.4\n",
+			errMessage: "parsing peer endpoint: splitting host and port: address 1.2.3.4: missing port in address",
+		},
+		"invalid_endpoint_port": {
+			content:    "[Peer]\nEndpoint=1.2.3.4:70000\n",
+			errMessage: "parsing peer endpoint: parsing port: strconv.ParseUint",
+		},
+		"invalid_persistent_keepalive": {
+			content:    "[Peer]\nPersistentKeepalive=-1\n",
+			errMessage: "parsing peer persistentkeepalive: strconv.ParseUint",
+		},
+		"missing_public_key": {
+			content:    "[Interface]\nAddress=10.0.0.1\n[Peer]\nEndpoint=1.2.3.4:51820",
+			errMessage: "peer public key is missing",
 		},
 		"missing_endpoint": {
 			content:    "[Interface]\nAddress=10.0.0.1\n[Peer]\nPublicKey=" + testServerKey,

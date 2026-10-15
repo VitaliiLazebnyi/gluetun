@@ -48,7 +48,7 @@ func Test_isDeleteMatchInstruction(t *testing.T) {
 	}
 }
 
-func newCmdMatcherListRules(iptablesBinary, table, chain string) *cmdMatcher { //nolint:unparam
+func newCmdMatcherListRules(iptablesBinary, table, chain string) *cmdMatcher {
 	return newCmdMatcher(iptablesBinary, "^-t$", "^"+table+"$", "^-L$", "^"+chain+"$",
 		"^--line-numbers$", "^-n$", "^-v$")
 }
@@ -193,7 +193,7 @@ func Test_deleteIPTablesRule(t *testing.T) {
 				logger = testCase.makeLogger(ctrl)
 			}
 
-			err := deleteIPTablesRule(ctx, iptablesBinary, instruction, runner, logger)
+			err := deleteIPTablesRule(ctx, iptablesBinary, instruction, instruction, runner, logger)
 
 			if testCase.errMessage != "" {
 				assert.EqualError(t, err, testCase.errMessage)

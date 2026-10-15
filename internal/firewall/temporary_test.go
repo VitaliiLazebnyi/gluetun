@@ -3,72 +3,54 @@ package firewall
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/netip"
-	"slices"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/qdm12/gluetun/internal/routing"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
 
-// acceptOutputMarkedImpl records AcceptOutputMarked calls, fails adding
-// a rule for addFailAddr, and fails removing a rule for removeFailAddr
-// removeFailures times. It fails if the context given is canceled.
-type acceptOutputMarkedImpl struct {
-	firewallImpl
-	addFailAddr    netip.Addr
-	removeFailAddr netip.Addr
-	removeFailures uint
+// removalContextMatcher matches a context which is not canceled and
+// has a deadline of at most 5 seconds, as used to remove a rule even
+// if the context of the caller is canceled.
+type removalContextMatcher struct{}
 
-	mutex sync.Mutex
-	calls []string
-	rules map[string]struct{}
+func (removalContextMatcher) Matches(x any) bool {
+	ctx, ok := x.(context.Context)
+	if !ok || ctx.Err() != nil {
+		return false
+	}
+	deadline, ok := ctx.Deadline()
+	return ok && time.Until(deadline) <= 5*time.Second
 }
 
-func (i *acceptOutputMarkedImpl) AcceptOutputMarked(ctx context.Context, protocol, intf string,
-	ip netip.Addr, port uint16, mark uint32, remove bool,
-) error {
-	i.mutex.Lock()
-	defer i.mutex.Unlock()
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	rule := fmt.Sprintf("%s %s %s:%d mark %d", intf, protocol, ip, port, mark)
-	switch {
-	case !remove && ip == i.addFailAddr:
-		return errors.New("test add error")
-	case remove && ip == i.removeFailAddr && i.removeFailures > 0:
-		i.removeFailures--
-		return errors.New("test remove error")
-	}
-	if i.rules == nil {
-		i.rules = make(map[string]struct{})
-	}
-	if remove {
-		i.calls = append(i.calls, "del "+rule)
-		delete(i.rules, rule)
-	} else {
-		i.calls = append(i.calls, "add "+rule)
-		i.rules[rule] = struct{}{}
-	}
-	return nil
+func (removalContextMatcher) String() string {
+	return "is a non canceled context with a deadline of at most 5 seconds"
 }
 
-func (i *acceptOutputMarkedImpl) popCalls() []string {
-	i.mutex.Lock()
-	defer i.mutex.Unlock()
-	calls := i.calls
-	i.calls = nil
-	return calls
-}
+func Test_removalContextMatcher(t *testing.T) {
+	t.Parallel()
 
-func (i *acceptOutputMarkedImpl) rulesCount() int {
-	i.mutex.Lock()
-	defer i.mutex.Unlock()
-	return len(i.rules)
+	canceledCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	cancel()
+	longCtx, longCancel := context.WithTimeout(context.Background(), time.Hour)
+	t.Cleanup(longCancel)
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), time.Second)
+	t.Cleanup(shortCancel)
+
+	matcher := removalContextMatcher{}
+	assert.False(t, matcher.Matches("not a context"))
+	assert.False(t, matcher.Matches(canceledCtx))
+	assert.False(t, matcher.Matches(context.Background()))
+	assert.False(t, matcher.Matches(longCtx))
+	assert.True(t, matcher.Matches(shortCtx))
+	assert.Equal(t, "is a non canceled context with a deadline of at most 5 seconds", matcher.String())
 }
 
 func Test_Config_AllowOutputTemporarily(t *testing.T) {
@@ -82,162 +64,359 @@ func Test_Config_AllowOutputTemporarily(t *testing.T) {
 	defaultRoutes := []routing.DefaultRoute{
 		{NetInterface: "eth0"}, {NetInterface: "eth0"}, {NetInterface: "eth1"},
 	}
+	ip1 := netip.MustParseAddr("1.1.1.1")
+	ip2 := netip.MustParseAddr("203.0.113.1")
 	const mark = 0x7075
-	allAdded := []string{
-		"add eth0 tcp 1.1.1.1:443 mark 28789",
-		"add eth0 tcp 203.0.113.1:443 mark 28789",
-		"add eth1 tcp 1.1.1.1:443 mark 28789",
-		"add eth1 tcp 203.0.113.1:443 mark 28789",
-	}
-	allRemoved := []string{
-		"del eth1 tcp 203.0.113.1:443 mark 28789",
-		"del eth1 tcp 1.1.1.1:443 mark 28789",
-		"del eth0 tcp 203.0.113.1:443 mark 28789",
-		"del eth0 tcp 1.1.1.1:443 mark 28789",
+	const add, remove = false, true
+	errTest := errors.New("test error")
+	removal := removalContextMatcher{}
+
+	type testContext struct {
+		ctx    context.Context
+		cancel context.CancelFunc
 	}
 
 	testCases := map[string]struct {
-		impl     *acceptOutputMarkedImpl
-		disabled bool
+		disabled   bool
+		cgroupPath string
+		// makeImpl sets the calls expected when adding the rules,
+		// and returns the calls expected when reverting the rules
+		// the first time and the second time.
+		makeImpl func(impl *MockfirewallImpl, test testContext) (
+			firstRevert, secondRevert func())
+		makeLogger func(logger *MockLogger)
 		// betweenAddAndRevert is run after adding the rules and before reverting.
 		betweenAddAndRevert func(config *Config)
-		revertCtx           func() context.Context
-		addCalls            []string
+		cancelBeforeRevert  bool
 		addErrMessage       string
-		revertCalls         []string
 		revertErrMessage    string
-		secondRevertCalls   []string
+		cgroupPathAfter     string
 	}{
 		"firewall_disabled": {
-			impl:     &acceptOutputMarkedImpl{},
 			disabled: true,
+			makeImpl: func(*MockfirewallImpl, testContext) (func(), func()) {
+				return func() {}, func() {}
+			},
 		},
 		"add_and_revert": {
-			impl:        &acceptOutputMarkedImpl{},
-			addCalls:    allAdded,
-			revertCalls: allRemoved,
+			cgroupPath: "/",
+			makeImpl: func(impl *MockfirewallImpl, test testContext) (func(), func()) {
+				gomock.InOrder(
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), add).Return(nil),
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip2, uint16(443), "/", uint32(mark), add).Return(nil),
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip1, uint16(443), "/", uint32(mark), add).Return(nil),
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip2, uint16(443), "/", uint32(mark), add).Return(nil),
+				)
+				firstRevert := func() {
+					gomock.InOrder(
+						impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth1", ip2, uint16(443), "/", uint32(mark), remove).Return(nil),
+						impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth1", ip1, uint16(443), "/", uint32(mark), remove).Return(nil),
+						impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip2, uint16(443), "/", uint32(mark), remove).Return(nil),
+						impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), remove).Return(nil),
+					)
+				}
+				return firstRevert, func() {}
+			},
+			cgroupPathAfter: "/",
 		},
 		"revert_with_canceled_context": {
-			impl:     &acceptOutputMarkedImpl{},
-			addCalls: allAdded,
-			revertCtx: func() context.Context {
-				ctx, cancel := context.WithCancel(context.Background())
-				cancel()
-				return ctx
+			cgroupPath: "/",
+			makeImpl: func(impl *MockfirewallImpl, test testContext) (func(), func()) {
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip1, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip2, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip2, uint16(443), "/", uint32(mark), add).Return(nil)
+				firstRevert := func() {
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), remove).Return(nil)
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth1", ip1, uint16(443), "/", uint32(mark), remove).Return(nil)
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip2, uint16(443), "/", uint32(mark), remove).Return(nil)
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth1", ip2, uint16(443), "/", uint32(mark), remove).Return(nil)
+				}
+				return firstRevert, func() {}
 			},
-			revertCalls: allRemoved,
+			cancelBeforeRevert: true,
+			cgroupPathAfter:    "/",
 		},
 		"revert_failure_keeps_failed_rule": {
-			impl: &acceptOutputMarkedImpl{
-				removeFailAddr: netip.MustParseAddr("203.0.113.1"),
-				removeFailures: 1,
+			cgroupPath: "/",
+			makeImpl: func(impl *MockfirewallImpl, test testContext) (func(), func()) {
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip1, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip2, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip2, uint16(443), "/", uint32(mark), add).Return(nil)
+				firstRevert := func() {
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), remove).Return(nil)
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth1", ip1, uint16(443), "/", uint32(mark), remove).Return(nil)
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip2, uint16(443), "/", uint32(mark), remove).Return(nil)
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth1", ip2, uint16(443), "/", uint32(mark), remove).
+						Return(errTest)
+				}
+				secondRevert := func() {
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth1", ip2, uint16(443), "/", uint32(mark), remove).Return(nil)
+				}
+				return firstRevert, secondRevert
 			},
-			addCalls: allAdded,
-			revertCalls: []string{
-				"del eth1 tcp 1.1.1.1:443 mark 28789",
-				"del eth0 tcp 203.0.113.1:443 mark 28789",
-				"del eth0 tcp 1.1.1.1:443 mark 28789",
+			revertErrMessage: "removing rule: test error",
+			cgroupPathAfter:  "/",
+		},
+		"add_failure_with_canceled_context_removes_rules": {
+			makeImpl: func(impl *MockfirewallImpl, test testContext) (func(), func()) {
+				gomock.InOrder(
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "", uint32(mark), add).Return(nil),
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip2, uint16(443), "", uint32(mark), add).
+						DoAndReturn(func(context.Context, string, string, netip.Addr, uint16, string, uint32, bool) error {
+							// The rule may be added before the context is canceled.
+							test.cancel()
+							return context.Canceled
+						}),
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip2, uint16(443), "", uint32(mark), remove).Return(nil),
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip1, uint16(443), "", uint32(mark), remove).Return(nil),
+				)
+				return func() {}, func() {}
 			},
-			revertErrMessage: "removing rule: test remove error",
-			secondRevertCalls: []string{
-				"del eth1 tcp 203.0.113.1:443 mark 28789",
+			makeLogger: func(logger *MockLogger) {
+				logger.EXPECT().Warn("cgroup v2 path not found, temporary firewall rules only match the socket mark")
+			},
+			addErrMessage: "adding rule: context canceled",
+		},
+		"add_failure_with_failed_removal": {
+			makeImpl: func(impl *MockfirewallImpl, test testContext) (func(), func()) {
+				gomock.InOrder(
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "", uint32(mark), add).Return(errTest),
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip1, uint16(443), "", uint32(mark), remove).
+						Return(errors.New("test remove error")),
+				)
+				retryRevert := func() {
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip1, uint16(443), "", uint32(mark), remove).Return(nil)
+				}
+				return retryRevert, func() {}
+			},
+			makeLogger: func(logger *MockLogger) {
+				logger.EXPECT().Warn("cgroup v2 path not found, temporary firewall rules only match the socket mark")
+			},
+			addErrMessage: "adding rule: test error (reverting: removing rule: test remove error)",
+		},
+		"cgroup_match_unsupported": {
+			cgroupPath: "/",
+			makeImpl: func(impl *MockfirewallImpl, test testContext) (func(), func()) {
+				gomock.InOrder(
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), add).
+						Return(errors.New("no xt_cgroup")),
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "", uint32(mark), add).Return(nil),
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip2, uint16(443), "", uint32(mark), add).Return(nil),
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip1, uint16(443), "", uint32(mark), add).Return(nil),
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip2, uint16(443), "", uint32(mark), add).Return(nil),
+				)
+				firstRevert := func() {
+					gomock.InOrder(
+						impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth1", ip2, uint16(443), "", uint32(mark), remove).Return(nil),
+						impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth1", ip1, uint16(443), "", uint32(mark), remove).Return(nil),
+						impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip2, uint16(443), "", uint32(mark), remove).Return(nil),
+						impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip1, uint16(443), "", uint32(mark), remove).Return(nil),
+						// The rule with the cgroup match may have been added.
+						impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), remove).Return(nil),
+					)
+				}
+				return firstRevert, func() {}
+			},
+			makeLogger: func(logger *MockLogger) {
+				logger.EXPECT().Warn("cgroup match is not supported, temporary firewall rules only match " +
+					"the socket mark: no xt_cgroup")
 			},
 		},
-		"add_failure_reverts_added_rules": {
-			impl: &acceptOutputMarkedImpl{addFailAddr: netip.MustParseAddr("203.0.113.1")},
-			addCalls: []string{
-				"add eth0 tcp 1.1.1.1:443 mark 28789",
-				"del eth0 tcp 1.1.1.1:443 mark 28789",
+		"cgroup_match_and_fallback_fail": {
+			cgroupPath: "/",
+			makeImpl: func(impl *MockfirewallImpl, test testContext) (func(), func()) {
+				gomock.InOrder(
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), add).
+						Return(errors.New("first error")),
+					impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "", uint32(mark), add).Return(errTest),
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip1, uint16(443), "", uint32(mark), remove).Return(nil),
+					impl.EXPECT().AcceptOutputMarked(removal, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), remove).Return(nil),
+				)
+				return func() {}, func() {}
 			},
-			addErrMessage: "adding rule: test add error",
+			addErrMessage:   "adding rule: test error",
+			cgroupPathAfter: "/",
 		},
 		"revert_after_disable": {
-			impl:     &acceptOutputMarkedImpl{},
-			addCalls: allAdded,
+			cgroupPath: "/",
+			makeImpl: func(impl *MockfirewallImpl, test testContext) (func(), func()) {
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip1, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip2, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip2, uint16(443), "/", uint32(mark), add).Return(nil)
+				return func() {}, func() {}
+			},
 			betweenAddAndRevert: func(config *Config) {
 				config.enabled = false
 				config.disabledCount++
 			},
+			cgroupPathAfter: "/",
 		},
 		"revert_after_disable_and_enable": {
-			impl:     &acceptOutputMarkedImpl{},
-			addCalls: allAdded,
+			cgroupPath: "/",
+			makeImpl: func(impl *MockfirewallImpl, test testContext) (func(), func()) {
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip1, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip1, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth0", ip2, uint16(443), "/", uint32(mark), add).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(test.ctx, "tcp", "eth1", ip2, uint16(443), "/", uint32(mark), add).Return(nil)
+				return func() {}, func() {}
+			},
 			betweenAddAndRevert: func(config *Config) {
 				config.disabledCount++
 			},
+			cgroupPathAfter: "/",
 		},
 	}
 
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+			ctrl := gomock.NewController(t)
 
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			impl := NewMockfirewallImpl(ctrl)
+			firstRevert, secondRevert := testCase.makeImpl(impl, testContext{ctx: ctx, cancel: cancel})
+			logger := NewMockLogger(ctrl)
+			if testCase.makeLogger != nil {
+				testCase.makeLogger(logger)
+			}
 			config := &Config{
-				impl:          testCase.impl,
+				impl:          impl,
+				logger:        logger,
 				enabled:       !testCase.disabled,
 				defaultRoutes: defaultRoutes,
+				cgroupPath:    testCase.cgroupPath,
 			}
 
-			revert, err := config.AllowOutputTemporarily(context.Background(), "tcp", mark, addrPorts)
+			revert, err := config.AllowOutputTemporarily(ctx, "tcp", mark, addrPorts)
 			require.NotNil(t, revert)
 			if testCase.addErrMessage != "" {
 				assert.ErrorContains(t, err, testCase.addErrMessage)
 			} else {
 				assert.NoError(t, err)
 			}
-			assert.Equal(t, testCase.addCalls, testCase.impl.popCalls())
+			assert.Equal(t, testCase.cgroupPathAfter, config.cgroupPath)
 
 			if testCase.betweenAddAndRevert != nil {
 				testCase.betweenAddAndRevert(config)
 			}
 
-			revertCtx := context.Background()
-			if testCase.revertCtx != nil {
-				revertCtx = testCase.revertCtx()
+			if testCase.cancelBeforeRevert {
+				cancel()
 			}
-			err = revert(revertCtx)
+			firstRevert()
+			err = revert(ctx)
 			if testCase.revertErrMessage != "" {
 				assert.ErrorContains(t, err, testCase.revertErrMessage)
 			} else {
 				assert.NoError(t, err)
 			}
-			assert.Equal(t, testCase.revertCalls, testCase.impl.popCalls())
 
+			secondRevert()
 			err = revert(context.Background())
 			assert.NoError(t, err)
-			assert.Equal(t, testCase.secondRevertCalls, testCase.impl.popCalls())
+		})
+	}
+}
+
+func Test_Config_AllowOutputTemporarily_warnsOnce(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		cgroupPath string
+		makeImpl   func(impl *MockfirewallImpl, ctx context.Context)
+		warning    string
+	}{
+		"cgroup_path_not_found": {
+			makeImpl: func(impl *MockfirewallImpl, ctx context.Context) {
+				impl.EXPECT().AcceptOutputMarked(ctx, "tcp", "eth0", netip.MustParseAddr("1.1.1.1"),
+					uint16(443), "", uint32(1), false).Return(nil).Times(2)
+			},
+			warning: "cgroup v2 path not found, temporary firewall rules only match the socket mark",
+		},
+		"cgroup_match_unsupported": {
+			cgroupPath: "/system.slice/docker-1.scope",
+			makeImpl: func(impl *MockfirewallImpl, ctx context.Context) {
+				impl.EXPECT().AcceptOutputMarked(ctx, "tcp", "eth0", netip.MustParseAddr("1.1.1.1"),
+					uint16(443), "/system.slice/docker-1.scope", uint32(1), false).Return(errors.New("test error"))
+				impl.EXPECT().AcceptOutputMarked(ctx, "tcp", "eth0", netip.MustParseAddr("1.1.1.1"),
+					uint16(443), "", uint32(1), false).Return(nil).Times(2)
+			},
+			warning: "cgroup match is not supported, temporary firewall rules only match the socket mark: test error",
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctrl := gomock.NewController(t)
+
+			ctx := context.Background()
+			impl := NewMockfirewallImpl(ctrl)
+			testCase.makeImpl(impl, ctx)
+			logger := NewMockLogger(ctrl)
+			logger.EXPECT().Warn(testCase.warning)
+			config := &Config{
+				impl:          impl,
+				logger:        logger,
+				enabled:       true,
+				defaultRoutes: []routing.DefaultRoute{{NetInterface: "eth0"}},
+				cgroupPath:    testCase.cgroupPath,
+			}
+
+			addrPorts := []netip.AddrPort{netip.MustParseAddrPort("1.1.1.1:443")}
+			for range 2 {
+				_, err := config.AllowOutputTemporarily(ctx, "tcp", 1, addrPorts)
+				require.NoError(t, err)
+			}
 		})
 	}
 }
 
 func Test_Config_AllowOutputTemporarily_concurrent(t *testing.T) {
 	t.Parallel()
+	ctrl := gomock.NewController(t)
 
-	impl := &acceptOutputMarkedImpl{}
+	ctx := context.Background()
+	const workers = 10
+	interfaces := [...]string{"eth0", "eth1"}
+	impl := NewMockfirewallImpl(ctrl)
+	addrPortsPerWorker := make([][]netip.AddrPort, workers)
+	for i := range byte(workers) {
+		addrPortsPerWorker[i] = []netip.AddrPort{
+			netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, 100, i}), 443),
+			netip.AddrPortFrom(netip.AddrFrom4([4]byte{203, 0, 113, i}), 443),
+		}
+		for _, intf := range interfaces {
+			for _, addrPort := range addrPortsPerWorker[i] {
+				impl.EXPECT().AcceptOutputMarked(ctx, "tcp", intf, addrPort.Addr(),
+					uint16(443), "/", uint32(1), false).Return(nil)
+				impl.EXPECT().AcceptOutputMarked(removalContextMatcher{}, "tcp", intf, addrPort.Addr(),
+					uint16(443), "/", uint32(1), true).Return(nil)
+			}
+		}
+	}
 	config := &Config{
 		impl:          impl,
 		enabled:       true,
-		defaultRoutes: []routing.DefaultRoute{{NetInterface: "eth0"}, {NetInterface: "eth1"}},
+		defaultRoutes: []routing.DefaultRoute{{NetInterface: interfaces[0]}, {NetInterface: interfaces[1]}},
+		cgroupPath:    "/",
 	}
 
-	const workers = 10
 	errs := make(chan error, workers)
 	var wg sync.WaitGroup
-	for i := range byte(workers) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			addrPorts := []netip.AddrPort{
-				netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, 100, i}), 443),
-				netip.AddrPortFrom(netip.AddrFrom4([4]byte{203, 0, 113, i}), 443),
-			}
-			revert, err := config.AllowOutputTemporarily(context.Background(), "tcp", 1, addrPorts)
+	for _, addrPorts := range addrPortsPerWorker {
+		wg.Go(func() {
+			revert, err := config.AllowOutputTemporarily(ctx, "tcp", 1, addrPorts)
 			if err != nil {
 				errs <- err
 				return
 			}
 			errs <- revert(context.Background())
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -245,9 +424,48 @@ func Test_Config_AllowOutputTemporarily_concurrent(t *testing.T) {
 	for err := range errs {
 		assert.NoError(t, err)
 	}
-	assert.Zero(t, impl.rulesCount(), "all rules must be removed")
-	calls := impl.popCalls()
-	assert.Len(t, calls, workers*2*2*2) // add and remove, 2 addresses, 2 interfaces
-	adds := slices.DeleteFunc(slices.Clone(calls), func(call string) bool { return call[:3] != "add" })
-	assert.Len(t, adds, workers*2*2)
+}
+
+func Test_readCgroupPath(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		content *string
+		path    string
+	}{
+		"no_file": {},
+		"cgroup_namespace_root": {
+			content: new("0::/\n"),
+			path:    "/",
+		},
+		"hybrid_cgroup_host_namespace": {
+			content: new("12:cpuset:/docker/abc\n0::/system.slice/docker-abc.scope\n"),
+			path:    "/system.slice/docker-abc.scope",
+		},
+		"cgroup_v1_only": {
+			content: new("12:cpuset:/docker/abc\n1:name=systemd:/docker/abc\n"),
+		},
+		"path_with_space": {
+			content: new("0::/deleted cgroup (deleted)\n"),
+		},
+		"relative_path": {
+			content: new("0::abc\n"),
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			filePath := filepath.Join(t.TempDir(), "cgroup")
+			if testCase.content != nil {
+				err := os.WriteFile(filePath, []byte(*testCase.content), 0o600)
+				require.NoError(t, err)
+			}
+
+			path := readCgroupPath(filePath)
+
+			assert.Equal(t, testCase.path, path)
+		})
+	}
 }

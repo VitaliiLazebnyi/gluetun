@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -57,6 +58,9 @@ func (c *Client) loginWithCredentials(ctx context.Context) (token string, err er
 		return token, nil
 	}
 
+	// passwordSubmitted is true if the current page is the
+	// response to the login form submission.
+	passwordSubmitted := false
 	loginForm := page.findForm(isLoginForm)
 	switch {
 	case page.findForm(isTwoFactorForm) != nil, page.findForm(isTwoFactorMethodsForm) != nil:
@@ -69,33 +73,37 @@ func (c *Client) loginWithCredentials(ctx context.Context) (token string, err er
 		if err != nil {
 			return "", fmt.Errorf("submitting login form: %w", err)
 		}
+		passwordSubmitted = true
 	}
 
-	const maxSteps = 3 // two-factor method selection, then code, then maybe trust device
-	for range maxSteps {
-		token = c.getAccessTokenCookie()
-		if token != "" {
-			return token, nil
-		}
-
-		switch {
-		case page.findForm(isTwoFactorMethodsForm) != nil:
-			page, err = c.selectTwoFactorMethod(ctx, page)
-		case page.findForm(isTwoFactorForm) != nil:
-			page, err = c.submitTwoFactorCode(ctx, page)
-		case page.findForm(isLoginForm) != nil:
-			return "", loginPageError(page)
-		default:
-			return "", fmt.Errorf("%w: no access token after logging in, landed on %s",
-				errUnexpectedResponse, redactURL(page.url))
-		}
+	// Note the two-factor code page can also contain a form to
+	// choose another two-factor method, so it is checked first.
+	if page.findForm(isTwoFactorForm) == nil && page.findForm(isTwoFactorMethodsForm) != nil {
+		page, err = c.selectTwoFactorMethod(ctx, page)
 		if err != nil {
 			return "", err
 		}
+		passwordSubmitted = false
 	}
 
-	return "", fmt.Errorf("%w: too many login steps, landed on %s",
-		errUnexpectedResponse, redactURL(page.url))
+	if page.findForm(isTwoFactorForm) != nil {
+		page, err = c.submitTwoFactorCode(ctx, page)
+		if err != nil {
+			return "", err
+		}
+		passwordSubmitted = false
+	}
+
+	token = c.getAccessTokenCookie()
+	switch {
+	case token != "":
+		return token, nil
+	case passwordSubmitted && page.findForm(isLoginForm) != nil:
+		return "", loginPageError(page)
+	default:
+		return "", fmt.Errorf("%w: no access token after logging in, landed on %s",
+			errUnexpectedResponse, redactURL(page.url))
+	}
 }
 
 func (c *Client) submitLoginForm(ctx context.Context, page *htmlPage,
@@ -120,22 +128,17 @@ func (c *Client) selectTwoFactorMethod(ctx context.Context, page *htmlPage) (*ht
 	form := page.findForm(isTwoFactorMethodsForm)
 	values := form.values()
 	methodID := ""
-	methodsCount := 0
 	for _, input := range form.inputs {
-		if input.name != "methodId" {
+		if !isTwoFactorMethodInput(input) {
 			continue
 		}
-		methodsCount++
 		description := strings.ToLower(input.label + " " + input.id + " " + input.value)
 		if strings.Contains(description, "authenticator") {
 			methodID = input.value
 			break
 		}
 	}
-	switch {
-	case methodsCount == 0:
-		return nil, fmt.Errorf("%w: no two-factor method found", errUnexpectedResponse)
-	case methodID == "":
+	if methodID == "" {
 		// Only email or SMS methods are available.
 		return nil, errTwoFactorMethodUnsupported
 	}
@@ -144,18 +147,49 @@ func (c *Client) selectTwoFactorMethod(ctx context.Context, page *htmlPage) (*ht
 	if err != nil {
 		return nil, fmt.Errorf("selecting two-factor method: %w", err)
 	}
-	if page.findForm(isTwoFactorForm) == nil && c.getAccessTokenCookie() == "" {
-		// The only method left is likely email or SMS.
-		return nil, errTwoFactorMethodUnsupported
-	}
 	return page, nil
 }
 
+// submitTwoFactorCode submits the two-factor code generated from the
+// TOTP secret. If the code is rejected, which can happen if it was
+// generated at the end of its time step or was already used, it waits
+// for the next time step and submits the next code once.
 func (c *Client) submitTwoFactorCode(ctx context.Context, page *htmlPage) (*htmlPage, error) {
 	if c.credentials.TOTPSecret == "" {
 		return nil, errTwoFactorRequired
 	}
-	code, err := totpCode(c.credentials.TOTPSecret, c.timeNow())
+
+	now := c.timeNow()
+	page, err := c.submitTwoFactorCodeAt(ctx, page, now)
+	if err != nil {
+		return nil, err
+	}
+	if !twoFactorCodeRejected(page) {
+		return page, nil
+	}
+
+	// TOTP codes from authenticator apps change every 30 seconds.
+	const timeStepSeconds = 30
+	nextTimeStep := time.Unix((now.Unix()/timeStepSeconds+1)*timeStepSeconds, 0)
+	err = waitFor(ctx, nextTimeStep.Sub(now))
+	if err != nil {
+		return nil, fmt.Errorf("waiting for the next two-factor code: %w", err)
+	}
+
+	page, err = c.submitTwoFactorCodeAt(ctx, page, nextTimeStep)
+	if err != nil {
+		return nil, err
+	}
+	if twoFactorCodeRejected(page) {
+		return nil, fmt.Errorf("%w: %s", errTwoFactorCodeInvalid, page.errorMessage())
+	}
+	return page, nil
+}
+
+func (c *Client) submitTwoFactorCodeAt(ctx context.Context, page *htmlPage,
+	codeTime time.Time,
+) (*htmlPage, error) {
+	code, err := totpCode(c.credentials.TOTPSecret, codeTime)
 	if err != nil {
 		return nil, err
 	}
@@ -170,11 +204,26 @@ func (c *Client) submitTwoFactorCode(ctx context.Context, page *htmlPage) (*html
 	if err != nil {
 		return nil, fmt.Errorf("submitting two-factor code: %w", err)
 	}
-
-	if c.getAccessTokenCookie() == "" && page.findForm(isTwoFactorForm) != nil {
-		return nil, fmt.Errorf("%w: %s", errTwoFactorCodeInvalid, page.errorMessage())
-	}
 	return page, nil
+}
+
+// twoFactorCodeRejected returns true if the page given, returned after
+// submitting a two-factor code, shows the two-factor code form again.
+// Note the page has no form if the login succeeded.
+func twoFactorCodeRejected(page *htmlPage) bool {
+	return page.findForm(isTwoFactorForm) != nil
+}
+
+// waitFor waits for the duration given or until the context is canceled.
+func waitFor(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	}
 }
 
 func totpCode(secret string, now time.Time) (code string, err error) {
@@ -254,7 +303,7 @@ func (c *Client) doAuthRequest(ctx context.Context, method, rawURL string,
 		return nil, err
 	}
 
-	page = &htmlPage{url: response.Request.URL, body: responseBody}
+	page = &htmlPage{url: response.Request.URL}
 	if c.getAccessTokenCookie() != "" {
 		// Logged in, the final page content does not matter.
 		return page, nil
@@ -271,7 +320,6 @@ func (c *Client) doAuthRequest(ctx context.Context, method, rawURL string,
 
 type htmlPage struct {
 	url    *url.URL
-	body   []byte
 	forms  []*htmlForm
 	errors []string
 }
@@ -336,8 +384,16 @@ func isTwoFactorForm(form *htmlForm) bool {
 	return form.hasInput("code") && form.hasInput("twoFactorId")
 }
 
+// isTwoFactorMethodsForm returns true if the form is a two-factor
+// method selection form, with radio buttons to choose the method.
+// A two-factor code form can contain a hidden methodId input, which
+// does not make it a method selection form.
 func isTwoFactorMethodsForm(form *htmlForm) bool {
-	return form.hasInput("methodId") && !form.hasInput("code")
+	return slices.ContainsFunc(form.inputs, isTwoFactorMethodInput)
+}
+
+func isTwoFactorMethodInput(input htmlInput) bool {
+	return input.name == "methodId" && input.inputType == "radio"
 }
 
 // parseHTML extracts the forms and the error messages from an HTML page.

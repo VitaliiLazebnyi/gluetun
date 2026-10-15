@@ -18,8 +18,6 @@ import (
 type Config struct {
 	// Addresses are the interface addresses assigned to the client.
 	Addresses []netip.Prefix
-	// DNS are the PureVPN DNS servers, which Gluetun does not use.
-	DNS []netip.Addr
 	// ServerPublicKey is the WireGuard public key of the server.
 	ServerPublicKey string
 	// EndpointHost is the server endpoint host, either an IP
@@ -38,7 +36,7 @@ type Config struct {
 // EndpointIP returns the endpoint IP address if the endpoint host
 // or the protocol IP is an IP address.
 func (c Config) EndpointIP() (ip netip.Addr, ok bool) {
-	for _, candidate := range []string{c.ProtocolIP, c.EndpointHost} {
+	for _, candidate := range [...]string{c.ProtocolIP, c.EndpointHost} {
 		ip, err := netip.ParseAddr(strings.TrimSpace(candidate))
 		if err == nil {
 			return ip.Unmap(), true
@@ -79,8 +77,6 @@ func parseConfig(content string) (config Config, err error) {
 		switch section + "." + key {
 		case "interface.address":
 			config.Addresses, err = parseAddresses(value)
-		case "interface.dns":
-			config.DNS = parseDNS(value)
 		case "peer.publickey":
 			config.ServerPublicKey = value
 			_, err = wgtypes.ParseKey(value)
@@ -116,34 +112,24 @@ func parseAddresses(value string) (addresses []netip.Prefix, err error) {
 		if !strings.Contains(field, "/") {
 			addr, err := netip.ParseAddr(field)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("parsing address: %w", err)
 			}
 			addresses = append(addresses, netip.PrefixFrom(addr, addr.BitLen()))
 			continue
 		}
 		prefix, err := netip.ParsePrefix(field)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("parsing prefix: %w", err)
 		}
 		addresses = append(addresses, prefix)
 	}
 	return addresses, nil
 }
 
-func parseDNS(value string) (servers []netip.Addr) {
-	for field := range strings.SplitSeq(value, ",") {
-		addr, err := netip.ParseAddr(strings.TrimSpace(field))
-		if err == nil {
-			servers = append(servers, addr)
-		}
-	}
-	return servers
-}
-
 func parseEndpoint(value string) (host string, port uint16, err error) {
 	host, portString, err := net.SplitHostPort(value)
 	if err != nil {
-		return "", 0, err
+		return "", 0, fmt.Errorf("splitting host and port: %w", err)
 	}
 	port64, err := strconv.ParseUint(portString, 10, 16)
 	if err != nil {

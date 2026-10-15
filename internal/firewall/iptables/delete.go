@@ -32,7 +32,10 @@ func isDeleteMatchInstruction(instruction string) bool {
 	return false
 }
 
-func deleteIPTablesRule(ctx context.Context, iptablesBinary, instruction string,
+// deleteIPTablesRule deletes the rule matching the delete instruction given,
+// and does nothing if no rule matches. It logs logInstruction instead of
+// instruction, for instructions containing a secret.
+func deleteIPTablesRule(ctx context.Context, iptablesBinary, instruction, logInstruction string,
 	runner CmdRunner, logger Logger,
 ) (err error) {
 	targetRule, err := parseIptablesInstruction(instruction)
@@ -45,11 +48,11 @@ func deleteIPTablesRule(ctx context.Context, iptablesBinary, instruction string,
 	if err != nil {
 		return fmt.Errorf("finding iptables chain rule line number: %w", err)
 	} else if lineNumber == 0 {
-		logger.Debug("rule matching \"" + instruction + "\" not found")
+		logger.Debug("rule matching \"" + logInstruction + "\" not found")
 		return nil
 	}
 	logger.Debug(fmt.Sprintf("found iptables chain rule matching %q at line number %d",
-		instruction, lineNumber))
+		logInstruction, lineNumber))
 
 	cmd := exec.CommandContext(ctx, iptablesBinary, "-t", targetRule.table,
 		"-D", targetRule.chain, fmt.Sprint(lineNumber)) // #nosec G204

@@ -36,6 +36,7 @@ type iptablesInstruction struct {
 	tcpFlags        tcpFlags
 	mark            mark
 	connMark        mark
+	cgroupPath      string // cgroup v2 path to match, or "" for no cgroup match
 	setMark         uint   // only used for jump CONNMARK --set-mark
 	rejectWith      string // only used for REJECT targets
 }
@@ -79,6 +80,8 @@ func (i *iptablesInstruction) equalToRule(table, chain string, rule chainRule) (
 	case i.mark != rule.mark:
 		return false
 	case i.connMark != rule.connMark:
+		return false
+	case i.cgroupPath != rule.cgroupPath:
 		return false
 	case i.setMark != rule.setMark:
 		return false
@@ -157,6 +160,8 @@ func parseInstructionFlag(fields []string, instruction *iptablesInstruction) (co
 			return 0, fmt.Errorf("parsing mark value %q: %w", value, err)
 		}
 		instruction.mark.value = n
+	case "--path": // cgroup match path
+		instruction.cgroupPath = value
 	case "-i", "--in-interface":
 		instruction.inputInterface = value
 	case "-o", "--out-interface":
@@ -285,11 +290,11 @@ func parseMatchModule(fields []string, instruction *iptablesInstruction) (
 	_ = fields[consumed] // -m or --match flag already detected
 	consumed++
 	switch fields[consumed] {
-	case "tcp", "udp", "conntrack":
+	case "tcp", "udp", "conntrack", "cgroup":
 		consumed++
-		// for now ignore the protocol and conntrack matches since they are
-		// auto-loaded when parsing the -p/--protocol and --ctstate flags,
-		// and we don't need to parse them twice.
+		// for now ignore the protocol, conntrack and cgroup matches since
+		// they are auto-loaded when parsing the -p/--protocol, --ctstate
+		// and --path flags, and we don't need to parse them twice.
 	case "mark":
 		consumed++
 		switch {

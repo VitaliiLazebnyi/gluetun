@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -8,22 +9,11 @@ import (
 	"testing"
 
 	"github.com/qdm12/gluetun/internal/configuration/settings"
+	"github.com/qdm12/gluetun/internal/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
-
-type fakeVPNLooper struct {
-	VPNLooper
-	settings settings.VPN
-}
-
-func (l *fakeVPNLooper) GetSettings() settings.VPN {
-	return l.settings.Copy()
-}
-
-type noopWarner struct{}
-
-func (noopWarner) Warn(string) {}
 
 func newPureVPNTestSettings(totpSecret, sessionToken string) settings.VPN {
 	return settings.VPN{
@@ -75,9 +65,11 @@ func Test_vpnHandler_getSettings_redactsPureVPNSecrets(t *testing.T) {
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+			ctrl := gomock.NewController(t)
 
-			looper := &fakeVPNLooper{settings: testCase.settings}
-			handler := newVPNHandler(context.Background(), looper, nil, false, noopWarner{})
+			looper := NewMockVPNLooper(ctrl)
+			looper.EXPECT().GetSettings().Return(testCase.settings.Copy())
+			handler := newVPNHandler(context.Background(), looper, nil, false, NewMockLogger(ctrl))
 			request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/vpn/settings", nil)
 			recorder := httptest.NewRecorder()
 
@@ -90,8 +82,6 @@ func Test_vpnHandler_getSettings_redactsPureVPNSecrets(t *testing.T) {
 			err := json.Unmarshal(recorder.Body.Bytes(), &body)
 			require.NoError(t, err)
 			assert.Equal(t, testCase.purevpn, body.PureVPN)
-			// The looper settings must not be modified.
-			assert.Equal(t, testCase.settings, looper.settings)
 		})
 	}
 }
@@ -124,4 +114,69 @@ func Test_PureVPN_secrets_roundTrip(t *testing.T) {
 	ignoreRedactedPureVPNSecrets(&put)
 	updated.OverrideWith(put)
 	assert.Equal(t, "new-password", *updated.PureVPN.Password)
+}
+
+func Test_vpnHandler_PureVPN_secrets_roundTrip(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+
+	var allSettings settings.Settings
+	allSettings.VPN = newPureVPNTestSettings("JBSWY3DP", "token")
+	allSettings.VPN.Type = "wireguard"
+	allSettings.VPN.Provider.Name = "purevpn"
+	allSettings.SetDefaults()
+	current := allSettings.VPN
+
+	ctx := context.Background()
+	looper := NewMockVPNLooper(ctrl)
+	storage := NewMockStorage(ctrl)
+	logger := NewMockLogger(ctrl)
+	handler := newVPNHandler(ctx, looper, storage, false, logger)
+
+	// A client gets the settings, with the secrets redacted.
+	looper.EXPECT().GetSettings().Return(current.Copy())
+	request := httptest.NewRequestWithContext(ctx, http.MethodGet, "/vpn/settings", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var got map[string]any
+	err := json.Unmarshal(recorder.Body.Bytes(), &got)
+	require.NoError(t, err)
+	purevpn, ok := got["purevpn"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, redactedSecret, purevpn["password"])
+	assert.Equal(t, redactedSecret, purevpn["totp_secret"])
+	assert.Equal(t, redactedSecret, purevpn["session_token"])
+	assert.NotContains(t, recorder.Body.String(), "JBSWY3DP")
+
+	putSettings := func(body map[string]any) (response string) {
+		t.Helper()
+		data, err := json.Marshal(body)
+		require.NoError(t, err)
+		request := httptest.NewRequestWithContext(ctx, http.MethodPut, "/vpn/settings", bytes.NewReader(data))
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		return recorder.Body.String()
+	}
+
+	// The client puts back the settings received with another country:
+	// the redacted secrets are kept unchanged.
+	purevpn["country"] = "GB"
+	expected := current.Copy()
+	expected.PureVPN.Country = "GB"
+	looper.EXPECT().GetSettings().Return(current.Copy())
+	storage.EXPECT().GetFilterChoices("purevpn").Return(models.FilterChoices{})
+	looper.EXPECT().SetSettings(ctx, expected).Return("settings updated")
+	assert.Equal(t, "settings updated", putSettings(got))
+
+	// The client puts a new password: it is changed.
+	purevpn["password"] = "new-password"
+	current = expected
+	expected = current.Copy()
+	expected.PureVPN.Password = new("new-password")
+	looper.EXPECT().GetSettings().Return(current.Copy())
+	storage.EXPECT().GetFilterChoices("purevpn").Return(models.FilterChoices{})
+	looper.EXPECT().SetSettings(ctx, expected).Return("settings updated")
+	assert.Equal(t, "settings updated", putSettings(got))
 }
