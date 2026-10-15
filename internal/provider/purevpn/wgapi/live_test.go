@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/qdm12/gluetun/internal/constants"
 	"github.com/stretchr/testify/require"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -19,7 +20,8 @@ import (
 // Test_Live talks to the real PureVPN website. It is only built with the
 // live build tag, and only runs if the PUREVPN_LIVE_TEST environment
 // variable is set to the path of an env file such as purevpn-wireguard.env
-// at the repository root, for example:
+// at the repository root, which must set SERVER_COUNTRIES to a single
+// country name and the PureVPN account settings, for example:
 //
 //	PUREVPN_LIVE_TEST=$PWD/purevpn-wireguard.env go test -tags live -run Test_Live -v ./internal/provider/purevpn/wgapi/
 //
@@ -54,10 +56,13 @@ func Test_Live(t *testing.T) { //nolint:paralleltest
 		require.NoError(t, err)
 	}
 
+	countryCode, ok := constants.CountryNameToCode(env["SERVER_COUNTRIES"])
+	require.True(t, ok, "SERVER_COUNTRIES must be set to a single known country name")
+
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	config, err := client.FetchConfig(ctx, ServerRequest{
-		CountryCode:     env["PUREVPN_COUNTRY"],
+		CountryCode:     strings.ToUpper(countryCode),
 		CityID:          uint32(cityID),
 		SubscriptionID:  env["PUREVPN_SUBSCRIPTION_ID"],
 		VPNUsername:     env["PUREVPN_VPN_USERNAME"],
