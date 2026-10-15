@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -733,4 +734,132 @@ func Test_newWireguardFetcher(t *testing.T) {
 	assert.Nil(t, client)
 	assert.Nil(t, resolve)
 	assert.Empty(t, cleanup())
+}
+
+func Test_wireguardFetcher_fetch_errors(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		privateKey    string
+		cityID        uint
+		endpoint      string
+		modifyFetcher func(fetcher *wireguardFetcher)
+		makeLogger    func(ctrl *gomock.Controller) *MockLogger
+		errMessage    string
+	}{
+		"invalid_settings_private_key": {
+			privateKey: "invalid",
+			makeLogger: NewMockLogger,
+			errMessage: "parsing Wireguard private key: wgtypes: failed to parse base64-encoded key: " +
+				"illegal base64 data at input byte 4",
+		},
+		"http_client_error": {
+			modifyFetcher: func(fetcher *wireguardFetcher) {
+				fetcher.newHTTPClient = func(context.Context, Firewall, Logger) (*http.Client,
+					func(ctx context.Context, host string) ([]netip.Addr, error),
+					func() []func(ctx context.Context) error, error,
+				) {
+					cleanup := func() []func(ctx context.Context) error { return nil }
+					return nil, nil, cleanup, errors.New("test error")
+				}
+			},
+			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+				logger := NewMockLogger(ctrl)
+				logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN")
+				logger.EXPECT().Debug("using PureVPN session token as access token")
+				return logger
+			},
+			errMessage: "preparing network access to PureVPN: test error",
+		},
+		"invalid_auth_url": {
+			modifyFetcher: func(fetcher *wireguardFetcher) {
+				fetcher.authURL = "://invalid"
+			},
+			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+				logger := NewMockLogger(ctrl)
+				logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN")
+				logger.EXPECT().Debug("using PureVPN session token as access token")
+				return logger
+			},
+			errMessage: `creating PureVPN client: parsing auth URL: parse "://invalid": missing protocol scheme`,
+		},
+		"endpoint_resolution_error": {
+			endpoint: "unknown.purevpn.net:51820",
+			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+				logger := NewMockLogger(ctrl)
+				gomock.InOrder(
+					logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+					logger.EXPECT().Debug("using PureVPN session token as access token"),
+					// City ID 0 lets PureVPN pick a city in the country.
+					logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
+				)
+				return logger
+			},
+			errMessage: "resolving Wireguard endpoint: unknown host unknown.purevpn.net",
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctrl := gomock.NewController(t)
+
+			endpoint := testCase.endpoint
+			if endpoint == "" {
+				endpoint = "us-ny.purevpn.net:51820"
+			}
+			api := &fakeAPI{token: testJWT, endpoint: endpoint}
+			server := httptest.NewServer(api)
+			t.Cleanup(server.Close)
+
+			fetcher := newTestFetcher(t, server.URL)
+			if testCase.modifyFetcher != nil {
+				testCase.modifyFetcher(fetcher.wireguardFetcher)
+			}
+			vpnSettings := testVPNSettings(api.token, testCase.privateKey)
+			*vpnSettings.PureVPN.CityID = testCase.cityID
+
+			connection, err := fetcher.fetch(context.Background(), vpnSettings, nil, testCase.makeLogger(ctrl))
+
+			assert.EqualError(t, err, testCase.errMessage)
+			assert.Equal(t, models.WireguardConnection{}, connection)
+		})
+	}
+}
+
+func Test_Provider(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+
+	provider := New(nil, nil, nil, nil, nil)
+
+	assert.Equal(t, "purevpn", provider.Name())
+	assert.Equal(t, "/gluetun/purevpn-wireguard.json", provider.wireguard.statePath)
+
+	// FetchWireguardConnection uses the Wireguard fetcher, which here
+	// returns the previous authentication error for the same settings.
+	vpnSettings := testVPNSettings("token", "")
+	provider.wireguard.authErr = errors.New("test error")
+	provider.wireguard.authErrFingerprint = settingsFingerprint(vpnSettings.PureVPN)
+
+	connection, err := provider.FetchWireguardConnection(context.Background(),
+		vpnSettings, NewMockFirewall(ctrl), NewMockLogger(ctrl))
+
+	assert.EqualError(t, err, "not retrying with unchanged PureVPN settings: test error")
+	assert.Equal(t, models.WireguardConnection{}, connection)
+}
+
+func Test_writeFileAtomically_createTempError(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	// The temporary file name is longer than the 255 bytes file name limit.
+	path := filepath.Join(directory, strings.Repeat("a", 250))
+
+	err := writeFileAtomically(path, []byte("data"))
+
+	assert.ErrorContains(t, err, "creating temporary file: ")
+	entries, err := os.ReadDir(directory)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
 }

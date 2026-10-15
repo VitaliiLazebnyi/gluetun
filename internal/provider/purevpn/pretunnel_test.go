@@ -15,6 +15,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
@@ -145,6 +146,11 @@ func Test_newPreTunnelHTTPClient(t *testing.T) {
 	client, resolve, cleanup, err := newPreTunnelHTTPClient(ctx, firewall, logger, preTunnel)
 	require.NoError(t, err)
 
+	assert.Equal(t, 30*time.Second, client.Timeout)
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.Equal(t, 10*time.Second, transport.TLSHandshakeTimeout)
+	assert.Nil(t, transport.Proxy, "proxy must never be used")
 	assert.Empty(t, reverts)
 	assert.Equal(t, []string{fmt.Sprintf("127.0.0.1:%d", dohPort)}, marks.dialed(),
 		"DNS over HTTPS connection must be marked")
@@ -404,5 +410,36 @@ func Test_newPreTunnelMark(t *testing.T) {
 			assert.Equal(t, testCase.mark, mark)
 			assert.Equal(t, len(testCase.randomValues), calls)
 		})
+	}
+}
+
+func Test_mustHost(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "auth.example.com", mustHost("https://auth.example.com:8443/path"))
+	assert.Panics(t, func() { mustHost("://invalid") })
+}
+
+func Test_newPinnedTransport_dialErrors(t *testing.T) {
+	t.Parallel()
+
+	// Find two local TCP ports with nothing listening on them.
+	closedAddrPorts := make([]netip.AddrPort, 2)
+	for i := range closedAddrPorts {
+		listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		closedAddrPorts[i] = netip.MustParseAddrPort(listener.Addr().String())
+		require.NoError(t, listener.Close())
+	}
+	addresses := map[string][]netip.AddrPort{"host.example.com:443": closedAddrPorts}
+	transport := newPinnedTransport(&net.Dialer{}, addresses, nil)
+	t.Cleanup(transport.CloseIdleConnections)
+
+	conn, err := transport.DialContext(context.Background(), "tcp", "host.example.com:443")
+
+	assert.Nil(t, conn)
+	require.Error(t, err)
+	for _, addrPort := range closedAddrPorts {
+		assert.ErrorContains(t, err, "dial tcp "+addrPort.String()+": connect: connection refused")
 	}
 }

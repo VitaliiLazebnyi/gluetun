@@ -7,6 +7,8 @@ import (
 	"github.com/qdm12/gluetun/internal/constants/providers"
 	"github.com/qdm12/gluetun/internal/constants/vpn"
 	"github.com/qdm12/gluetun/internal/models"
+	"github.com/qdm12/gosettings/reader"
+	"github.com/qdm12/gosettings/reader/sources/env"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 )
@@ -84,11 +86,12 @@ func Test_Wireguard_validate_purevpn(t *testing.T) {
 
 	const validKey = "Y0QnWR6mhgxOjNkPUkRdPYKYrB+pERhKFAuhkBapHw8="
 	testCases := map[string]struct {
-		provider     string
-		privateKey   string
-		preSharedKey string
-		addresses    []netip.Prefix
-		errMessage   string
+		provider      string
+		privateKey    string
+		preSharedKey  string
+		addresses     []netip.Prefix
+		ipv6Supported bool
+		errMessage    string
 	}{
 		"purevpn_defaults": {
 			provider: providers.Purevpn,
@@ -114,6 +117,23 @@ func Test_Wireguard_validate_purevpn(t *testing.T) {
 			privateKey: "invalid",
 			errMessage: "private key is not valid",
 		},
+		"other_provider_addresses_missing": {
+			provider:   providers.Mullvad,
+			privateKey: validKey,
+			errMessage: "interface address is not set",
+		},
+		"other_provider_ipv6_only_not_supported": {
+			provider:   providers.Mullvad,
+			privateKey: validKey,
+			addresses:  []netip.Prefix{netip.MustParsePrefix("fd00::2/128")},
+			errMessage: "no IPv4 interface addresses in [fd00::2/128] but IPv6 is not supported",
+		},
+		"other_provider_ipv6_only_supported": {
+			provider:      providers.Mullvad,
+			privateKey:    validKey,
+			addresses:     []netip.Prefix{netip.MustParsePrefix("fd00::2/128")},
+			ipv6Supported: true,
+		},
 		"purevpn_addresses_set": {
 			provider:  providers.Purevpn,
 			addresses: []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")},
@@ -134,7 +154,7 @@ func Test_Wireguard_validate_purevpn(t *testing.T) {
 			wireguardSettings.setDefaults(testCase.provider)
 
 			// Private key and addresses are fetched at runtime for PureVPN.
-			err := wireguardSettings.validate(testCase.provider, false, false)
+			err := wireguardSettings.validate(testCase.provider, testCase.ipv6Supported, false)
 
 			if testCase.errMessage == "" {
 				assert.NoError(t, err)
@@ -149,10 +169,19 @@ func Test_WireguardSelection_validate_purevpn(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
-		selection  WireguardSelection
-		errMessage string
+		provider        string
+		selection       WireguardSelection
+		clearEndpointIP bool
+		errMessage      string
 	}{
 		"defaults": {},
+		"endpoint_ip_zero_value": {
+			clearEndpointIP: true,
+		},
+		"other_provider_public_key_set": {
+			provider:  providers.Mullvad,
+			selection: WireguardSelection{PublicKey: "Y0QnWR6mhgxOjNkPUkRdPYKYrB+pERhKFAuhkBapHw8="},
+		},
 		"endpoint_ip_set": {
 			selection:  WireguardSelection{EndpointIP: netip.MustParseAddr("203.0.113.1")},
 			errMessage: "endpoint IP cannot be set for PureVPN",
@@ -173,8 +202,16 @@ func Test_WireguardSelection_validate_purevpn(t *testing.T) {
 
 			selection := testCase.selection
 			selection.setDefaults()
+			if testCase.clearEndpointIP {
+				selection.EndpointIP = netip.Addr{}
+			}
 
-			err := selection.validate(providers.Purevpn)
+			provider := testCase.provider
+			if provider == "" {
+				provider = providers.Purevpn
+			}
+
+			err := selection.validate(provider)
 
 			if testCase.errMessage == "" {
 				assert.NoError(t, err)
@@ -246,6 +283,28 @@ func Test_ServerSelection_validate_purevpnWireguardFilters(t *testing.T) {
 	}
 }
 
+func Test_warnPureVPNWireguardFilters_allFilters(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+
+	warner := NewMockWarner(ctrl)
+	warner.EXPECT().Warn("server selection filters ISPs, categories, cities, countries, hostnames, " +
+		"names, numbers, regions are ignored with PureVPN Wireguard, " +
+		"use PUREVPN_COUNTRY and PUREVPN_CITY_ID instead")
+	selection := ServerSelection{
+		Countries:  []string{"United States"},
+		Regions:    []string{"New York"},
+		Cities:     []string{"New York"},
+		ISPs:       []string{"isp"},
+		Names:      []string{"name"},
+		Numbers:    []uint16{1},
+		Hostnames:  []string{"us2-auto-udp.ptoserver.com"},
+		Categories: []string{"category"},
+	}
+
+	warnPureVPNWireguardFilters(selection, warner)
+}
+
 func Test_validatePreSharedKey(t *testing.T) {
 	t.Parallel()
 
@@ -295,4 +354,189 @@ func Test_validatePreSharedKey(t *testing.T) {
 			assert.ErrorContains(t, err, testCase.errMessage)
 		})
 	}
+}
+
+func Test_PureVPN_toLinesNode(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		settings PureVPN
+		expected string
+	}{
+		"minimal": {
+			settings: PureVPN{SessionToken: new("sessiontoken"), Country: "us"},
+			expected: `PureVPN account settings:
+├── Session token: [set]
+└── Location: US`,
+		},
+		"credentials_only": {
+			settings: PureVPN{Username: new("user@example.com"), Password: new("password"), Country: "US"},
+			expected: `PureVPN account settings:
+├── Username: user@example.com
+├── Password: [set]
+└── Location: US`,
+		},
+		"all_set": {
+			settings: PureVPN{
+				Username:       new("user@example.com"),
+				Password:       new("password"),
+				TOTPSecret:     new("JBSWY3DPEHPK3PXP"),
+				SessionToken:   new("sessiontoken"),
+				Country:        "gb",
+				CityID:         new(uint(1234)),
+				SubscriptionID: new("sub-1"),
+				VPNUsername:    new("purevpn0s123"),
+			},
+			expected: `PureVPN account settings:
+├── Username: user@example.com
+├── Password: [set]
+├── TOTP secret: [set]
+├── Session token: [set]
+├── Location: GB city ID 1234
+├── Subscription ID: sub-1
+└── VPN username: purevpn0s123`,
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			settings := testCase.settings
+			settings.setDefaults()
+
+			assert.Equal(t, testCase.expected, settings.String())
+		})
+	}
+}
+
+func Test_PureVPN_read(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		environ    []string
+		expected   PureVPN
+		errMessage string
+	}{
+		"nothing_set": {},
+		"all_set": {
+			environ: []string{
+				"PUREVPN_USERNAME=User@Example.com",
+				"PUREVPN_PASSWORD=PassWord",
+				"PUREVPN_TOTP_SECRET=JBSWY3DPEHPK3PXP",
+				"PUREVPN_SESSION_TOKEN=TokenValue",
+				"PUREVPN_COUNTRY=us",
+				"PUREVPN_CITY_ID=1234",
+				"PUREVPN_SUBSCRIPTION_ID=Sub-1",
+				"PUREVPN_VPN_USERNAME=PureVPN0s123",
+			},
+			expected: PureVPN{
+				Username:       new("User@Example.com"),
+				Password:       new("PassWord"),
+				TOTPSecret:     new("JBSWY3DPEHPK3PXP"),
+				SessionToken:   new("TokenValue"),
+				Country:        "US",
+				CityID:         new(uint(1234)),
+				SubscriptionID: new("Sub-1"),
+				VPNUsername:    new("PureVPN0s123"),
+			},
+		},
+		"invalid_city_id": {
+			environ:    []string{"PUREVPN_COUNTRY=us", "PUREVPN_CITY_ID=abc"},
+			expected:   PureVPN{Country: "US"},
+			errMessage: "environment variable PUREVPN_CITY_ID: ",
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			reader := reader.New(reader.Settings{
+				Sources: []reader.Source{env.New(env.Settings{Environ: testCase.environ})},
+			})
+
+			var settings PureVPN
+			err := settings.read(reader)
+
+			if testCase.errMessage == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, testCase.errMessage)
+			}
+			assert.Equal(t, testCase.expected, settings)
+		})
+	}
+}
+
+func Test_VPN_purevpn(t *testing.T) {
+	t.Parallel()
+
+	makeSettings := func(pureVPN PureVPN) VPN {
+		settings := VPN{
+			Type:     vpn.Wireguard,
+			Provider: Provider{Name: providers.Purevpn},
+			PureVPN:  pureVPN,
+		}
+		settings.setDefaults()
+		return settings
+	}
+
+	t.Run("validate_valid", func(t *testing.T) {
+		t.Parallel()
+		settings := makeSettings(PureVPN{SessionToken: new("token"), Country: "US"})
+		err := settings.Validate(pureVPNFilterChoicesGetter{}, false, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("validate_invalid_purevpn_settings", func(t *testing.T) {
+		t.Parallel()
+		settings := makeSettings(PureVPN{SessionToken: new("token")})
+		err := settings.Validate(pureVPNFilterChoicesGetter{}, false, nil)
+		assert.EqualError(t, err, `PureVPN settings: country is not a valid 2 letters country code: ""`)
+	})
+
+	t.Run("validate_other_provider_ignores_purevpn_settings", func(t *testing.T) {
+		t.Parallel()
+		settings := VPN{
+			Type:     vpn.Wireguard,
+			Provider: Provider{Name: providers.Mullvad},
+			Wireguard: Wireguard{
+				PrivateKey: new("Y0QnWR6mhgxOjNkPUkRdPYKYrB+pERhKFAuhkBapHw8="),
+				Addresses:  []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")},
+			},
+		}
+		settings.setDefaults()
+		err := settings.Validate(noopFilterChoicesGetter{}, false, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("to_lines_node", func(t *testing.T) {
+		t.Parallel()
+		settings := makeSettings(PureVPN{SessionToken: new("token"), Country: "US"})
+		assert.Contains(t, settings.String(), "PureVPN account settings:")
+		settings.Provider.Name = providers.Mullvad
+		assert.NotContains(t, settings.String(), "PureVPN account settings:")
+	})
+
+	t.Run("read_success", func(t *testing.T) {
+		t.Parallel()
+		reader := reader.New(reader.Settings{
+			Sources: []reader.Source{env.New(env.Settings{Environ: []string{"PUREVPN_COUNTRY=gb"}})},
+		})
+		var settings VPN
+		err := settings.read(reader)
+		assert.NoError(t, err)
+		assert.Equal(t, "GB", settings.PureVPN.Country)
+	})
+
+	t.Run("read_error", func(t *testing.T) {
+		t.Parallel()
+		reader := reader.New(reader.Settings{
+			Sources: []reader.Source{env.New(env.Settings{Environ: []string{"PUREVPN_CITY_ID=abc"}})},
+		})
+		var settings VPN
+		err := settings.read(reader)
+		assert.ErrorContains(t, err, "PureVPN: environment variable PUREVPN_CITY_ID: ")
+	})
 }

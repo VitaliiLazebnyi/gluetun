@@ -469,3 +469,41 @@ func Test_readCgroupPath(t *testing.T) {
 		})
 	}
 }
+
+func Test_Config_AllowOutputTemporarily_revertAfterSetEnabledFalse(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+
+	ctx := context.Background()
+	impl := NewMockfirewallImpl(ctrl)
+	impl.EXPECT().AcceptOutputMarked(ctx, "tcp", "eth0", netip.MustParseAddr("1.1.1.1"),
+		uint16(443), "/", uint32(1), false).Return(nil)
+	logger := NewMockLogger(ctrl)
+	disablingCall := logger.EXPECT().Info("disabling...")
+	logger.EXPECT().Info("disabled successfully").After(disablingCall)
+	restoreCalls := 0
+	config := &Config{
+		impl:          impl,
+		logger:        logger,
+		enabled:       true,
+		defaultRoutes: []routing.DefaultRoute{{NetInterface: "eth0"}},
+		cgroupPath:    "/",
+		restore:       func(context.Context) { restoreCalls++ },
+	}
+
+	addrPorts := []netip.AddrPort{netip.MustParseAddrPort("1.1.1.1:443")}
+	revert, err := config.AllowOutputTemporarily(ctx, "tcp", 1, addrPorts)
+	require.NoError(t, err)
+
+	err = config.SetEnabled(ctx, false)
+	require.NoError(t, err)
+	assert.Equal(t, 1, restoreCalls)
+
+	// Simulate the firewall being enabled again, which does not
+	// restore the temporary rules removed when disabling it.
+	config.enabled = true
+
+	// The rules are already removed, so no removal is attempted.
+	err = revert(ctx)
+	assert.NoError(t, err)
+}

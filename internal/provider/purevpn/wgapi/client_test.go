@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -57,6 +58,7 @@ type fakePureVPN struct {
 	blocked              map[string]bool          // "METHOD /path" blocked by Cloudflare
 	subscriptions        []subscription
 	singleServerObject   bool
+	noCityID             bool              // the city ID is not expected in the server request
 	brokenAuthorizePages uint              // number of GET authorize pages without any form
 	htmlAPIResponses     uint              // number of API responses with an HTML page
 	rejectToken          string            // API rejects this access token once
@@ -322,7 +324,11 @@ func (f *fakePureVPN) serveAPI(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(f.t, testVPNUsername, r.PostForm.Get("sUsername"))
 		assert.Equal(f.t, "encrypted", r.PostForm.Get("sPassword"))
 		assert.Equal(f.t, "US", r.PostForm.Get("sCountrySlug"))
-		assert.Equal(f.t, "8778", r.PostForm.Get("iCityId"))
+		if f.noCityID {
+			assert.False(f.t, r.PostForm.Has("iCityId"))
+		} else {
+			assert.Equal(f.t, "8778", r.PostForm.Get("iCityId"))
+		}
 		assert.Equal(f.t, testSubsID, r.PostForm.Get("sSubsId"))
 		assert.Equal(f.t, testClientKey, r.PostForm.Get("sClientPublicKey"))
 		server := map[string]string{
@@ -859,6 +865,48 @@ func Test_Client_FetchConfig(t *testing.T) {
 			errMessage:  "available subscriptions are none",
 			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
 		},
+		"no_city_id": {
+			setup:       func(fake *fakePureVPN) { fake.noCityID = true },
+			credentials: credentials,
+			request:     func(request *ServerRequest) { request.CityID = 0 },
+			authCookies: ssoCookies,
+			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
+		},
+		"subscription_invalid_json_falls_back_on_onboarding": {
+			setup: func(fake *fakePureVPN) {
+				fake.apiResponses = map[string]*fakeResponse{"/v2/api/subscription": {
+					status: http.StatusOK, contentType: "application/json", body: "not json",
+				}}
+			},
+			credentials: credentials,
+			authCookies: ssoCookies,
+			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
+		},
+		"server_with_empty_configuration": {
+			setup: func(fake *fakePureVPN) {
+				fake.apiResponses = map[string]*fakeResponse{"/v2/api/wireguard/get-wg-server": {
+					status: http.StatusOK,
+					body:   `{"status":true,"body":[{"wireguard_configuration":""}]}`,
+				}}
+			},
+			credentials: credentials,
+			errWrapped:  errUnexpectedResponse,
+			errMessage:  "no WireGuard configuration in response",
+			counters:    fakeCounters{passwordLogins: 1, tokens: 1},
+		},
+		"two_factor_methods_page_on_authorize": {
+			// The single sign-on session is valid but the trusted device
+			// cookie expired, and the authorize page asks for a method.
+			setup: func(fake *fakePureVPN) {
+				fake.twoFactor = true
+				fake.pages = map[string]string{
+					"GET /oauth2/authorize": fmt.Sprintf(twoFactorMethodsPage, emailMethod+authenticatorMethod),
+				}
+			},
+			credentials: credentialsWithTOTP,
+			authCookies: trustedCookies,
+			counters:    fakeCounters{twoFactorLogins: 1, tokens: 1},
+		},
 		"subscription_not_found": {
 			credentials: credentials,
 			request:     func(request *ServerRequest) { request.VPNUsername = "purevpn0sother" },
@@ -1048,6 +1096,7 @@ func Test_Client_apiRequest(t *testing.T) {
 		status     int
 		headers    map[string]string
 		body       string
+		nilBody    bool
 		errWrapped error
 		errMessage string
 	}{
@@ -1133,6 +1182,32 @@ func Test_Client_apiRequest(t *testing.T) {
 			body:       `{"status":true,"body":"text"}`,
 			errWrapped: errUnexpectedResponse,
 		},
+		"body_ignored": {
+			status:  http.StatusOK,
+			body:    `{"status":true,"body":"text"}`,
+			nilBody: true,
+		},
+		"html_body_with_json_content_type": {
+			status:     http.StatusOK,
+			headers:    map[string]string{"Content-Type": "application/json"},
+			body:       "  <html>login</html>",
+			errWrapped: errUnauthorized,
+			errMessage: "API returned an HTML page",
+		},
+		"cloudflare_service_unavailable": {
+			status:     http.StatusServiceUnavailable,
+			headers:    map[string]string{"Server": "cloudflare", "Content-Type": "text/html"},
+			body:       "<html><div id=\"cf-error-details\">Error</div></html>",
+			errWrapped: errBlocked,
+			errMessage: "Cloudflare returned 503 Service Unavailable",
+		},
+		"cloudflare_too_many_requests": {
+			status:     http.StatusTooManyRequests,
+			headers:    map[string]string{"Server": "cloudflare", "Content-Type": "text/html"},
+			body:       "<html><title>Just a moment...</title></html>",
+			errWrapped: errBlocked,
+			errMessage: "Cloudflare returned 429 Too Many Requests",
+		},
 	}
 
 	for name, testCase := range testCases {
@@ -1140,6 +1215,7 @@ func Test_Client_apiRequest(t *testing.T) {
 			t.Parallel()
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				assert.Equal(t, "Bearer token", r.Header.Get("Authorization"))
+				assert.Equal(t, "application/json", r.Header.Get("Accept"))
 				for key, value := range testCase.headers {
 					w.Header().Set(key, value)
 				}
@@ -1152,13 +1228,17 @@ func Test_Client_apiRequest(t *testing.T) {
 			var body struct {
 				Value string `json:"value"`
 			}
-			err := client.apiRequest(context.Background(), "token", "/v2/api/test", nil, &body)
+			var bodyTarget any = &body
+			if testCase.nilBody {
+				bodyTarget = nil
+			}
+			err := client.apiRequest(context.Background(), "token", "/v2/api/test", nil, bodyTarget)
 
 			assert.ErrorIs(t, err, testCase.errWrapped)
 			if testCase.errMessage != "" {
 				assert.ErrorContains(t, err, testCase.errMessage)
 			}
-			if testCase.errWrapped == nil {
+			if testCase.errWrapped == nil && !testCase.nilBody {
 				assert.Equal(t, "x", body.Value)
 			}
 		})
@@ -1335,12 +1415,257 @@ func Test_accessTokenValid(t *testing.T) {
 		"expired_jwt":     {token: makeJWT(now.Add(-time.Hour), 0)},
 		"malformed_token": {token: "a.b.c", valid: true},
 		"not_json":        {token: "a.bm90LWpzb24.c", valid: true}, //nolint:gosec // test value
+		// eyJqdGkiOjF9 is {"jti":1}, a JWT payload without expiry.
+		"jwt_without_expiry": {token: "a.eyJqdGkiOjF9.c", valid: true}, //nolint:gosec // test value
 	}
 
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, testCase.valid, accessTokenValid(testCase.token, now))
+		})
+	}
+}
+
+func Test_truncate(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "text", truncate("  text \n"))
+	maxLengthText := strings.Repeat("x", 200)
+	assert.Equal(t, maxLengthText, truncate(maxLengthText))
+	assert.Equal(t, maxLengthText+"...", truncate(maxLengthText+"y"))
+}
+
+type errorReader struct{}
+
+func (errorReader) Read([]byte) (int, error) { return 0, errors.New("test read error") }
+
+func Test_Client_readBodyError(t *testing.T) {
+	t.Parallel()
+
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(errorReader{}),
+				Request:    request,
+			}, nil
+		}),
+	}
+	client, err := New(httpClient, "", "", Credentials{}, Session{})
+	require.NoError(t, err)
+
+	err = client.apiRequest(context.Background(), "token", "/v2/api/test", nil, nil)
+	assert.EqualError(t, err, "reading response body: test read error")
+
+	page, err := client.doAuthRequest(context.Background(), http.MethodGet, DefaultAuthURL, nil)
+	assert.EqualError(t, err, "reading response body: test read error")
+	assert.Nil(t, page)
+}
+
+func Test_Client_apiRequest_requestError(t *testing.T) {
+	t.Parallel()
+
+	errTest := errors.New("test error")
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errTest
+		}),
+	}
+	client, err := New(httpClient, "", "", Credentials{}, Session{})
+	require.NoError(t, err)
+
+	err = client.apiRequest(context.Background(), "token", "/v2/api/test", nil, nil)
+
+	assert.ErrorIs(t, err, errTest)
+	assert.EqualError(t, err, `Post "https://my.purevpn.com/v2/api/test": test error`)
+}
+
+func Test_setBrowserHeaders(t *testing.T) {
+	t.Parallel()
+
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/", nil)
+	setBrowserHeaders(request)
+	assert.Equal(t, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		request.Header.Get("Accept"))
+	assert.Contains(t, request.Header.Get("User-Agent"), "Mozilla/5.0")
+	assert.Equal(t, "en-US,en;q=0.9", request.Header.Get("Accept-Language"))
+
+	request = httptest.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/", nil)
+	request.Header.Set("Accept", "application/json")
+	setBrowserHeaders(request)
+	assert.Equal(t, "application/json", request.Header.Get("Accept"), "Accept header set must be kept")
+}
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string { return "test timeout" }
+func (timeoutError) Timeout() bool { return true }
+
+func Test_wrapRequestError(t *testing.T) {
+	t.Parallel()
+
+	errTest := errors.New("test error")
+	testCases := map[string]struct {
+		err        error
+		errMessage string
+	}{
+		"not_url_error": {
+			err:        errTest,
+			errMessage: "test error",
+		},
+		"url_redacted": {
+			err:        &url.Error{Op: "Get", URL: "https://auth.example.com/path?code=secret", Err: errTest},
+			errMessage: `Get "https://auth.example.com/path": test error`,
+		},
+		"unparsable_url": {
+			err:        &url.Error{Op: "Get", URL: "https://auth.example.com/%zz?code=secret", Err: errTest},
+			errMessage: `Get "<redacted>": test error`,
+		},
+		"timeout": {
+			err: &url.Error{Op: "Get", URL: "https://auth.example.com/path?code=secret", Err: timeoutError{}},
+			errMessage: `timed out reaching PureVPN: Get "https://auth.example.com/path": ` +
+				"test timeout",
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			err := wrapRequestError(testCase.err)
+			assert.EqualError(t, err, testCase.errMessage)
+			assert.ErrorIs(t, err, testCase.err)
+		})
+	}
+}
+
+func cookiesToStrings(cookies []*http.Cookie) []string {
+	values := make([]string, len(cookies))
+	for i, cookie := range cookies {
+		values[i] = cookie.Name + "=" + cookie.Value
+	}
+	return values
+}
+
+func Test_Client_clearAccessToken(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		sessionToken string
+		staleTokens  []string
+	}{
+		"session_token_set": {
+			sessionToken: "session-token",
+			staleTokens:  []string{"session-token", "domain-token"},
+		},
+		"session_token_not_set": {
+			staleTokens: []string{"domain-token"},
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			client, err := New(&http.Client{}, "https://auth.example.com", "https://app.example.com",
+				Credentials{}, Session{AccessToken: testCase.sessionToken})
+			require.NoError(t, err)
+			client.jar.SetCookies(client.appURL, []*http.Cookie{
+				{Name: accessToken, Value: "", Path: "/"},
+				// A cookie set with a Domain attribute cannot be removed
+				// by setting an expired host-only cookie.
+				{Name: accessToken, Value: "domain-token", Domain: "example.com", Path: "/"},
+				{Name: "other", Value: "x", Path: "/"},
+			})
+
+			// The empty access token cookie is ignored.
+			assert.Equal(t, "domain-token", client.getAccessTokenCookie())
+
+			client.clearAccessToken()
+
+			assert.Equal(t, testCase.staleTokens, client.staleTokens)
+			assert.Empty(t, client.session.AccessToken)
+			assert.ElementsMatch(t, []string{accessToken + "=domain-token", "other=x"},
+				cookiesToStrings(client.jar.Cookies(client.appURL)))
+			assert.Empty(t, client.getAccessTokenCookie(), "stale access token must be ignored")
+
+			client.jar.SetCookies(client.appURL, []*http.Cookie{{Name: accessToken, Value: "fresh", Path: "/"}})
+			assert.Equal(t, "fresh", client.getAccessTokenCookie())
+		})
+	}
+}
+
+func Test_Client_saveSession(t *testing.T) {
+	t.Parallel()
+
+	client, err := New(&http.Client{}, "https://auth.example.com", "https://app.example.com",
+		Credentials{}, Session{})
+	require.NoError(t, err)
+	client.jar.SetCookies(client.authURL, []*http.Cookie{
+		{Name: "fusionauth.sso", Value: "general", Path: "/"},
+		{Name: "fusionauth.sso", Value: "specific", Path: "/oauth2"},
+		{Name: "fusionauth.trust", Value: "trusted", Path: "/"},
+		{Name: "other", Value: "x", Path: "/"},
+	})
+
+	client.saveSession("token")
+
+	assert.Equal(t, Session{
+		AccessToken: "token",
+		AuthCookies: map[string]string{"fusionauth.sso": "specific", "fusionauth.trust": "trusted"},
+	}, client.Session())
+}
+
+func Test_Client_login_credentialsNotSet(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]Credentials{
+		"nothing_set":      {},
+		"password_not_set": {Username: testUsername},
+		"username_not_set": {Password: testPassword},
+	}
+
+	for name, credentials := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			httpClient := &http.Client{
+				Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					t.Error("unexpected request")
+					return nil, errors.New("unexpected request")
+				}),
+			}
+			client, err := New(httpClient, "", "", credentials, Session{})
+			require.NoError(t, err)
+
+			token, err := client.login(context.Background())
+
+			assert.Empty(t, token)
+			assert.EqualError(t, err, errCredentialsNotSet.Error())
+		})
+	}
+}
+
+func Test_joinURL(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		base     string
+		path     string
+		expected string
+	}{
+		"empty_base_path": {base: "https://example.com", path: "/v2/api", expected: "https://example.com/v2/api"},
+		"base_path": {
+			base: "https://example.com/base", path: "/v2/api", expected: "https://example.com/base/v2/api",
+		},
+		"base_path_trailing": {base: "https://example.com/base/", path: "v2", expected: "https://example.com/base/v2"},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			base, err := url.Parse(testCase.base)
+			require.NoError(t, err)
+			assert.Equal(t, testCase.expected, joinURL(base, testCase.path).String())
 		})
 	}
 }

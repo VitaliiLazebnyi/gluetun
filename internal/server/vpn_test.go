@@ -47,6 +47,19 @@ func Test_vpnHandler_getSettings_redactsPureVPNSecrets(t *testing.T) {
 				"vpn_username":    nil,
 			},
 		},
+		"nil_secrets_not_redacted": {
+			settings: settings.VPN{PureVPN: settings.PureVPN{Country: "US"}},
+			purevpn: map[string]any{
+				"username":        nil,
+				"password":        nil,
+				"totp_secret":     nil,
+				"session_token":   nil,
+				"country":         "US",
+				"city_id":         nil,
+				"subscription_id": nil,
+				"vpn_username":    nil,
+			},
+		},
 		"empty_secrets_not_redacted": {
 			settings: newPureVPNTestSettings("", ""),
 			purevpn: map[string]any{

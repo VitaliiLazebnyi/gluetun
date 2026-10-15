@@ -203,3 +203,27 @@ func Test_deleteIPTablesRule(t *testing.T) {
 		})
 	}
 }
+
+func Test_Config_runIP6tablesInstructionNoSave_deleteMatch(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+
+	const ip6tablesBinary = "/sbin/ip6tables"
+	const instruction = "-t filter -D OUTPUT -o eth0 -p tcp -m tcp --dport 443 -j ACCEPT"
+	runner := NewMockCmdRunner(ctrl)
+	runner.EXPECT().Run(newCmdMatcherListRules(ip6tablesBinary, "filter", "OUTPUT")).
+		Return("Chain OUTPUT (policy ACCEPT 0 packets, 0 bytes)\n"+
+			"num   pkts bytes target     prot opt in     out     source               destination\n", nil)
+	logger := NewMockLogger(ctrl)
+	logger.EXPECT().Debug("/sbin/ip6tables -t filter -L OUTPUT --line-numbers -n -v")
+	logger.EXPECT().Debug("rule matching \"" + instruction + "\" not found")
+	config := &Config{
+		runner:    runner,
+		logger:    logger,
+		ip6Tables: ip6tablesBinary,
+	}
+
+	err := config.runIP6tablesInstructionNoSave(context.Background(), instruction)
+
+	assert.NoError(t, err)
+}

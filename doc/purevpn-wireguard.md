@@ -68,14 +68,17 @@ path set with `PUREVPN_PASSWORD_SECRETFILE`. The same works for
 `PUREVPN_SESSION_TOKEN` (`/run/secrets/purevpn_session_token`).
 
 PureVPN assigns the server endpoint, its public key and the interface
-addresses, so these settings are rejected at startup:
-`WIREGUARD_ADDRESSES`, `WIREGUARD_ENDPOINT_IP`, `WIREGUARD_ENDPOINT_PORT`
-and `WIREGUARD_PUBLIC_KEY`. If PureVPN assigns no IPv4 address and IPv6 is
+addresses, and its servers use no pre-shared key, so these settings are
+rejected at startup: `WIREGUARD_ADDRESSES`, `WIREGUARD_ENDPOINT_IP`,
+`WIREGUARD_ENDPOINT_PORT`, `WIREGUARD_PUBLIC_KEY` and
+`WIREGUARD_PRESHARED_KEY`. If PureVPN assigns no IPv4 address and IPv6 is
 not supported, the connection attempt fails.
 
-The `SERVER_*` filters (countries, regions, cities, hostnames...) are
-ignored, with a warning: the server location only comes from
-`PUREVPN_COUNTRY` and `PUREVPN_CITY_ID`.
+The server location only comes from `PUREVPN_COUNTRY` and
+`PUREVPN_CITY_ID`. The `SERVER_*` filters (countries, regions, cities,
+hostnames...) are still validated at startup against Gluetun's PureVPN
+OpenVPN server data, so an invalid value such as `SERVER_COUNTRIES=Atlantis`
+fails at startup. Valid filters are then ignored, with a warning.
 
 ### City IDs
 
@@ -162,14 +165,16 @@ session stops working:
 1. Otherwise, it logs in with the username and password. If two-factor
    authentication is enabled, it generates the 6-digit code from
    `PUREVPN_TOTP_SECRET`, and asks PureVPN to trust the device
-   (`trustComputer`), which may let later logins skip the code.
+   (`trustComputer`), which may let later logins skip the code. If PureVPN
+   rejects the code, Gluetun waits for the next 30-second code and submits
+   it once before failing.
 
 The TOTP secret is the text version of the QR code shown when you enable
 two-factor authentication. It is often shown as "Can't scan the code?".
-Only authenticator app two-factor authentication is supported. If the
-account has several two-factor methods, Gluetun picks the one labelled as
-an authenticator app; if there is none (only email or SMS codes), the login
-fails.
+Only authenticator app two-factor authentication is supported. If PureVPN
+shows the code form, Gluetun uses it directly. If it only shows a method
+selection, Gluetun picks the authenticator app method; if there is none
+(only email or SMS codes), the login fails.
 
 ### Session token
 
@@ -202,24 +207,41 @@ Gluetun briefly opens the firewall as follows:
    route interfaces.
 1. It resolves `auth.purevpn.com` and `my.purevpn.com` with its own DNS
    over HTTPS client, which connects to these pinned IP addresses. The
-   system DNS is not used.
+   system DNS is not used. Responses are checked: they must match the
+   query, and only A records of the queried name or its CNAME chain are
+   used.
 1. It adds temporary rules allowing HTTPS to the resolved PureVPN IPv4
    addresses only. Its HTTP client refuses any other destination and never
    uses a proxy.
 1. It fetches the configuration, then removes all these rules before the
-   WireGuard tunnel starts. The rules are also removed if the fetch fails or
-   Gluetun shuts down. The whole fetch is limited to 2 minutes.
+   WireGuard tunnel starts. The rules are also removed if the fetch fails,
+   is interrupted or Gluetun shuts down. The whole fetch is limited to 2
+   minutes.
 
-The temporary rules only accept packets carrying a socket mark, and Gluetun
-sets this mark only on its own sockets used for this fetch. The mark is
-random and changes on every fetch. This matters because the PureVPN
-website is behind Cloudflare, so its IP addresses are shared with many
-other websites: without the mark, any program in the container could reach
-those Cloudflare sites outside the VPN while the rules exist. Other
-processes, and containers sharing Gluetun's network namespace (for example
-with `network_mode: service:gluetun`), cannot use this opening, unless they
-have the `NET_ADMIN` capability, which lets them read the rules and their
-mark.
+The PureVPN website is behind Cloudflare, so its IP addresses are shared
+with many other websites. To keep other programs from reaching those sites
+outside the VPN while the rules exist, the rules only accept packets that
+match both:
+
+- a socket mark, set only on Gluetun's sockets for this fetch. The mark is
+  random, changes on every fetch, and is shown as `<redacted>` in the logs.
+- Gluetun's own cgroup (`-m cgroup --path <path>`, with the cgroup v2 path
+  read from `/proc/self/cgroup`). Containers sharing Gluetun's network
+  namespace (for example with `network_mode: service:gluetun`) run in other
+  cgroups, so they cannot match. The mark alone is not enough: a process
+  with the `NET_RAW` capability, granted by Docker by default, can set
+  socket marks on Linux 5.17 and later, so it could try mark values until
+  one works.
+
+The cgroup match is best effort. If the cgroup v2 path is not found, or the
+cgroup match is not supported, Gluetun logs a warning once and the rules
+only match the mark. In all cases, a program with the `NET_ADMIN`
+capability can read the rules and their mark.
+
+If removing a rule fails, Gluetun logs a warning and tries again at the
+start of the next fetch, logging `removed temporary firewall rules left by
+a previous attempt` once it succeeds. With the firewall disabled, no rules
+are added.
 
 ## Reconnection
 
@@ -243,23 +265,31 @@ secret, so you can send back the settings you received.
 | `two-factor authentication is enabled on the PureVPN account but no TOTP secret is set` | Set `PUREVPN_TOTP_SECRET` or `PUREVPN_SESSION_TOKEN` |
 | `PureVPN rejected the two-factor code, check the TOTP secret and the system clock` | Wrong TOTP secret, or the system clock is off |
 | `PureVPN two-factor method is not supported, only authenticator app (TOTP) is supported` | The account only has email or SMS codes |
-| `PureVPN requires a captcha to log in, ...` | Too many logins: log in from a browser and use a session token |
-| `PureVPN account username and password are not set` | The session token expired, or is not usable, and no username and password are set |
+| `PureVPN requires a captcha to log in, log in once from a browser or set a session token` | Too many logins, see below |
+| `PureVPN account username and password are not set` | The session token expired, or is not usable, and no username and password are set. After an expired session, it is prefixed with `PureVPN login session expired and` |
 | `request blocked by the PureVPN website protection` | Cloudflare blocked the request, usually because of the IP address reputation |
 | `no active PureVPN subscription found` | The account has no active subscription |
 | `PureVPN subscription not found` | `PUREVPN_SUBSCRIPTION_ID` or `PUREVPN_VPN_USERNAME` matches no subscription; the error lists the ones available |
-| `unexpected response from PureVPN` | PureVPN probably changed its website, so please report it |
+| `unexpected response from PureVPN` | PureVPN probably changed its website, so please report it. This includes an unexpected page after the two-factor step |
 
-The first six errors are about credentials, two-factor authentication or
-captcha. To avoid getting the account locked or captcha-protected by
-repeated failed logins, Gluetun does not retry them with the same settings.
-The first failure ends with `change the PureVPN settings to retry, through
+To avoid getting the account locked or captcha-protected by repeated
+failed logins, Gluetun does not retry credential and two-factor errors (the
+first, second, third, fourth and sixth rows) with the same settings. The
+first failure ends with `- change the PureVPN settings to retry, through
 the control server or by restarting with fixed settings`. Later connection
 attempts fail immediately with `not retrying with unchanged PureVPN
 settings: ...`, without contacting PureVPN, until any PureVPN setting
 changes. The VPN loop keeps cycling, but no login happens.
 
-Network errors and Cloudflare blocks are retried with growing delays.
+A captcha may stop being required after a while, so it only pauses logins
+for one hour. The error ends with `- not contacting PureVPN again before
+<time>, unless the PureVPN settings change`, and attempts during that hour
+fail with `not retrying with unchanged PureVPN settings: ...`. To avoid it,
+log in once from a browser, or use a [session token](#session-token).
+
+Other errors, such as network errors, Cloudflare blocks and unexpected
+responses, are retried by the VPN loop with a delay that doubles after each
+failure, starting at 15 seconds.
 
 ## Testing your settings without Docker
 

@@ -2,11 +2,13 @@ package purevpn
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -257,6 +259,90 @@ func Test_extractIPv4s(t *testing.T) {
 				assert.NoError(t, err)
 			}
 			assert.Equal(t, testCase.ips, ips)
+		})
+	}
+}
+
+type dohRoundTripFunc func(request *http.Request) (*http.Response, error)
+
+func (f dohRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("test read error") }
+
+func Test_dohResolver_lookupIPv4_errors(t *testing.T) {
+	t.Parallel()
+
+	okResponse := func(body io.Reader) dohRoundTripFunc {
+		return func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(body)}, nil
+		}
+	}
+
+	testCases := map[string]struct {
+		host         string
+		url          string
+		roundTripper dohRoundTripFunc
+		errMessage   string
+	}{
+		"query_packing_error": {
+			host:       strings.Repeat("a", 64) + ".example.com",
+			url:        "https://doh.example.com/dns-query",
+			errMessage: "packing DNS query: ",
+		},
+		"invalid_url": {
+			host:       "host.example.com",
+			url:        "://invalid",
+			errMessage: "querying ://invalid: creating request: ",
+		},
+		"request_error": {
+			host: "host.example.com",
+			url:  "https://doh.example.com/dns-query",
+			roundTripper: func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("test error")
+			},
+			errMessage: "querying https://doh.example.com/dns-query: doing request: " +
+				`Post "https://doh.example.com/dns-query": test error`,
+		},
+		"body_read_error": {
+			host:         "host.example.com",
+			url:          "https://doh.example.com/dns-query",
+			roundTripper: okResponse(errReader{}),
+			errMessage: "querying https://doh.example.com/dns-query: " +
+				"reading response body: test read error",
+		},
+		"body_unpack_error": {
+			host:         "host.example.com",
+			url:          "https://doh.example.com/dns-query",
+			roundTripper: okResponse(strings.NewReader("not a dns message")),
+			errMessage: "querying https://doh.example.com/dns-query: " +
+				"unpacking DNS response: ",
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			roundTripper := testCase.roundTripper
+			if roundTripper == nil {
+				roundTripper = func(*http.Request) (*http.Response, error) {
+					t.Error("unexpected HTTP request")
+					return nil, errors.New("unexpected HTTP request")
+				}
+			}
+			resolver := &dohResolver{
+				client: &http.Client{Transport: roundTripper},
+				urls:   []string{testCase.url},
+			}
+
+			ips, err := resolver.lookupIPv4(context.Background(), testCase.host)
+
+			assert.ErrorContains(t, err, testCase.errMessage)
+			assert.Nil(t, ips)
 		})
 	}
 }

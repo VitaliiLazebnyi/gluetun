@@ -43,6 +43,16 @@ func Test_parseConfig(t *testing.T) {
 				PersistentKeepalive: 25 * time.Second,
 			},
 		},
+		"unterminated_section_header_ignored": {
+			content: "[Interface]\nAddress=10.0.0.1\n[Peer\n[Peer]\nPublicKey=" + testServerKey +
+				"\nEndpoint=1.2.3.4:51820",
+			config: Config{
+				Addresses:       []netip.Prefix{netip.MustParsePrefix("10.0.0.1/32")},
+				ServerPublicKey: testServerKey,
+				EndpointHost:    "1.2.3.4",
+				EndpointPort:    51820,
+			},
+		},
 		"missing_address": {
 			content:    "[Peer]\nPublicKey=" + testServerKey + "\nEndpoint=1.2.3.4:51820",
 			errMessage: "interface address is missing",
