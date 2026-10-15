@@ -39,7 +39,7 @@ func Test_fetchWireguardConnection(t *testing.T) {
 		fetchErr       error
 		userPrivateKey string
 		userAddresses  []netip.Prefix
-		userKeepalive  time.Duration
+		userKeepalive  *time.Duration
 		ipv6Supported  bool
 		connection     models.Connection
 		privateKey     string
@@ -73,11 +73,24 @@ func Test_fetchWireguardConnection(t *testing.T) {
 				PersistentKeepalive: 21 * time.Second,
 			},
 			userPrivateKey: "user-private-key",
-			userKeepalive:  time.Minute,
+			userKeepalive:  new(time.Minute),
 			connection:     serverConnection,
 			privateKey:     "user-private-key",
 			addresses:      []netip.Prefix{ipv4Address, ipv6Address},
 			keepalive:      time.Minute,
+		},
+		"user_zero_keepalive_kept": {
+			fetched: models.WireguardConnection{
+				Connection:          serverConnection,
+				PrivateKey:          "fetched-private-key",
+				Addresses:           []netip.Prefix{ipv4Address},
+				PersistentKeepalive: 21 * time.Second,
+			},
+			userKeepalive: new(time.Duration(0)),
+			connection:    serverConnection,
+			privateKey:    "fetched-private-key",
+			addresses:     []netip.Prefix{ipv4Address},
+			keepalive:     0,
 		},
 		"no_address": {
 			fetched: models.WireguardConnection{
@@ -118,7 +131,7 @@ func Test_fetchWireguardConnection(t *testing.T) {
 				Wireguard: settings.Wireguard{
 					PrivateKey:                  new(testCase.userPrivateKey),
 					Addresses:                   testCase.userAddresses,
-					PersistentKeepaliveInterval: new(testCase.userKeepalive),
+					PersistentKeepaliveInterval: testCase.userKeepalive,
 					Interface:                   "wg0",
 				},
 			}
@@ -144,7 +157,7 @@ func Test_fetchWireguardConnection(t *testing.T) {
 			assert.Equal(t, "wg0", wireguardSettings.Interface)
 			// The user settings given must not be modified.
 			assert.Equal(t, testCase.userPrivateKey, *vpnSettings.Wireguard.PrivateKey)
-			assert.Equal(t, testCase.userKeepalive, *vpnSettings.Wireguard.PersistentKeepaliveInterval)
+			assert.Equal(t, testCase.userKeepalive, vpnSettings.Wireguard.PersistentKeepaliveInterval)
 		})
 	}
 }
@@ -263,7 +276,7 @@ func Test_buildWireguardSettings(t *testing.T) {
 			userSettings: settings.Wireguard{
 				PrivateKey:                  ptrTo("private"),
 				PreSharedKey:                ptrTo(""),
-				PersistentKeepaliveInterval: ptrTo(time.Duration(0)),
+				PersistentKeepaliveInterval: nil, // unset for PureVPN
 				Interface:                   "wg0",
 				MTU:                         ptrTo(uint32(0)),
 				GSO:                         ptrTo(false),
