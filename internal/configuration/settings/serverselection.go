@@ -3,11 +3,11 @@ package settings
 import (
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/qdm12/gluetun/internal/configuration/settings/helpers"
 	"github.com/qdm12/gluetun/internal/configuration/settings/validation"
+	"github.com/qdm12/gluetun/internal/constants"
 	"github.com/qdm12/gluetun/internal/constants/providers"
 	"github.com/qdm12/gluetun/internal/constants/vpn"
 	"github.com/qdm12/gluetun/internal/models"
@@ -122,7 +122,10 @@ func (ss *ServerSelection) validate(vpnServiceProvider string,
 	}
 
 	if vpnServiceProvider == providers.Purevpn && ss.VPN == vpn.Wireguard {
-		warnPureVPNWireguardFilters(*ss, warner)
+		err = validatePureVPNWireguard(*ss, warner)
+		if err != nil {
+			return fmt.Errorf("for VPN service provider %s: %w", vpnServiceProvider, err)
+		}
 	}
 
 	if ss.VPN == vpn.OpenVPN {
@@ -140,32 +143,42 @@ func (ss *ServerSelection) validate(vpnServiceProvider string,
 	return nil
 }
 
-// warnPureVPNWireguardFilters warns about server filters set, since they
-// are ignored with PureVPN Wireguard, for which the server location is
-// only selected with the PureVPN country and city ID settings.
-func warnPureVPNWireguardFilters(ss ServerSelection, warner Warner) {
-	filterNameToSet := map[string]bool{
-		"countries":  len(ss.Countries) > 0,
-		"regions":    len(ss.Regions) > 0,
-		"cities":     len(ss.Cities) > 0,
-		"ISPs":       len(ss.ISPs) > 0,
-		"names":      len(ss.Names) > 0,
-		"numbers":    len(ss.Numbers) > 0,
-		"hostnames":  len(ss.Hostnames) > 0,
-		"categories": len(ss.Categories) > 0,
+// validatePureVPNWireguard validates the server selection for PureVPN
+// Wireguard, for which the server location is only selected with a
+// single country and the PureVPN city ID setting.
+func validatePureVPNWireguard(ss ServerSelection, warner Warner) (err error) {
+	if len(ss.Countries) != 1 {
+		return fmt.Errorf("exactly one country must be set with PureVPN Wireguard, but got %d: %s",
+			len(ss.Countries), strings.Join(ss.Countries, ", "))
+	}
+	_, ok := constants.CountryNameToCode(ss.Countries[0])
+	if !ok {
+		return fmt.Errorf("country code not found for country %q", ss.Countries[0])
+	}
+
+	filters := [...]struct {
+		name string
+		set  bool
+	}{
+		{name: "regions", set: len(ss.Regions) > 0},
+		{name: "cities", set: len(ss.Cities) > 0},
+		{name: "ISPs", set: len(ss.ISPs) > 0},
+		{name: "names", set: len(ss.Names) > 0},
+		{name: "numbers", set: len(ss.Numbers) > 0},
+		{name: "hostnames", set: len(ss.Hostnames) > 0},
+		{name: "categories", set: len(ss.Categories) > 0},
 	}
 	var setFilterNames []string
-	for name, set := range filterNameToSet {
-		if set {
-			setFilterNames = append(setFilterNames, name)
+	for _, filter := range filters {
+		if filter.set {
+			setFilterNames = append(setFilterNames, filter.name)
 		}
 	}
-	if len(setFilterNames) == 0 {
-		return
+	if len(setFilterNames) > 0 {
+		warner.Warn("server selection filters " + strings.Join(setFilterNames, ", ") +
+			" are ignored with PureVPN Wireguard, use PUREVPN_CITY_ID to select a city")
 	}
-	slices.Sort(setFilterNames)
-	warner.Warn("server selection filters " + strings.Join(setFilterNames, ", ") +
-		" are ignored with PureVPN Wireguard, use PUREVPN_COUNTRY and PUREVPN_CITY_ID instead")
+	return nil
 }
 
 func getLocationFilterChoices(vpnServiceProvider string,

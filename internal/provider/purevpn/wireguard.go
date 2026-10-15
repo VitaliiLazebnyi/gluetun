@@ -80,7 +80,10 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	defer f.mutex.Unlock()
 
 	purevpnSettings := vpnSettings.PureVPN
-	fingerprint := settingsFingerprint(purevpnSettings)
+	// The settings validation ensures there is exactly one known country.
+	countryCode, _ := constants.CountryNameToCode(vpnSettings.Provider.ServerSelection.Countries[0])
+	countryCode = strings.ToUpper(countryCode)
+	fingerprint := settingsFingerprint(purevpnSettings, countryCode)
 	if f.authErr != nil {
 		if fingerprint == f.authErrFingerprint &&
 			(f.authErrUntil.IsZero() || f.timeNow().Before(f.authErrUntil)) {
@@ -128,9 +131,10 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 		return models.WireguardConnection{}, fmt.Errorf("creating PureVPN client: %w", err)
 	}
 
-	logger.Info("fetching Wireguard configuration from PureVPN for " + describeLocation(purevpnSettings))
+	location := describeLocation(countryCode, *purevpnSettings.CityID)
+	logger.Info("fetching Wireguard configuration from PureVPN for " + location)
 	config, err := client.FetchConfig(ctx, wgapi.ServerRequest{
-		CountryCode:     purevpnSettings.Country,
+		CountryCode:     countryCode,
 		CityID:          uint32(*purevpnSettings.CityID), //nolint:gosec
 		SubscriptionID:  *purevpnSettings.SubscriptionID,
 		VPNUsername:     *purevpnSettings.VPNUsername,
@@ -192,13 +196,13 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 
 // settingsFingerprint returns a hash of the PureVPN settings, to detect
 // a change in the settings without keeping the secrets in memory twice.
-func settingsFingerprint(purevpnSettings settings.PureVPN) string {
+func settingsFingerprint(purevpnSettings settings.PureVPN, countryCode string) string {
 	fields := [...]string{
 		*purevpnSettings.Username,
 		*purevpnSettings.Password,
 		*purevpnSettings.TOTPSecret,
 		*purevpnSettings.SessionToken,
-		purevpnSettings.Country,
+		countryCode,
 		fmt.Sprint(*purevpnSettings.CityID),
 		*purevpnSettings.SubscriptionID,
 		*purevpnSettings.VPNUsername,
@@ -207,11 +211,11 @@ func settingsFingerprint(purevpnSettings settings.PureVPN) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func describeLocation(purevpnSettings settings.PureVPN) string {
-	if *purevpnSettings.CityID == 0 {
-		return "country " + purevpnSettings.Country
+func describeLocation(countryCode string, cityID uint) string {
+	if cityID == 0 {
+		return "country " + countryCode
 	}
-	return fmt.Sprintf("country %s city ID %d", purevpnSettings.Country, *purevpnSettings.CityID)
+	return fmt.Sprintf("country %s city ID %d", countryCode, cityID)
 }
 
 // keyPair returns the private key from the settings if set, or the

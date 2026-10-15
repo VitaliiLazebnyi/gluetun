@@ -166,12 +166,14 @@ func testVPNSettings(sessionToken, privateKey string) settings.VPN {
 			PrivateKey:                  new(privateKey),
 			PersistentKeepaliveInterval: new(time.Duration(0)),
 		},
+		Provider: settings.Provider{
+			ServerSelection: settings.ServerSelection{Countries: []string{"United States"}},
+		},
 		PureVPN: settings.PureVPN{
 			Username:       new(""),
 			Password:       new(""),
 			TOTPSecret:     new(""),
 			SessionToken:   new(sessionToken),
-			Country:        "US",
 			CityID:         new(uint(8778)),
 			SubscriptionID: new(""),
 			VPNUsername:    new(""),
@@ -430,15 +432,15 @@ func Test_settingsFingerprint(t *testing.T) {
 	t.Parallel()
 
 	base := testVPNSettings("token", "").PureVPN
-	baseFingerprint := settingsFingerprint(base)
-	assert.Equal(t, baseFingerprint, settingsFingerprint(testVPNSettings("token", "").PureVPN))
+	baseFingerprint := settingsFingerprint(base, "US")
+	assert.Equal(t, baseFingerprint, settingsFingerprint(testVPNSettings("token", "").PureVPN, "US"))
+	assert.NotEqual(t, baseFingerprint, settingsFingerprint(base, "GB"))
 
 	testCases := map[string]func(purevpnSettings *settings.PureVPN){
 		"username":        func(s *settings.PureVPN) { s.Username = new("user") },
 		"password":        func(s *settings.PureVPN) { s.Password = new("password") },
 		"totp_secret":     func(s *settings.PureVPN) { s.TOTPSecret = new("JBSWY3DP") },
 		"session_token":   func(s *settings.PureVPN) { s.SessionToken = new("other") },
-		"country":         func(s *settings.PureVPN) { s.Country = "GB" },
 		"city_id":         func(s *settings.PureVPN) { s.CityID = new(uint(1)) },
 		"subscription_id": func(s *settings.PureVPN) { s.SubscriptionID = new("s2") },
 		"vpn_username":    func(s *settings.PureVPN) { s.VPNUsername = new("purevpn0s2") },
@@ -449,7 +451,7 @@ func Test_settingsFingerprint(t *testing.T) {
 			t.Parallel()
 			modified := testVPNSettings("token", "").PureVPN
 			modify(&modified)
-			assert.NotEqual(t, baseFingerprint, settingsFingerprint(modified))
+			assert.NotEqual(t, baseFingerprint, settingsFingerprint(modified, "US"))
 		})
 	}
 }

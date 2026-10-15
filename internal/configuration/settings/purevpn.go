@@ -4,7 +4,6 @@ import (
 	"encoding/base32"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/qdm12/gosettings"
@@ -33,11 +32,8 @@ type PureVPN struct {
 	// access token cookie of my.purevpn.com. It can be the empty
 	// string, and cannot be nil in the internal state.
 	SessionToken *string `json:"session_token"`
-	// Country is the ISO 3166 alpha-2 country code of the server
-	// location, for example "US". It cannot be the empty string
-	// in the internal state if PureVPN Wireguard is used.
-	Country string `json:"country"`
-	// CityID is the PureVPN city ID of the server location.
+	// CityID is the PureVPN city ID of the server location, in the
+	// country set with the server selection countries filter.
 	// It can be 0 to let PureVPN pick a city in the country,
 	// and cannot be nil in the internal state.
 	CityID *uint `json:"city_id"`
@@ -52,8 +48,6 @@ type PureVPN struct {
 	// It cannot be nil in the internal state.
 	VPNUsername *string `json:"vpn_username"`
 }
-
-var regexpCountryCode = regexp.MustCompile(`^[A-Za-z]{2}$`)
 
 func (p PureVPN) validate() (err error) {
 	hasCredentials := *p.Username != "" && *p.Password != ""
@@ -74,10 +68,6 @@ func (p PureVPN) validate() (err error) {
 		}
 	}
 
-	if !regexpCountryCode.MatchString(p.Country) {
-		return fmt.Errorf("country is not a valid 2 letters country code: %q", p.Country)
-	}
-
 	return nil
 }
 
@@ -87,7 +77,6 @@ func (p *PureVPN) copy() (copied PureVPN) {
 		Password:       gosettings.CopyPointer(p.Password),
 		TOTPSecret:     gosettings.CopyPointer(p.TOTPSecret),
 		SessionToken:   gosettings.CopyPointer(p.SessionToken),
-		Country:        p.Country,
 		CityID:         gosettings.CopyPointer(p.CityID),
 		SubscriptionID: gosettings.CopyPointer(p.SubscriptionID),
 		VPNUsername:    gosettings.CopyPointer(p.VPNUsername),
@@ -99,7 +88,6 @@ func (p *PureVPN) overrideWith(other PureVPN) {
 	p.Password = gosettings.OverrideWithPointer(p.Password, other.Password)
 	p.TOTPSecret = gosettings.OverrideWithPointer(p.TOTPSecret, other.TOTPSecret)
 	p.SessionToken = gosettings.OverrideWithPointer(p.SessionToken, other.SessionToken)
-	p.Country = gosettings.OverrideWithComparable(p.Country, other.Country)
 	p.CityID = gosettings.OverrideWithPointer(p.CityID, other.CityID)
 	p.SubscriptionID = gosettings.OverrideWithPointer(p.SubscriptionID, other.SubscriptionID)
 	p.VPNUsername = gosettings.OverrideWithPointer(p.VPNUsername, other.VPNUsername)
@@ -122,7 +110,7 @@ func (p PureVPN) String() string {
 func (p PureVPN) toLinesNode() (node *gotree.Node) {
 	node = gotree.New("PureVPN account settings:")
 	if *p.Username != "" {
-		node.Appendf("Username: %s", *p.Username)
+		node.Appendf("Username: %s", gosettings.ObfuscateKey(*p.Username))
 		node.Appendf("Password: %s", gosettings.ObfuscateKey(*p.Password))
 	}
 	if *p.TOTPSecret != "" {
@@ -131,16 +119,14 @@ func (p PureVPN) toLinesNode() (node *gotree.Node) {
 	if *p.SessionToken != "" {
 		node.Appendf("Session token: %s", gosettings.ObfuscateKey(*p.SessionToken))
 	}
-	location := strings.ToUpper(p.Country)
 	if *p.CityID != 0 {
-		location += fmt.Sprintf(" city ID %d", *p.CityID)
+		node.Appendf("City ID: %d", *p.CityID)
 	}
-	node.Appendf("Location: %s", location)
 	if *p.SubscriptionID != "" {
 		node.Appendf("Subscription ID: %s", *p.SubscriptionID)
 	}
 	if *p.VPNUsername != "" {
-		node.Appendf("VPN username: %s", *p.VPNUsername)
+		node.Appendf("VPN username: %s", gosettings.ObfuscateKey(*p.VPNUsername))
 	}
 	return node
 }
@@ -150,7 +136,6 @@ func (p *PureVPN) read(r *reader.Reader) (err error) {
 	p.Password = r.Get("PUREVPN_PASSWORD", reader.ForceLowercase(false))
 	p.TOTPSecret = r.Get("PUREVPN_TOTP_SECRET", reader.ForceLowercase(false))
 	p.SessionToken = r.Get("PUREVPN_SESSION_TOKEN", reader.ForceLowercase(false))
-	p.Country = strings.ToUpper(r.String("PUREVPN_COUNTRY"))
 	p.CityID, err = r.UintPtr("PUREVPN_CITY_ID")
 	if err != nil {
 		return err
