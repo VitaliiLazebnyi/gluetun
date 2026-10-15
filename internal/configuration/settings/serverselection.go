@@ -3,6 +3,7 @@ package settings
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/qdm12/gluetun/internal/configuration/settings/helpers"
@@ -120,6 +121,10 @@ func (ss *ServerSelection) validate(vpnServiceProvider string,
 		return fmt.Errorf("for VPN service provider %s: %w", vpnServiceProvider, err)
 	}
 
+	if vpnServiceProvider == providers.Purevpn && ss.VPN == vpn.Wireguard {
+		warnPureVPNWireguardFilters(*ss, warner)
+	}
+
 	if ss.VPN == vpn.OpenVPN {
 		err = ss.OpenVPN.validate(vpnServiceProvider)
 		if err != nil {
@@ -133,6 +138,34 @@ func (ss *ServerSelection) validate(vpnServiceProvider string,
 	}
 
 	return nil
+}
+
+// warnPureVPNWireguardFilters warns about server filters set, since they
+// are ignored with PureVPN Wireguard, for which the server location is
+// only selected with the PureVPN country and city ID settings.
+func warnPureVPNWireguardFilters(ss ServerSelection, warner Warner) {
+	filterNameToSet := map[string]bool{
+		"countries":  len(ss.Countries) > 0,
+		"regions":    len(ss.Regions) > 0,
+		"cities":     len(ss.Cities) > 0,
+		"ISPs":       len(ss.ISPs) > 0,
+		"names":      len(ss.Names) > 0,
+		"numbers":    len(ss.Numbers) > 0,
+		"hostnames":  len(ss.Hostnames) > 0,
+		"categories": len(ss.Categories) > 0,
+	}
+	var setFilterNames []string
+	for name, set := range filterNameToSet {
+		if set {
+			setFilterNames = append(setFilterNames, name)
+		}
+	}
+	if len(setFilterNames) == 0 {
+		return
+	}
+	slices.Sort(setFilterNames)
+	warner.Warn("server selection filters " + strings.Join(setFilterNames, ", ") +
+		" are ignored with PureVPN Wireguard, use PUREVPN_COUNTRY and PUREVPN_CITY_ID instead")
 }
 
 func getLocationFilterChoices(vpnServiceProvider string,

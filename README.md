@@ -64,7 +64,7 @@ Lightweight swiss-army-knife-like VPN client to multiple VPN service providers
 - Supports OpenVPN for all providers listed
 - Supports Wireguard both kernelspace and userspace
   - For **AirVPN**, **FastestVPN**, **Ivpn**, **Mullvad**, **NordVPN**, **ProtonVPN**, **Surfshark** and **Windscribe**
-  - For **Cyberghost**, **Private Internet Access**, **PrivateVPN**, **PureVPN**, **Torguard**, **VPN Unlimited** and **VyprVPN** using [the custom provider](https://github.com/qdm12/gluetun-wiki/blob/main/setup/providers/custom.md)
+  - For **Cyberghost**, **Private Internet Access**, **PrivateVPN**, **Torguard**, **VPN Unlimited** and **VyprVPN** using [the custom provider](https://github.com/qdm12/gluetun-wiki/blob/main/setup/providers/custom.md)
   - For **PureVPN**, with the configuration generated from your PureVPN account, see [doc/purevpn-wireguard.md](doc/purevpn-wireguard.md)
   - For custom Wireguard configurations using [the custom provider](https://github.com/qdm12/gluetun-wiki/blob/main/setup/providers/custom.md)
   - More in progress, see [#134](https://github.com/passteque/gluetun/issues/134)

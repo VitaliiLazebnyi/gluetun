@@ -12,7 +12,6 @@ import (
 	"github.com/qdm12/gluetun/internal/pmtud/tcp"
 	portforward "github.com/qdm12/gluetun/internal/portforward"
 	"github.com/qdm12/gluetun/internal/provider"
-	"github.com/qdm12/gluetun/internal/provider/purevpn"
 	"github.com/qdm12/gluetun/internal/provider/utils"
 )
 
@@ -20,7 +19,7 @@ type Firewall interface {
 	SetVPNConnection(ctx context.Context, connection models.Connection, interfaceName string) error
 	SetAllowedPort(ctx context.Context, port uint16, interfaceName string) error
 	RemoveAllowedPort(ctx context.Context, port uint16) error
-	AllowOutputTemporarily(ctx context.Context, protocol string,
+	AllowOutputTemporarily(ctx context.Context, protocol string, mark uint32,
 		addrPorts []netip.AddrPort) (revert func(ctx context.Context) error, err error)
 	tcp.Firewall
 }
@@ -54,8 +53,25 @@ type Provider interface {
 // Wireguard configurations at runtime through their API.
 type wireguardConnectionFetcher interface {
 	FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN,
-		fw purevpn.Firewall, logger purevpn.Logger) (connection purevpn.WireguardConnection, err error)
+		fw wireguardFetcherFirewall, logger wireguardFetcherLogger,
+	) (connection models.WireguardConnection, err error)
 }
+
+// wireguardFetcherFirewall and wireguardFetcherLogger are type aliases of
+// interface literals, and not defined types, so the method signature of
+// wireguardConnectionFetcher is identical to the one of providers defining
+// the same interface literals, without this package importing them.
+type (
+	wireguardFetcherFirewall = interface {
+		AllowOutputTemporarily(ctx context.Context, protocol string, mark uint32,
+			addrPorts []netip.AddrPort) (revert func(ctx context.Context) error, err error)
+	}
+	wireguardFetcherLogger = interface {
+		Debug(s string)
+		Info(s string)
+		Warn(s string)
+	}
+)
 
 type PortForwarder interface {
 	Name() string

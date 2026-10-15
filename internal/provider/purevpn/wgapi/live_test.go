@@ -23,9 +23,8 @@ import (
 // It logs in, fetches a Wireguard configuration and prints it, without
 // the private key. Set PUREVPN_LIVE_EXPECT=invalid_credentials to check
 // that fake credentials are rejected as such.
-func Test_Live(t *testing.T) {
-	t.Parallel()
-
+// It does not run in parallel to avoid concurrent requests to the real website.
+func Test_Live(t *testing.T) { //nolint:paralleltest
 	envPath := os.Getenv("PUREVPN_LIVE_TEST")
 	if envPath == "" {
 		t.Skip("PUREVPN_LIVE_TEST is not set")

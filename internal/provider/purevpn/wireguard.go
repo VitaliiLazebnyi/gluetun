@@ -7,19 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
+	"maps"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/qdm12/dns/v2/pkg/doh"
-	dnsprovider "github.com/qdm12/dns/v2/pkg/provider"
 	"github.com/qdm12/gluetun/internal/configuration/settings"
 	"github.com/qdm12/gluetun/internal/constants"
 	"github.com/qdm12/gluetun/internal/constants/vpn"
@@ -27,16 +23,6 @@ import (
 	"github.com/qdm12/gluetun/internal/provider/purevpn/wgapi"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
-
-// WireguardConnection is a Wireguard connection fetched from PureVPN.
-type WireguardConnection struct {
-	Connection          models.Connection
-	PrivateKey          string
-	Addresses           []netip.Prefix
-	PersistentKeepalive time.Duration
-}
-
-const defaultWireguardStatePath = "/gluetun/purevpn-wireguard.json"
 
 // wireguardState is persisted to disk so restarts do not need
 // to log in again or change the Wireguard key pair.
@@ -55,19 +41,29 @@ type wireguardFetcher struct {
 	appURL    string
 	// newHTTPClient creates an HTTP client able to reach the PureVPN
 	// website, and returns a function to call once done with it.
-	newHTTPClient func(ctx context.Context, fw Firewall) (client *http.Client,
+	newHTTPClient func(ctx context.Context, fw Firewall, logger Logger) (client *http.Client,
 		resolve func(ctx context.Context, host string) ([]netip.Addr, error),
 		cleanup func(), err error)
 
 	mutex       sync.Mutex
 	state       wireguardState
 	stateLoaded bool
+	// authErr is the last authentication error, returned again without
+	// contacting PureVPN as long as the PureVPN settings fingerprint is
+	// authErrFingerprint, to avoid having the account locked out or
+	// requiring a captcha because of repeated failed logins.
+	authErr            error
+	authErrFingerprint string
 }
 
 func newWireguardFetcher() *wireguardFetcher {
 	return &wireguardFetcher{
-		statePath:     defaultWireguardStatePath,
-		newHTTPClient: newPreTunnelHTTPClient,
+		statePath: "/gluetun/purevpn-wireguard.json",
+		newHTTPClient: func(ctx context.Context, fw Firewall, logger Logger) (*http.Client,
+			func(ctx context.Context, host string) ([]netip.Addr, error), func(), error,
+		) {
+			return newPreTunnelHTTPClient(ctx, fw, logger, defaultPreTunnelSettings())
+		},
 	}
 }
 
@@ -76,28 +72,44 @@ func newWireguardFetcher() *wireguardFetcher {
 // every connection attempt, since PureVPN removes unused peers.
 func (p *Provider) FetchWireguardConnection(ctx context.Context,
 	vpnSettings settings.VPN, fw Firewall, logger Logger,
-) (connection WireguardConnection, err error) {
+) (connection models.WireguardConnection, err error) {
 	return p.wireguard.fetch(ctx, vpnSettings, fw, logger)
 }
 
 func (f *wireguardFetcher) fetch(ctx context.Context,
 	vpnSettings settings.VPN, fw Firewall, logger Logger,
-) (connection WireguardConnection, err error) {
+) (connection models.WireguardConnection, err error) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
 	purevpnSettings := vpnSettings.PureVPN
+	fingerprint := settingsFingerprint(purevpnSettings)
+	if f.authErr != nil {
+		if fingerprint == f.authErrFingerprint {
+			return models.WireguardConnection{}, fmt.Errorf(
+				"not retrying with unchanged PureVPN settings: %w", f.authErr)
+		}
+		f.authErr = nil
+		f.authErrFingerprint = ""
+	}
+
+	// Bound the whole fetch so it does not block the VPN loop for too long,
+	// for example preventing it from being stopped or its settings changed.
+	const fetchTimeout = 2 * time.Minute
+	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	defer cancel()
+
 	f.loadState(logger)
 
 	privateKey, publicKey, err := f.keyPair(*vpnSettings.Wireguard.PrivateKey, logger)
 	if err != nil {
-		return WireguardConnection{}, err
+		return models.WireguardConnection{}, err
 	}
 	f.applySessionToken(*purevpnSettings.SessionToken, logger)
 
-	httpClient, resolve, cleanup, err := f.newHTTPClient(ctx, fw)
+	httpClient, resolve, cleanup, err := f.newHTTPClient(ctx, fw, logger)
 	if err != nil {
-		return WireguardConnection{}, fmt.Errorf("preparing network access to PureVPN: %w", err)
+		return models.WireguardConnection{}, fmt.Errorf("preparing network access to PureVPN: %w", err)
 	}
 	defer cleanup()
 
@@ -108,7 +120,7 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	}
 	client, err := wgapi.New(httpClient, f.authURL, f.appURL, credentials, f.state.Session)
 	if err != nil {
-		return WireguardConnection{}, fmt.Errorf("creating PureVPN client: %w", err)
+		return models.WireguardConnection{}, fmt.Errorf("creating PureVPN client: %w", err)
 	}
 
 	logger.Info("fetching Wireguard configuration from PureVPN for " + describeLocation(purevpnSettings))
@@ -122,18 +134,21 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	f.state.Session = client.Session()
 	f.saveState(logger) // save even on error, the session may have changed
 	if err != nil {
+		err = fmt.Errorf("requesting configuration from PureVPN: %w", err)
 		if wgapi.IsAuthError(err) {
-			err = fmt.Errorf("%w - fix the PureVPN settings, retrying with the same settings "+
-				"will fail again", err)
+			err = fmt.Errorf("%w - change the PureVPN settings to retry, through the control "+
+				"server or by restarting with fixed settings", err)
+			f.authErr = err
+			f.authErrFingerprint = fingerprint
 		}
-		return WireguardConnection{}, fmt.Errorf("fetching Wireguard configuration from PureVPN: %w", err)
+		return models.WireguardConnection{}, err
 	}
 
 	endpointIP, ok := config.EndpointIP()
 	if !ok {
 		ips, err := resolve(ctx, config.EndpointHost)
 		if err != nil {
-			return WireguardConnection{}, fmt.Errorf("resolving Wireguard endpoint: %w", err)
+			return models.WireguardConnection{}, fmt.Errorf("resolving Wireguard endpoint: %w", err)
 		}
 		endpointIP = ips[0]
 	}
@@ -141,7 +156,7 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	logger.Info(fmt.Sprintf("PureVPN Wireguard server %s (%s:%d)",
 		config.EndpointHost, endpointIP, config.EndpointPort))
 
-	return WireguardConnection{
+	return models.WireguardConnection{
 		Connection: models.Connection{
 			Type:       vpn.Wireguard,
 			IP:         endpointIP,
@@ -155,6 +170,23 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 		Addresses:           config.Addresses,
 		PersistentKeepalive: config.PersistentKeepalive,
 	}, nil
+}
+
+// settingsFingerprint returns a hash of the PureVPN settings, to detect
+// a change in the settings without keeping the secrets in memory twice.
+func settingsFingerprint(purevpnSettings settings.PureVPN) string {
+	fields := [...]string{
+		*purevpnSettings.Username,
+		*purevpnSettings.Password,
+		*purevpnSettings.TOTPSecret,
+		*purevpnSettings.SessionToken,
+		purevpnSettings.Country,
+		fmt.Sprint(*purevpnSettings.CityID),
+		*purevpnSettings.SubscriptionID,
+		*purevpnSettings.VPNUsername,
+	}
+	hash := sha256.Sum256([]byte(strings.Join(fields[:], "\x00")))
+	return hex.EncodeToString(hash[:])
 }
 
 func describeLocation(purevpnSettings settings.PureVPN) string {
@@ -192,6 +224,8 @@ func (f *wireguardFetcher) keyPair(settingsKey string, logger Logger) (
 
 // applySessionToken seeds the session with the session token from
 // the settings, if it is set and different from the one used last.
+// Other authentication cookies, such as the two-factor trusted device
+// cookie, are kept.
 func (f *wireguardFetcher) applySessionToken(token string, logger Logger) {
 	if token == "" {
 		return
@@ -204,12 +238,17 @@ func (f *wireguardFetcher) applySessionToken(token string, logger Logger) {
 
 	if wgapi.IsJWT(token) {
 		logger.Debug("using PureVPN session token as access token")
-		f.state.Session = wgapi.Session{AccessToken: token}
+		f.state.Session.AccessToken = token
 	} else {
 		logger.Debug("using PureVPN session token as single sign-on cookie")
-		f.state.Session = wgapi.Session{
-			AuthCookies: map[string]string{"fusionauth.sso": token},
+		cookies := maps.Clone(f.state.Session.AuthCookies)
+		if cookies == nil {
+			cookies = make(map[string]string, 1)
 		}
+		cookies["fusionauth.sso"] = token
+		f.state.Session.AuthCookies = cookies
+		// The access token comes from the previous single sign-on session.
+		f.state.Session.AccessToken = ""
 	}
 	f.state.SessionTokenHash = tokenHash
 }
@@ -242,131 +281,56 @@ func (f *wireguardFetcher) saveState(logger Logger) {
 		logger.Warn("encoding PureVPN state: " + err.Error())
 		return
 	}
-	const dirPerm, filePerm = 0o700, 0o600
-	err = os.MkdirAll(filepath.Dir(f.statePath), dirPerm)
-	if err == nil {
-		err = os.WriteFile(f.statePath, data, filePerm)
-	}
+	err = writeFileAtomically(f.statePath, data)
 	if err != nil {
 		logger.Warn("saving PureVPN state, the next restart will need to log in again: " + err.Error())
 	}
 }
 
-func mustHost(rawURL string) string {
-	parsedURL, err := url.Parse(rawURL)
+// writeFileAtomically writes the data to a temporary file in the same
+// directory as the file path given, syncs it, and renames it to the file
+// path, so the file is never partially written. The file permissions
+// are set to 0600, even if the file already existed.
+func writeFileAtomically(path string, data []byte) (err error) {
+	directory := filepath.Dir(path)
+	const dirPerm = 0o700
+	err = os.MkdirAll(directory, dirPerm)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("creating directory: %w", err)
 	}
-	return parsedURL.Hostname()
-}
 
-// newPreTunnelHTTPClient returns an HTTP client able to reach the
-// PureVPN website before the VPN is up, even with the firewall enabled.
-// It temporarily allows HTTPS traffic to DNS over HTTPS servers, resolves
-// the PureVPN hostnames with them, and then allows HTTPS traffic to the
-// resolved IP addresses only. The HTTP client dials these IP addresses
-// directly, so it does not depend on the system DNS. The cleanup function
-// returned removes the firewall rules and closes idle connections.
-func newPreTunnelHTTPClient(ctx context.Context, fw Firewall) (client *http.Client,
-	resolve func(ctx context.Context, host string) ([]netip.Addr, error),
-	cleanup func(), err error,
-) {
-	upstreams := []dnsprovider.Provider{dnsprovider.Cloudflare(), dnsprovider.Google()}
-	dohDialer, err := doh.New(doh.Settings{UpstreamResolvers: upstreams})
+	file, err := os.CreateTemp(directory, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("creating DNS over HTTPS dialer: %w", err)
+		return fmt.Errorf("creating temporary file: %w", err)
 	}
-	resolver := &net.Resolver{PreferGo: true, Dial: dohDialer.Dial}
-
-	const https = 443
-	var reverts []func(ctx context.Context) error
-	cleanup = func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) //nolint:mnd
-		defer cancel()
-		for _, revert := range slices.Backward(reverts) {
-			_ = revert(ctx)
-		}
-		if client != nil {
-			client.CloseIdleConnections()
-		}
-	}
-
-	dohAddrPorts := make([]netip.AddrPort, 0)
-	for _, upstream := range upstreams {
-		for _, ip := range upstream.DoH.IPv4 {
-			dohAddrPorts = append(dohAddrPorts, netip.AddrPortFrom(ip, https))
-		}
-	}
-	revert, err := fw.AllowOutputTemporarily(ctx, constants.TCP, dohAddrPorts)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("allowing DNS over HTTPS traffic: %w", err)
-	}
-	reverts = append(reverts, revert)
-
-	resolve = func(ctx context.Context, host string) ([]netip.Addr, error) {
-		ips, err := resolver.LookupNetIP(ctx, "ip4", host)
-		switch {
-		case err != nil:
-			return nil, fmt.Errorf("resolving with DNS over HTTPS: %w", err)
-		case len(ips) == 0:
-			return nil, fmt.Errorf("no IPv4 address found for %s", host)
-		}
-		for i := range ips {
-			ips[i] = ips[i].Unmap()
-		}
-		return ips, nil
-	}
-
-	purevpnHosts := [...]string{mustHost(wgapi.DefaultAuthURL), mustHost(wgapi.DefaultAppURL)}
-	hostToIPs := make(map[string][]netip.Addr, len(purevpnHosts))
-	var allowed []netip.AddrPort
-	for _, host := range purevpnHosts {
-		ips, err := resolve(ctx, host)
+	temporaryPath := file.Name()
+	defer func() {
 		if err != nil {
-			cleanup()
-			return nil, nil, nil, err
+			_ = file.Close()
+			_ = os.Remove(temporaryPath)
 		}
-		hostToIPs[host] = ips
-		for _, ip := range ips {
-			allowed = append(allowed, netip.AddrPortFrom(ip, https))
-		}
-	}
-	revert, err = fw.AllowOutputTemporarily(ctx, constants.TCP, allowed)
-	if err != nil {
-		cleanup()
-		return nil, nil, nil, fmt.Errorf("allowing traffic to PureVPN website: %w", err)
-	}
-	reverts = append(reverts, revert)
+	}()
 
-	dialer := &net.Dialer{Timeout: 10 * time.Second} //nolint:mnd
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(address)
-			if err != nil {
-				return nil, err
-			}
-			ips, ok := hostToIPs[host]
-			if !ok || port != strconv.Itoa(https) {
-				// Refuse other destinations, they are blocked by the firewall anyway.
-				return nil, fmt.Errorf("destination %s is not allowed before the VPN is up", address)
-			}
-			var errs []error
-			for _, ip := range ips {
-				conn, err := dialer.DialContext(ctx, network, netip.AddrPortFrom(ip, https).String())
-				if err == nil {
-					return conn, nil
-				}
-				errs = append(errs, err)
-			}
-			return nil, errors.Join(errs...)
-		},
-		ForceAttemptHTTP2:   true,
-		TLSHandshakeTimeout: 10 * time.Second, //nolint:mnd
-		MaxIdleConns:        4,                //nolint:mnd
+	const filePerm = 0o600
+	err = file.Chmod(filePerm)
+	if err != nil {
+		return fmt.Errorf("setting temporary file permissions: %w", err)
 	}
-	client = &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second, //nolint:mnd
+	_, err = file.Write(data)
+	if err != nil {
+		return fmt.Errorf("writing temporary file: %w", err)
 	}
-	return client, resolve, cleanup, nil
+	err = file.Sync()
+	if err != nil {
+		return fmt.Errorf("syncing temporary file: %w", err)
+	}
+	err = file.Close()
+	if err != nil {
+		return fmt.Errorf("closing temporary file: %w", err)
+	}
+	err = os.Rename(temporaryPath, path)
+	if err != nil {
+		return fmt.Errorf("renaming temporary file: %w", err)
+	}
+	return nil
 }

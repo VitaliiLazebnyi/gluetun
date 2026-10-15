@@ -92,7 +92,8 @@ func (h *vpnHandler) setStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *vpnHandler) getSettings(w http.ResponseWriter) {
-	settings := h.looper.GetSettings()
+	settings := h.looper.GetSettings() // already copied
+	redactPureVPNSecrets(&settings)
 	encoder := json.NewEncoder(w)
 	if err := encoder.Encode(settings); err != nil {
 		h.warner.Warn(err.Error())
@@ -115,6 +116,7 @@ func (h *vpnHandler) patchSettings(w http.ResponseWriter, r *http.Request) {
 		h.warner.Warn("closing body: " + err.Error())
 	}
 
+	ignoreRedactedPureVPNSecrets(&overrideSettings)
 	updatedSettings := h.looper.GetSettings() // already copied
 	updatedSettings.OverrideWith(overrideSettings)
 	err = updatedSettings.Validate(h.storage, h.ipv6Supported, h.warner)
@@ -127,5 +129,39 @@ func (h *vpnHandler) patchSettings(w http.ResponseWriter, r *http.Request) {
 	_, err = w.Write([]byte(outcome))
 	if err != nil {
 		h.warner.Warn("writing response: " + err.Error())
+	}
+}
+
+// redactedSecret replaces the PureVPN secrets in the settings returned,
+// and is ignored when received in settings to update, so a client can
+// send back the settings it received without changing the secrets.
+const redactedSecret = "[redacted]"
+
+func pureVPNSecrets(vpnSettings *settings.VPN) [3]**string {
+	return [...]**string{
+		&vpnSettings.PureVPN.Password,
+		&vpnSettings.PureVPN.TOTPSecret,
+		&vpnSettings.PureVPN.SessionToken,
+	}
+}
+
+// redactPureVPNSecrets replaces each PureVPN secret set with the
+// redacted placeholder. The settings given must be a copy, since
+// the secret pointers are replaced.
+func redactPureVPNSecrets(vpnSettings *settings.VPN) {
+	for _, secret := range pureVPNSecrets(vpnSettings) {
+		if *secret != nil && **secret != "" {
+			*secret = new(redactedSecret)
+		}
+	}
+}
+
+// ignoreRedactedPureVPNSecrets unsets each PureVPN secret set to the
+// redacted placeholder, so the current secret is kept.
+func ignoreRedactedPureVPNSecrets(vpnSettings *settings.VPN) {
+	for _, secret := range pureVPNSecrets(vpnSettings) {
+		if *secret != nil && **secret == redactedSecret {
+			*secret = nil
+		}
 	}
 }

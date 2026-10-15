@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -118,60 +119,75 @@ func (c *Client) apiRequest(ctx context.Context, token, path string,
 		return err
 	}
 
-	switch response.StatusCode {
-	case http.StatusOK:
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return fmt.Errorf("%w: %s returned %s", errUnauthorized, path, response.Status)
+	isHTML := isHTMLResponse(response, responseBody)
+	switch {
+	case response.StatusCode == http.StatusOK:
+	case response.StatusCode == http.StatusUnauthorized:
+		return fmt.Errorf("%w: API returned %s", errUnauthorized, response.Status)
+	case response.StatusCode == http.StatusForbidden && !isHTML:
+		return fmt.Errorf("%w: API returned %s: %s", errUnauthorized, response.Status,
+			truncate(string(responseBody)))
+	case response.StatusCode == http.StatusForbidden:
+		// HTML error page from the website protection, not the API.
+		return fmt.Errorf("%w: API returned %s with an HTML page", errBlocked, response.Status)
 	default:
-		return fmt.Errorf("%w: %s returned %s: %s", errAPI, path, response.Status,
+		return fmt.Errorf("%w: API returned %s: %s", errAPI, response.Status,
 			truncate(string(responseBody)))
 	}
 
 	var data apiResponse
 	err = json.Unmarshal(responseBody, &data)
-	if err != nil {
-		if strings.HasPrefix(strings.TrimSpace(string(responseBody)), "<") {
-			// HTML page instead of JSON, usually the login page
-			// after a redirect because the token is not accepted.
-			return fmt.Errorf("%w: %s returned an HTML page", errUnauthorized, path)
-		}
-		return fmt.Errorf("%w: decoding %s response: %w", errUnexpectedResponse, path, err)
-	}
-
-	if !data.Status {
-		if isAuthMessage(data.Message) {
-			return fmt.Errorf("%w: %s: %s", errUnauthorized, path, data.Message)
-		}
-		return fmt.Errorf("%w: %s: %s", errAPI, path, data.Message)
-	}
-
-	if body == nil {
+	switch {
+	case err != nil && isHTML:
+		// HTML page instead of JSON, usually the login page
+		// after a redirect because the token is not accepted.
+		return fmt.Errorf("%w: API returned an HTML page", errUnauthorized)
+	case err != nil:
+		return fmt.Errorf("%w: decoding response: %w", errUnexpectedResponse, err)
+	case !data.Status && isAuthMessage(data.Message):
+		return fmt.Errorf("%w: %s", errUnauthorized, data.Message)
+	case !data.Status:
+		return fmt.Errorf("%w: %s", errAPI, data.Message)
+	case body == nil:
 		return nil
 	}
+
 	err = json.Unmarshal(data.Body, body)
 	if err != nil {
-		return fmt.Errorf("%w: decoding %s response body: %w", errUnexpectedResponse, path, err)
+		return fmt.Errorf("%w: decoding response body: %w", errUnexpectedResponse, err)
 	}
 	return nil
 }
 
+func isHTMLResponse(response *http.Response, body []byte) bool {
+	return strings.Contains(response.Header.Get("Content-Type"), "text/html") ||
+		strings.HasPrefix(strings.TrimSpace(string(body)), "<")
+}
+
+// isAuthMessage returns true if the API error message given
+// clearly indicates the access token is not accepted.
 func isAuthMessage(message string) bool {
 	message = strings.ToLower(message)
-	for _, keyword := range []string{"unauthori", "token", "expired", "session", "login"} {
-		if strings.Contains(message, keyword) {
+	for _, phrase := range [...]string{
+		"unauthorized", "unauthorised", "not authenticated", "unauthenticated", //nolint:misspell
+		"token expired", "token has expired", "expired token",
+		"invalid token", "token is invalid", "invalid access token",
+		"access token is invalid",
+	} {
+		if strings.Contains(message, phrase) {
 			return true
 		}
 	}
 	return false
 }
 
-func truncate(s string) string {
+func truncate(text string) string {
 	const maxLength = 200
-	s = strings.TrimSpace(s)
-	if len(s) <= maxLength {
-		return s
+	text = strings.TrimSpace(text)
+	if len(text) <= maxLength {
+		return text
 	}
-	return s[:maxLength] + "..."
+	return text[:maxLength] + "..."
 }
 
 type subscription struct {
@@ -197,25 +213,23 @@ func (c *Client) selectSubscription(ctx context.Context, token,
 		return "", "", err
 	}
 
-	for _, sub := range subscriptions {
+	for _, candidate := range subscriptions {
 		switch {
-		case wantedID != "" && sub.ID != wantedID,
-			wantedID == "" && !sub.active(),
-			len(sub.VPNUsernames) == 0:
+		case wantedID != "" && candidate.ID != wantedID,
+			wantedID == "" && !candidate.active(),
+			len(candidate.VPNUsernames) == 0:
 			continue
 		case wantedUsername == "":
-			return sub.ID, sub.VPNUsernames[0], nil
+			return candidate.ID, candidate.VPNUsernames[0], nil
 		}
-		for _, username := range sub.VPNUsernames {
-			if username == wantedUsername {
-				return sub.ID, username, nil
-			}
+		if slices.Contains(candidate.VPNUsernames, wantedUsername) {
+			return candidate.ID, wantedUsername, nil
 		}
 	}
 
 	if wantedID != "" || wantedUsername != "" {
-		return "", "", fmt.Errorf("%w: subscription ID %q and VPN username %q, available: %s",
-			errSubscriptionNotFound, wantedID, wantedUsername, describeSubscriptions(subscriptions))
+		return "", "", fmt.Errorf("%w: available subscriptions are %s",
+			errSubscriptionNotFound, describeSubscriptions(subscriptions))
 	}
 	return "", "", errNoActiveSubscription
 }
@@ -227,10 +241,11 @@ func (c *Client) getSubscriptions(ctx context.Context, token string) (
 	subscriptions []subscription, err error,
 ) {
 	err = c.apiRequest(ctx, token, "/v2/api/subscription", nil, &subscriptions)
-	if err == nil {
+	switch {
+	case err == nil:
 		return subscriptions, nil
-	} else if !errors.Is(err, errAPI) && !errors.Is(err, errUnexpectedResponse) {
-		return nil, err
+	case !errors.Is(err, errAPI) && !errors.Is(err, errUnexpectedResponse):
+		return nil, fmt.Errorf("requesting subscriptions: %w", err)
 	}
 	subscriptionErr := err
 
@@ -239,16 +254,17 @@ func (c *Client) getSubscriptions(ctx context.Context, token string) (
 	}
 	err = c.apiRequest(ctx, token, "/v2/api/on-boarding", nil, &onBoarding)
 	if err != nil {
-		return nil, fmt.Errorf("%w; %w", subscriptionErr, err)
+		return nil, fmt.Errorf("requesting subscriptions: %w; requesting on-boarding: %w",
+			subscriptionErr, err)
 	}
 	return onBoarding.Subscriptions, nil
 }
 
 func describeSubscriptions(subscriptions []subscription) string {
 	descriptions := make([]string, len(subscriptions))
-	for i, sub := range subscriptions {
-		descriptions[i] = fmt.Sprintf("%s (%s) with VPN usernames %s",
-			sub.ID, sub.State, strings.Join(sub.VPNUsernames, ", "))
+	for i, accountSubscription := range subscriptions {
+		descriptions[i] = fmt.Sprintf("%s (%s) with VPN usernames %s", accountSubscription.ID,
+			accountSubscription.State, strings.Join(accountSubscription.VPNUsernames, ", "))
 	}
 	if len(descriptions) == 0 {
 		return "none"

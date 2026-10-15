@@ -343,6 +343,28 @@ func (c *Config) AcceptOutput(ctx context.Context,
 	return c.runIP6tablesInstruction(ctx, instruction)
 }
 
+// AcceptOutputMarked accepts output traffic of the given protocol to the
+// IPv4 address and port given through the network interface given, only for
+// packets carrying the given mark, which is for example set on sockets with
+// the SO_MARK socket option. This allows only the program marking its sockets
+// to reach the destination, and not other programs sharing the network namespace.
+func (c *Config) AcceptOutputMarked(ctx context.Context, protocol, intf string,
+	ip netip.Addr, port uint16, mark uint32, remove bool,
+) error {
+	if !ip.Is4() {
+		return fmt.Errorf("IP address is not IPv4: %s", ip)
+	}
+	instruction := acceptOutputMarkedInstruction(protocol, intf, ip, port, mark, remove)
+	return c.runIptablesInstruction(ctx, instruction)
+}
+
+func acceptOutputMarkedInstruction(protocol, intf string,
+	ip netip.Addr, port uint16, mark uint32, remove bool,
+) string {
+	return fmt.Sprintf("%s OUTPUT -d %s -o %s -p %s -m %s --dport %d -m mark --mark %d -j ACCEPT",
+		appendOrDelete(remove), ip, intf, protocol, protocol, port, mark)
+}
+
 func (c *Config) AcceptOutputFromIPPortToIPPort(ctx context.Context,
 	protocol, intf string, source, destination netip.AddrPort, remove bool,
 ) error {

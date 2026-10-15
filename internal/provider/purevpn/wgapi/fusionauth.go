@@ -41,7 +41,7 @@ func (c *Client) loginWithSSO(ctx context.Context) (token string, err error) {
 		return "", errSessionExpired
 	}
 	return "", fmt.Errorf("%w: no access token after single sign-on redirect to %s",
-		errUnexpectedResponse, page.url)
+		errUnexpectedResponse, redactURL(page.url))
 }
 
 // loginWithCredentials logs in using the account username, password
@@ -58,25 +58,17 @@ func (c *Client) loginWithCredentials(ctx context.Context) (token string, err er
 	}
 
 	loginForm := page.findForm(isLoginForm)
-	if loginForm == nil {
-		return "", fmt.Errorf("%w: login form not found at %s", errUnexpectedResponse, page.url)
-	}
-
-	values := loginForm.values()
-	setDefault(values, "client_id", clientID)
-	setDefault(values, "tenantId", tenantID)
-	setDefault(values, "response_type", "code")
-	setDefault(values, "redirect_uri", joinURL(c.appURL, "/v2/api/fusionauth/login").String())
-	setDefault(values, "timezone", "UTC")
-	values.Set("metaData.device.name", "Gluetun")
-	values.Set("metaData.device.type", "BROWSER")
-	values.Set("showPasswordField", "true")
-	values.Set("loginId", c.credentials.Username)
-	values.Set("password", c.credentials.Password)
-
-	page, err = c.submitForm(ctx, page, loginForm, values)
-	if err != nil {
-		return "", fmt.Errorf("submitting login form: %w", err)
+	switch {
+	case page.findForm(isTwoFactorForm) != nil, page.findForm(isTwoFactorMethodsForm) != nil:
+		// The single sign-on session is still valid but the two-factor
+		// trusted device cookie expired, so go straight to two-factor.
+	case loginForm == nil:
+		return "", fmt.Errorf("%w: login form not found at %s", errUnexpectedResponse, redactURL(page.url))
+	default:
+		page, err = c.submitLoginForm(ctx, page, loginForm)
+		if err != nil {
+			return "", fmt.Errorf("submitting login form: %w", err)
+		}
 	}
 
 	const maxSteps = 3 // two-factor method selection, then code, then maybe trust device
@@ -95,34 +87,57 @@ func (c *Client) loginWithCredentials(ctx context.Context) (token string, err er
 			return "", loginPageError(page)
 		default:
 			return "", fmt.Errorf("%w: no access token after logging in, landed on %s",
-				errUnexpectedResponse, page.url)
+				errUnexpectedResponse, redactURL(page.url))
 		}
 		if err != nil {
 			return "", err
 		}
 	}
 
-	return "", fmt.Errorf("%w: too many login steps, landed on %s", errUnexpectedResponse, page.url)
+	return "", fmt.Errorf("%w: too many login steps, landed on %s",
+		errUnexpectedResponse, redactURL(page.url))
+}
+
+func (c *Client) submitLoginForm(ctx context.Context, page *htmlPage,
+	loginForm *htmlForm,
+) (*htmlPage, error) {
+	values := loginForm.values()
+	setDefault(values, "client_id", clientID)
+	const tenantID = "9707f41e-21a4-bbc5-dcbc-fdf6b61cc68f"
+	setDefault(values, "tenantId", tenantID)
+	setDefault(values, "response_type", "code")
+	setDefault(values, "redirect_uri", joinURL(c.appURL, "/v2/api/fusionauth/login").String())
+	setDefault(values, "timezone", "UTC")
+	values.Set("metaData.device.name", "Gluetun")
+	values.Set("metaData.device.type", "BROWSER")
+	values.Set("showPasswordField", "true")
+	values.Set("loginId", c.credentials.Username)
+	values.Set("password", c.credentials.Password)
+	return c.submitForm(ctx, page, loginForm, values)
 }
 
 func (c *Client) selectTwoFactorMethod(ctx context.Context, page *htmlPage) (*htmlPage, error) {
 	form := page.findForm(isTwoFactorMethodsForm)
 	values := form.values()
 	methodID := ""
+	methodsCount := 0
 	for _, input := range form.inputs {
 		if input.name != "methodId" {
 			continue
 		}
-		if methodID == "" {
-			methodID = input.value // first method as fallback
-		}
-		if strings.Contains(strings.ToLower(input.label+" "+input.id), "authenticator") {
+		methodsCount++
+		description := strings.ToLower(input.label + " " + input.id + " " + input.value)
+		if strings.Contains(description, "authenticator") {
 			methodID = input.value
 			break
 		}
 	}
-	if methodID == "" {
+	switch {
+	case methodsCount == 0:
 		return nil, fmt.Errorf("%w: no two-factor method found", errUnexpectedResponse)
+	case methodID == "":
+		// Only email or SMS methods are available.
+		return nil, errTwoFactorMethodUnsupported
 	}
 	values.Set("methodId", methodID)
 	page, err := c.submitForm(ctx, page, form, values)
@@ -246,8 +261,8 @@ func (c *Client) doAuthRequest(ctx context.Context, method, rawURL string,
 	}
 
 	if response.StatusCode >= http.StatusInternalServerError {
-		return nil, fmt.Errorf("%w: %s %s returned %s",
-			errUnexpectedResponse, method, response.Request.URL.Redacted(), response.Status)
+		return nil, fmt.Errorf("%w: %s returned %s",
+			errUnexpectedResponse, redactURL(response.Request.URL), response.Status)
 	}
 
 	page.forms, page.errors = parseHTML(responseBody)
@@ -267,12 +282,12 @@ type htmlForm struct {
 }
 
 type htmlInput struct {
-	name    string
-	value   string
-	id      string
-	typ     string
-	checked bool
-	label   string
+	name      string
+	value     string
+	id        string
+	inputType string
+	checked   bool
+	label     string
 }
 
 func (p *htmlPage) findForm(match func(form *htmlForm) bool) *htmlForm {
@@ -304,8 +319,8 @@ func (f *htmlForm) values() url.Values {
 	for _, input := range f.inputs {
 		switch {
 		case input.name == "",
-			input.typ == "submit", input.typ == "button",
-			(input.typ == "radio" || input.typ == "checkbox") && !input.checked:
+			input.inputType == "submit", input.inputType == "button",
+			(input.inputType == "radio" || input.inputType == "checkbox") && !input.checked:
 			continue
 		}
 		values.Set(input.name, input.value)
@@ -335,11 +350,14 @@ func parseHTML(body []byte) (forms []*htmlForm, errorMessages []string) {
 	}
 
 	parser := &htmlParser{labels: make(map[string]string)}
-	parser.walk(root)
+	parser.walk(root, false, false)
 
 	for _, form := range parser.forms {
 		for i := range form.inputs {
-			form.inputs[i].label = parser.labels[form.inputs[i].id]
+			label, ok := parser.labels[form.inputs[i].id]
+			if ok {
+				form.inputs[i].label = label
+			}
 		}
 	}
 	return parser.forms, parser.errorMessages
@@ -349,23 +367,33 @@ type htmlParser struct {
 	forms         []*htmlForm
 	currentForm   *htmlForm
 	labels        map[string]string // input id to label text
+	enclosingText string            // text of the label element enclosing the current node
 	errorMessages []string
 }
 
-func (p *htmlParser) walk(node *html.Node) {
+// walk walks the HTML node tree. insideError is true if an ancestor
+// is an error element, whose text content was already collected, and
+// hidden is true if the node or an ancestor is hidden.
+func (p *htmlParser) walk(node *html.Node, insideError, hidden bool) {
+	previousEnclosingText := p.enclosingText
 	if node.Type == html.ElementNode {
+		hidden = hidden || isHiddenElement(node)
 		p.handleElement(node)
-		if isErrorElement(node) {
+		if node.Data == "label" && attribute(node, "for") == "" {
+			p.enclosingText = strings.TrimSpace(textContent(node))
+		}
+		if !insideError && !hidden && isErrorElement(node) {
+			insideError = true
 			text := strings.Join(strings.Fields(textContent(node)), " ")
 			if text != "" {
 				p.errorMessages = append(p.errorMessages, text)
 			}
-			return // do not collect nested error elements twice
 		}
 	}
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
-		p.walk(child)
+		p.walk(child, insideError, hidden)
 	}
+	p.enclosingText = previousEnclosingText
 }
 
 func (p *htmlParser) handleElement(node *html.Node) {
@@ -379,11 +407,12 @@ func (p *htmlParser) handleElement(node *html.Node) {
 		}
 		_, checked := attributeExists(node, "checked")
 		p.currentForm.inputs = append(p.currentForm.inputs, htmlInput{
-			name:    attribute(node, "name"),
-			value:   attribute(node, "value"),
-			id:      attribute(node, "id"),
-			typ:     strings.ToLower(attribute(node, "type")),
-			checked: checked,
+			name:      attribute(node, "name"),
+			value:     attribute(node, "value"),
+			id:        attribute(node, "id"),
+			inputType: strings.ToLower(attribute(node, "type")),
+			checked:   checked,
+			label:     p.enclosingText,
 		})
 	case "label":
 		forID := attribute(node, "for")
@@ -391,6 +420,22 @@ func (p *htmlParser) handleElement(node *html.Node) {
 			p.labels[forID] = strings.TrimSpace(textContent(node))
 		}
 	}
+}
+
+// isHiddenElement returns true if the element is not displayed,
+// such as template elements or elements hidden with an attribute
+// or an inline style.
+func isHiddenElement(node *html.Node) bool {
+	switch node.Data {
+	case "template", "script", "style", "noscript":
+		return true
+	}
+	_, hidden := attributeExists(node, "hidden")
+	if hidden || attribute(node, "aria-hidden") == "true" {
+		return true
+	}
+	style := strings.ReplaceAll(strings.ToLower(attribute(node, "style")), " ", "")
+	return strings.Contains(style, "display:none") || strings.Contains(style, "visibility:hidden")
 }
 
 func isErrorElement(node *html.Node) bool {
@@ -412,9 +457,9 @@ func attribute(node *html.Node, key string) string {
 }
 
 func attributeExists(node *html.Node, key string) (value string, ok bool) {
-	for _, attr := range node.Attr {
-		if attr.Key == key {
-			return attr.Val, true
+	for _, nodeAttribute := range node.Attr {
+		if nodeAttribute.Key == key {
+			return nodeAttribute.Val, true
 		}
 	}
 	return "", false
@@ -424,7 +469,10 @@ func textContent(node *html.Node) string {
 	var builder strings.Builder
 	var walk func(node *html.Node)
 	walk = func(node *html.Node) {
-		if node.Type == html.TextNode {
+		switch {
+		case node.Type == html.ElementNode && isHiddenElement(node):
+			return
+		case node.Type == html.TextNode:
 			builder.WriteString(node.Data)
 			builder.WriteString(" ")
 		}

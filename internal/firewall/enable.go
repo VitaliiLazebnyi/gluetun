@@ -24,6 +24,7 @@ func (c *Config) SetEnabled(ctx context.Context, enabled bool) (err error) {
 		c.logger.Info("disabling...")
 		c.restore(ctx)
 		c.enabled = false
+		c.disabledCount++
 		c.logger.Info("disabled successfully")
 		return nil
 	}

@@ -7,9 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -21,11 +22,9 @@ const DefaultAuthURL = "https://auth.purevpn.com"
 // DefaultAppURL is the PureVPN member area base URL.
 const DefaultAppURL = "https://my.purevpn.com"
 
-// clientID and tenantID are the FusionAuth identifiers of the
+// clientID is the FusionAuth client identifier of the
 // PureVPN member area application.
 const clientID = "ed1ee674-0a34-4265-b4a1-141b721036eb"
-
-const tenantID = "9707f41e-21a4-bbc5-dcbc-fdf6b61cc68f"
 
 // accessToken is the name of the member area access token cookie.
 const accessToken = "fa_token"
@@ -58,6 +57,7 @@ type Session struct {
 // It is safe for concurrent use.
 type Client struct {
 	httpClient  *http.Client
+	jar         *cookieJar
 	authURL     *url.URL
 	appURL      *url.URL
 	credentials Credentials
@@ -65,6 +65,9 @@ type Client struct {
 
 	mutex   sync.Mutex
 	session Session
+	// staleTokens are access tokens which must not be
+	// considered as the result of the current login.
+	staleTokens []string
 }
 
 // New creates a new client using the HTTP client given, which should
@@ -93,12 +96,12 @@ func New(httpClient *http.Client, authURL, appURL string,
 		return nil, fmt.Errorf("parsing app URL: %w", err)
 	}
 
-	jar, err := cookiejar.New(nil)
+	client.jar, err = newCookieJar(client.authURL)
 	if err != nil {
 		return nil, fmt.Errorf("creating cookie jar: %w", err)
 	}
 	httpClientCopy := *httpClient
-	httpClientCopy.Jar = jar
+	httpClientCopy.Jar = client.jar
 	client.httpClient = &httpClientCopy
 	client.setSession(session)
 
@@ -113,20 +116,12 @@ func (c *Client) Session() Session {
 }
 
 func (c *Client) copySession() Session {
-	cookies := make(map[string]string, len(c.session.AuthCookies))
-	for name, value := range c.session.AuthCookies {
-		cookies[name] = value
-	}
-	return Session{AccessToken: c.session.AccessToken, AuthCookies: cookies}
+	return Session{AccessToken: c.session.AccessToken, AuthCookies: maps.Clone(c.session.AuthCookies)}
 }
 
 func (c *Client) setSession(session Session) {
-	c.session = session
-	cookies := make([]*http.Cookie, 0, len(session.AuthCookies))
-	for name, value := range session.AuthCookies {
-		cookies = append(cookies, &http.Cookie{Name: name, Value: value, Path: "/"})
-	}
-	c.httpClient.Jar.SetCookies(c.authURL, cookies)
+	c.session = Session{AccessToken: session.AccessToken, AuthCookies: maps.Clone(session.AuthCookies)}
+	c.jar.restore(session.AuthCookies)
 }
 
 // saveSession records the current access token and auth cookies
@@ -134,10 +129,13 @@ func (c *Client) setSession(session Session) {
 func (c *Client) saveSession(token string) {
 	c.session.AccessToken = token
 	authCookies := make(map[string]string)
-	for _, cookie := range c.httpClient.Jar.Cookies(joinURL(c.authURL, "/oauth2/authorize")) {
-		if strings.HasPrefix(cookie.Name, "fusionauth.") {
-			authCookies[cookie.Name] = cookie.Value
+	// Cookies are sorted with the most specific path first.
+	for _, cookie := range c.jar.Cookies(joinURL(c.authURL, "/oauth2/authorize")) {
+		_, alreadySet := authCookies[cookie.Name]
+		if !strings.HasPrefix(cookie.Name, "fusionauth.") || alreadySet {
+			continue
 		}
+		authCookies[cookie.Name] = cookie.Value
 	}
 	c.session.AuthCookies = authCookies
 }
@@ -208,7 +206,7 @@ func readBody(response *http.Response) (body []byte, err error) {
 // Cloudflare block or challenge page.
 func checkBlocked(response *http.Response, body []byte) error {
 	if response.Header.Get("Cf-Mitigated") == "challenge" {
-		return fmt.Errorf("%w: Cloudflare challenge for %s", errBlocked, response.Request.URL.Host)
+		return fmt.Errorf("%w: Cloudflare challenge for %s", errBlocked, response.Request.URL.Hostname())
 	}
 	switch response.StatusCode {
 	case http.StatusForbidden, http.StatusServiceUnavailable, http.StatusTooManyRequests:
@@ -222,27 +220,66 @@ func checkBlocked(response *http.Response, body []byte) error {
 	for _, marker := range []string{"cf-chl", "just a moment", "attention required", "cf-error-details"} {
 		if strings.Contains(lowerBody, marker) {
 			return fmt.Errorf("%w: Cloudflare returned %s for %s",
-				errBlocked, response.Status, response.Request.URL.Host)
+				errBlocked, response.Status, response.Request.URL.Hostname())
 		}
 	}
 	return nil
 }
 
+// wrapRequestError redacts the URL query string, which can contain
+// OAuth parameters, from the request error given.
 func wrapRequestError(err error) error {
 	var urlErr *url.Error
-	if errors.As(err, &urlErr) && urlErr.Timeout() {
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	parsedURL, parseErr := url.Parse(urlErr.URL)
+	if parseErr == nil {
+		urlErr.URL = redactURL(parsedURL)
+	} else {
+		urlErr.URL = "<redacted>"
+	}
+	if urlErr.Timeout() {
 		return fmt.Errorf("timed out reaching PureVPN: %w", err)
 	}
 	return err
 }
 
+// redactURL returns the URL without its user information,
+// query string and fragment.
+func redactURL(fullURL *url.URL) string {
+	redacted := url.URL{Scheme: fullURL.Scheme, Host: fullURL.Host, Path: fullURL.Path}
+	return redacted.String()
+}
+
+// getAccessTokenCookie returns the access token cookie value,
+// ignoring stale access tokens.
 func (c *Client) getAccessTokenCookie() string {
-	for _, cookie := range c.httpClient.Jar.Cookies(c.appURL) {
-		if cookie.Name == accessToken && cookie.Value != "" {
+	for _, cookie := range c.jar.Cookies(c.appURL) {
+		if cookie.Name == accessToken && cookie.Value != "" &&
+			!slices.Contains(c.staleTokens, cookie.Value) {
 			return cookie.Value
 		}
 	}
 	return ""
+}
+
+// clearAccessToken removes the access token cookie from the cookie jar,
+// and records the current access tokens as stale, in case the cookie
+// cannot be removed since it was set with a Domain attribute or a
+// non root path.
+func (c *Client) clearAccessToken() {
+	c.staleTokens = c.staleTokens[:0]
+	if c.session.AccessToken != "" {
+		c.staleTokens = append(c.staleTokens, c.session.AccessToken)
+	}
+	for _, cookie := range c.jar.Cookies(c.appURL) {
+		if cookie.Name == accessToken && cookie.Value != "" {
+			c.staleTokens = append(c.staleTokens, cookie.Value)
+		}
+	}
+	c.session.AccessToken = ""
+	c.jar.SetCookies(c.appURL, []*http.Cookie{{Name: accessToken, Path: "/", MaxAge: -1}})
 }
 
 // ensureAccessToken returns a valid access token, logging in if needed.
@@ -258,20 +295,23 @@ func (c *Client) ensureAccessToken(ctx context.Context) (token string, err error
 // session if any, and then falling back on the account credentials.
 // The caller must hold the client mutex.
 func (c *Client) login(ctx context.Context) (token string, err error) {
-	c.session.AccessToken = ""
+	c.clearAccessToken()
+	credentialsSet := c.credentials.Username != "" && c.credentials.Password != ""
 	if len(c.session.AuthCookies) > 0 {
 		token, err = c.loginWithSSO(ctx)
 		switch {
 		case err == nil:
 			c.saveSession(token)
 			return token, nil
-		case !errors.Is(err, errSessionExpired):
+		case errors.Is(err, errSessionExpired),
+			errors.Is(err, errUnexpectedResponse) && credentialsSet:
+			// Fall back on the credentials.
+		default:
 			return "", fmt.Errorf("logging in with stored session: %w", err)
 		}
-		// Session expired, fall back on the credentials.
 	}
 
-	if c.credentials.Username == "" || c.credentials.Password == "" {
+	if !credentialsSet {
 		if len(c.session.AuthCookies) > 0 {
 			return "", fmt.Errorf("%w and %w", errSessionExpired, errCredentialsNotSet)
 		}

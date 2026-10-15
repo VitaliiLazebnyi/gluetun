@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/qdm12/gluetun/internal/routing"
@@ -12,22 +14,61 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// acceptOutputImpl records AcceptOutput calls and fails on failAddr.
-type acceptOutputImpl struct {
+// acceptOutputMarkedImpl records AcceptOutputMarked calls, fails adding
+// a rule for addFailAddr, and fails removing a rule for removeFailAddr
+// removeFailures times. It fails if the context given is canceled.
+type acceptOutputMarkedImpl struct {
 	firewallImpl
-	failAddr netip.Addr
-	calls    []string
+	addFailAddr    netip.Addr
+	removeFailAddr netip.Addr
+	removeFailures uint
+
+	mutex sync.Mutex
+	calls []string
+	rules map[string]struct{}
 }
 
-func (i *acceptOutputImpl) AcceptOutput(_ context.Context, protocol, intf string,
-	ip netip.Addr, port uint16, remove bool,
+func (i *acceptOutputMarkedImpl) AcceptOutputMarked(ctx context.Context, protocol, intf string,
+	ip netip.Addr, port uint16, mark uint32, remove bool,
 ) error {
-	if ip == i.failAddr && !remove {
-		return errors.New("test error")
+	i.mutex.Lock()
+	defer i.mutex.Unlock()
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
-	i.calls = append(i.calls, fmt.Sprintf("%s %s %s %s:%d", map[bool]string{false: "add", true: "del"}[remove],
-		intf, protocol, ip, port))
+	rule := fmt.Sprintf("%s %s %s:%d mark %d", intf, protocol, ip, port, mark)
+	switch {
+	case !remove && ip == i.addFailAddr:
+		return errors.New("test add error")
+	case remove && ip == i.removeFailAddr && i.removeFailures > 0:
+		i.removeFailures--
+		return errors.New("test remove error")
+	}
+	if i.rules == nil {
+		i.rules = make(map[string]struct{})
+	}
+	if remove {
+		i.calls = append(i.calls, "del "+rule)
+		delete(i.rules, rule)
+	} else {
+		i.calls = append(i.calls, "add "+rule)
+		i.rules[rule] = struct{}{}
+	}
 	return nil
+}
+
+func (i *acceptOutputMarkedImpl) popCalls() []string {
+	i.mutex.Lock()
+	defer i.mutex.Unlock()
+	calls := i.calls
+	i.calls = nil
+	return calls
+}
+
+func (i *acceptOutputMarkedImpl) rulesCount() int {
+	i.mutex.Lock()
+	defer i.mutex.Unlock()
+	return len(i.rules)
 }
 
 func Test_Config_AllowOutputTemporarily(t *testing.T) {
@@ -41,53 +82,172 @@ func Test_Config_AllowOutputTemporarily(t *testing.T) {
 	defaultRoutes := []routing.DefaultRoute{
 		{NetInterface: "eth0"}, {NetInterface: "eth0"}, {NetInterface: "eth1"},
 	}
+	const mark = 0x7075
+	allAdded := []string{
+		"add eth0 tcp 1.1.1.1:443 mark 28789",
+		"add eth0 tcp 203.0.113.1:443 mark 28789",
+		"add eth1 tcp 1.1.1.1:443 mark 28789",
+		"add eth1 tcp 203.0.113.1:443 mark 28789",
+	}
+	allRemoved := []string{
+		"del eth1 tcp 203.0.113.1:443 mark 28789",
+		"del eth1 tcp 1.1.1.1:443 mark 28789",
+		"del eth0 tcp 203.0.113.1:443 mark 28789",
+		"del eth0 tcp 1.1.1.1:443 mark 28789",
+	}
 
-	t.Run("disabled", func(t *testing.T) {
-		t.Parallel()
-		impl := &acceptOutputImpl{}
-		c := &Config{impl: impl, defaultRoutes: defaultRoutes}
-		revert, err := c.AllowOutputTemporarily(context.Background(), "tcp", addrPorts)
-		require.NoError(t, err)
-		require.NoError(t, revert(context.Background()))
-		assert.Empty(t, impl.calls)
-	})
+	testCases := map[string]struct {
+		impl     *acceptOutputMarkedImpl
+		disabled bool
+		// betweenAddAndRevert is run after adding the rules and before reverting.
+		betweenAddAndRevert func(config *Config)
+		revertCtx           func() context.Context
+		addCalls            []string
+		addErrMessage       string
+		revertCalls         []string
+		revertErrMessage    string
+		secondRevertCalls   []string
+	}{
+		"firewall_disabled": {
+			impl:     &acceptOutputMarkedImpl{},
+			disabled: true,
+		},
+		"add_and_revert": {
+			impl:        &acceptOutputMarkedImpl{},
+			addCalls:    allAdded,
+			revertCalls: allRemoved,
+		},
+		"revert_with_canceled_context": {
+			impl:     &acceptOutputMarkedImpl{},
+			addCalls: allAdded,
+			revertCtx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			revertCalls: allRemoved,
+		},
+		"revert_failure_keeps_failed_rule": {
+			impl: &acceptOutputMarkedImpl{
+				removeFailAddr: netip.MustParseAddr("203.0.113.1"),
+				removeFailures: 1,
+			},
+			addCalls: allAdded,
+			revertCalls: []string{
+				"del eth1 tcp 1.1.1.1:443 mark 28789",
+				"del eth0 tcp 203.0.113.1:443 mark 28789",
+				"del eth0 tcp 1.1.1.1:443 mark 28789",
+			},
+			revertErrMessage: "removing rule: test remove error",
+			secondRevertCalls: []string{
+				"del eth1 tcp 203.0.113.1:443 mark 28789",
+			},
+		},
+		"add_failure_reverts_added_rules": {
+			impl: &acceptOutputMarkedImpl{addFailAddr: netip.MustParseAddr("203.0.113.1")},
+			addCalls: []string{
+				"add eth0 tcp 1.1.1.1:443 mark 28789",
+				"del eth0 tcp 1.1.1.1:443 mark 28789",
+			},
+			addErrMessage: "adding rule: test add error",
+		},
+		"revert_after_disable": {
+			impl:     &acceptOutputMarkedImpl{},
+			addCalls: allAdded,
+			betweenAddAndRevert: func(config *Config) {
+				config.enabled = false
+				config.disabledCount++
+			},
+		},
+		"revert_after_disable_and_enable": {
+			impl:     &acceptOutputMarkedImpl{},
+			addCalls: allAdded,
+			betweenAddAndRevert: func(config *Config) {
+				config.disabledCount++
+			},
+		},
+	}
 
-	t.Run("add_and_revert", func(t *testing.T) {
-		t.Parallel()
-		impl := &acceptOutputImpl{}
-		c := &Config{impl: impl, enabled: true, defaultRoutes: defaultRoutes}
-		revert, err := c.AllowOutputTemporarily(context.Background(), "tcp", addrPorts)
-		require.NoError(t, err)
-		assert.Equal(t, []string{
-			"add eth0 tcp 1.1.1.1:443",
-			"add eth0 tcp 203.0.113.1:443",
-			"add eth1 tcp 1.1.1.1:443",
-			"add eth1 tcp 203.0.113.1:443",
-		}, impl.calls)
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-		impl.calls = nil
-		require.NoError(t, revert(context.Background()))
-		assert.Equal(t, []string{
-			"del eth0 tcp 1.1.1.1:443",
-			"del eth0 tcp 203.0.113.1:443",
-			"del eth1 tcp 1.1.1.1:443",
-			"del eth1 tcp 203.0.113.1:443",
-		}, impl.calls)
+			config := &Config{
+				impl:          testCase.impl,
+				enabled:       !testCase.disabled,
+				defaultRoutes: defaultRoutes,
+			}
 
-		impl.calls = nil
-		require.NoError(t, revert(context.Background()))
-		assert.Empty(t, impl.calls, "second revert must be a no-op")
-	})
+			revert, err := config.AllowOutputTemporarily(context.Background(), "tcp", mark, addrPorts)
+			require.NotNil(t, revert)
+			if testCase.addErrMessage != "" {
+				assert.ErrorContains(t, err, testCase.addErrMessage)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, testCase.addCalls, testCase.impl.popCalls())
 
-	t.Run("failure_reverts_added_rules", func(t *testing.T) {
-		t.Parallel()
-		impl := &acceptOutputImpl{failAddr: netip.MustParseAddr("203.0.113.1")}
-		c := &Config{impl: impl, enabled: true, defaultRoutes: defaultRoutes}
-		_, err := c.AllowOutputTemporarily(context.Background(), "tcp", addrPorts)
-		require.ErrorContains(t, err, "allowing output to tcp 203.0.113.1:443: test error")
-		assert.Equal(t, []string{
-			"add eth0 tcp 1.1.1.1:443",
-			"del eth0 tcp 1.1.1.1:443",
-		}, impl.calls)
-	})
+			if testCase.betweenAddAndRevert != nil {
+				testCase.betweenAddAndRevert(config)
+			}
+
+			revertCtx := context.Background()
+			if testCase.revertCtx != nil {
+				revertCtx = testCase.revertCtx()
+			}
+			err = revert(revertCtx)
+			if testCase.revertErrMessage != "" {
+				assert.ErrorContains(t, err, testCase.revertErrMessage)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, testCase.revertCalls, testCase.impl.popCalls())
+
+			err = revert(context.Background())
+			assert.NoError(t, err)
+			assert.Equal(t, testCase.secondRevertCalls, testCase.impl.popCalls())
+		})
+	}
+}
+
+func Test_Config_AllowOutputTemporarily_concurrent(t *testing.T) {
+	t.Parallel()
+
+	impl := &acceptOutputMarkedImpl{}
+	config := &Config{
+		impl:          impl,
+		enabled:       true,
+		defaultRoutes: []routing.DefaultRoute{{NetInterface: "eth0"}, {NetInterface: "eth1"}},
+	}
+
+	const workers = 10
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := range byte(workers) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			addrPorts := []netip.AddrPort{
+				netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, 100, i}), 443),
+				netip.AddrPortFrom(netip.AddrFrom4([4]byte{203, 0, 113, i}), 443),
+			}
+			revert, err := config.AllowOutputTemporarily(context.Background(), "tcp", 1, addrPorts)
+			if err != nil {
+				errs <- err
+				return
+			}
+			errs <- revert(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		assert.NoError(t, err)
+	}
+	assert.Zero(t, impl.rulesCount(), "all rules must be removed")
+	calls := impl.popCalls()
+	assert.Len(t, calls, workers*2*2*2) // add and remove, 2 addresses, 2 interfaces
+	adds := slices.DeleteFunc(slices.Clone(calls), func(call string) bool { return call[:3] != "add" })
+	assert.Len(t, adds, workers*2*2)
 }

@@ -94,7 +94,11 @@ func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (
 	}
 
 	// Validate Addresses
-	if len(w.Addresses) == 0 && !purevpn {
+	switch {
+	case purevpn && len(w.Addresses) > 0:
+		return fmt.Errorf("interface addresses cannot be set for PureVPN, "+
+			"since they are assigned by PureVPN: %v", w.Addresses)
+	case len(w.Addresses) == 0 && !purevpn:
 		return errors.New("interface address is not set")
 	}
 
@@ -107,7 +111,7 @@ func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (
 			hasIPv4 = true
 		}
 	}
-	if !hasIPv4 && !ipv6Supported && !purevpn {
+	if !hasIPv4 && !ipv6Supported && !purevpn { // PureVPN addresses are checked at runtime
 		return fmt.Errorf("no IPv4 interface addresses in %v but IPv6 is not supported",
 			w.Addresses)
 	}

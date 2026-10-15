@@ -23,7 +23,10 @@ type Config struct {
 	customRulesPath string
 
 	// State
-	enabled           bool
+	enabled bool
+	// disabledCount is incremented each time the firewall is disabled,
+	// which restores the iptables rules saved, removing any rule added.
+	disabledCount     uint
 	restore           func(context.Context)
 	vpnConnection     models.Connection
 	vpnIntf           string
