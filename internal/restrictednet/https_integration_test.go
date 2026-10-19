@@ -110,6 +110,7 @@ func Test_Client_OpenHTTPS(t *testing.T) {
 		err = response.Body.Close()
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusOK, response.StatusCode)
+		assert.Equal(t, 2, response.ProtoMajor)
 	}
 
 	err = cleanup()
