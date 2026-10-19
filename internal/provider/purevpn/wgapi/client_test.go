@@ -62,6 +62,7 @@ type fakePureVPN struct {
 	rejectTokens        bool              // API rejects all access tokens
 	ssoDisabled         bool              // ignore the single sign-on cookie
 	pages               map[string]string // HTML page served for "METHOD /path"
+	pagesStatus         int               // HTTP status of the pages, 200 if not set
 	challengePath       string            // path answered with a Cloudflare challenge
 	// State
 	counters    fakeCounters
@@ -166,6 +167,9 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	}
 	page, ok := f.pages[request.Method+" "+request.URL.Path]
 	if ok {
+		if f.pagesStatus != 0 {
+			writer.WriteHeader(f.pagesStatus)
+		}
 		fmt.Fprint(writer, page)
 		return
 	}
@@ -400,7 +404,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 		session     Session
 		request     func(request *ServerRequest)
 		errWrapped  error
-		errMessage  string
+		errMessage  string // {serverURL} is replaced by the test server URL
 		authCookies map[string]string
 		counters    fakeCounters
 
@@ -514,8 +518,9 @@ func Test_Client_FetchConfig(t *testing.T) {
 			},
 			credentials: credentials,
 			errWrapped:  errUnexpectedResponse,
-			errMessage:  "no access token after logging in, landed on",
-			counters:    fakeCounters{authorizePages: 1},
+			errMessage: "no access token after logging in, " +
+				"landed on {serverURL}/oauth2/authorize with status 200 OK",
+			counters: fakeCounters{authorizePages: 1},
 		},
 		"stored_session_without_credentials": {
 			setup:       func(fake *fakePureVPN) { fake.twoFactor = true }, // must not matter
@@ -554,8 +559,18 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: credentials,
 			session:     Session{AuthCookies: map[string]string{"fusionauth.sso": "stale"}},
 			errWrapped:  errUnexpectedResponse,
-			errMessage:  "login form not found",
+			errMessage:  "login form not found at {serverURL}/oauth2/authorize with status 200 OK",
 			authCookies: map[string]string{"fusionauth.sso": "stale"},
+			counters:    fakeCounters{authorizePages: 1},
+		},
+		"login_form_not_found_rate_limited": {
+			setup: func(fake *fakePureVPN) {
+				fake.pages = map[string]string{"GET /oauth2/authorize": "<html>Too many requests</html>"}
+				fake.pagesStatus = http.StatusTooManyRequests
+			},
+			credentials: credentials,
+			errWrapped:  errUnexpectedResponse,
+			errMessage:  "login form not found at {serverURL}/oauth2/authorize with status 429 Too Many Requests",
 			counters:    fakeCounters{authorizePages: 1},
 		},
 		"rejected_access_token_triggers_login": {
@@ -767,7 +782,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 				assert.ErrorIs(t, err, testCase.errWrapped)
 			}
 			if testCase.errMessage != "" {
-				assert.ErrorContains(t, err, testCase.errMessage)
+				assert.ErrorContains(t, err, strings.ReplaceAll(testCase.errMessage, "{serverURL}", server.URL))
 			}
 			assert.Equal(t, testCase.counters, fake.getCounters())
 			session := client.Session()

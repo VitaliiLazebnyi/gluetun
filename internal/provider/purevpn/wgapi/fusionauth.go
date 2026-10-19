@@ -47,7 +47,8 @@ func (c *Client) authenticate(ctx context.Context) (token string, err error) {
 		// The single sign-on session is still valid but the two-factor
 		// trusted device cookie expired, so go straight to two-factor.
 	case loginForm == nil:
-		return "", fmt.Errorf("%w: login form not found at %s", errUnexpectedResponse, redactURL(page.url))
+		return "", fmt.Errorf("%w: login form not found at %s with status %s",
+			errUnexpectedResponse, redactURL(page.url), page.status)
 	case !c.credentialsSet():
 		// The login form is only shown without a valid single sign-on session.
 		return "", fmt.Errorf("%w and %w", errSessionExpired, errCredentialsNotSet)
@@ -74,8 +75,8 @@ func (c *Client) authenticate(ctx context.Context) (token string, err error) {
 	case passwordSubmitted && page.findForm(isLoginForm) != nil:
 		return "", loginPageError(page)
 	default:
-		return "", fmt.Errorf("%w: no access token after logging in, landed on %s",
-			errUnexpectedResponse, redactURL(page.url))
+		return "", fmt.Errorf("%w: no access token after logging in, landed on %s with status %s",
+			errUnexpectedResponse, redactURL(page.url), page.status)
 	}
 }
 
@@ -240,7 +241,7 @@ func (c *Client) doAuthRequest(ctx context.Context, method, rawURL string,
 		return nil, err
 	}
 
-	page = &htmlPage{url: response.Request.URL}
+	page = &htmlPage{url: response.Request.URL, status: response.Status}
 	if c.getAccessTokenCookie() != "" {
 		// Logged in, the final page content does not matter, and it
 		// can be a redirect response or a Cloudflare challenge page.
@@ -262,7 +263,9 @@ func (c *Client) doAuthRequest(ctx context.Context, method, rawURL string,
 }
 
 type htmlPage struct {
-	url    *url.URL
+	url *url.URL
+	// status is the HTTP status of the page response, such as "200 OK".
+	status string
 	forms  []*htmlForm
 	errors []string
 }
