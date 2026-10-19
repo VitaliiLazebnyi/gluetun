@@ -22,10 +22,6 @@ var (
 	// generated two-factor code.
 	errTwoFactorCodeInvalid = errors.New("PureVPN rejected the two-factor code, " +
 		"check the TOTP secret and the system clock")
-	// errTwoFactorMethodUnsupported is returned when the account two-factor
-	// method is not an authenticator app (for example email or SMS).
-	errTwoFactorMethodUnsupported = errors.New("PureVPN two-factor method is not supported, " +
-		"only authenticator app (TOTP) is supported")
 	// errCaptchaRequired is returned when PureVPN requires a captcha
 	// to log in, which cannot be solved automatically.
 	errCaptchaRequired = errors.New("PureVPN requires a captcha to log in, " +
@@ -62,7 +58,6 @@ func IsAuthError(err error) bool {
 	for _, target := range [...]error{
 		errCredentialsNotSet, errInvalidCredentials,
 		errTwoFactorRequired, errTwoFactorCodeInvalid,
-		errTwoFactorMethodUnsupported,
 	} {
 		if errors.Is(err, target) {
 			return true

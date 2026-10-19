@@ -49,7 +49,6 @@ type fakePureVPN struct {
 	mutex sync.Mutex
 	// Settings
 	twoFactor           bool
-	twoFactorMethods    string // HTML radio inputs to show a method selection page
 	twoFactorPageExtra  string // HTML added after the two-factor code form
 	totpTime            time.Time
 	rejectCodes         uint // number of valid two-factor codes to reject
@@ -143,21 +142,6 @@ const otherMethodForm = `<form action="/oauth2/two-factor-methods" method="post"
 <button type="submit">Send a code by email instead</button>
 </form>`
 
-const twoFactorMethodsPage = `<html><body>
-<form action="/oauth2/two-factor-methods" method="post">
-<input type="hidden" name="twoFactorId" value="tf-1">
-%s
-<button type="submit">Continue</button>
-</form></body></html>`
-
-const emailMethod = `<label class="radio"><input type="radio" name="methodId" value="m-email" checked>
-<span>Email to u***@example.com</span></label>`
-
-const smsMethod = `<label class="radio"><input type="radio" name="methodId" value="m-sms"> SMS</label>`
-
-const authenticatorMethod = `<input type="radio" id="method-auth" name="methodId" value="m-auth">
-<label for="method-auth">Authenticator app</label>`
-
 func (f *fakePureVPN) issueToken(writer http.ResponseWriter, request *http.Request) {
 	f.counters.tokens++
 	f.latestToken = makeJWT(time.Now().Add(time.Hour), f.counters.tokens)
@@ -200,19 +184,11 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		case request.PostForm.Get("loginId") != testUsername || request.PostForm.Get("password") != testPassword:
 			fmt.Fprintf(writer, loginPage, baseURL, " error", //nolint:gosec // test server
 				`<span class="error">Invalid login credentials.</span>`)
-		case f.twoFactor && f.twoFactorMethods != "":
-			fmt.Fprintf(writer, twoFactorMethodsPage, f.twoFactorMethods)
 		case f.twoFactor:
 			f.writeTwoFactorPage(writer, "")
 		default:
 			f.issueToken(writer, request)
 		}
-	case "POST /oauth2/two-factor-methods":
-		if !f.parseForm(writer, request) {
-			return
-		}
-		assert.Equal(f.t, "m-auth", request.PostForm.Get("methodId"))
-		f.writeTwoFactorPage(writer, "")
 	case "POST /oauth2/two-factor":
 		f.serveTwoFactorCode(writer, request)
 	case "GET /v2/api/fusionauth/login":
@@ -525,38 +501,6 @@ func Test_Client_FetchConfig(t *testing.T) {
 			errWrapped:  errUnexpectedResponse,
 			errMessage:  "no access token after logging in, landed on",
 			counters:    fakeCounters{authorizePages: 1},
-		},
-		"two_factor_method_selection": {
-			setup: func(fake *fakePureVPN) {
-				fake.twoFactor = true
-				fake.twoFactorMethods = emailMethod + authenticatorMethod
-			},
-			credentials: credentialsWithTOTP,
-			authCookies: trustedCookies,
-			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1, tokens: 1},
-		},
-		"two_factor_method_unsupported": {
-			setup: func(fake *fakePureVPN) {
-				fake.twoFactor = true
-				fake.twoFactorMethods = emailMethod + smsMethod
-			},
-			credentials: credentialsWithTOTP,
-			errWrapped:  errTwoFactorMethodUnsupported,
-			authError:   true,
-			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1},
-		},
-		"two_factor_methods_page_on_authorize": {
-			// The single sign-on session is valid but the trusted device
-			// cookie expired, and the authorize page asks for a method.
-			setup: func(fake *fakePureVPN) {
-				fake.twoFactor = true
-				fake.pages = map[string]string{
-					"GET /oauth2/authorize": fmt.Sprintf(twoFactorMethodsPage, emailMethod+authenticatorMethod),
-				}
-			},
-			credentials: credentialsWithTOTP,
-			authCookies: trustedCookies,
-			counters:    fakeCounters{authorizePages: 1, twoFactorLogins: 1, tokens: 1},
 		},
 		"stored_session_without_credentials": {
 			setup:       func(fake *fakePureVPN) { fake.twoFactor = true }, // must not matter

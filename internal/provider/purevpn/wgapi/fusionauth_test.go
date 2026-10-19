@@ -63,17 +63,20 @@ func Test_parseHTML(t *testing.T) {
 			}},
 			errorMessages: []string{"Errors list", "Danger"},
 		},
-		"labels": {
-			body: `<form action="/methods">
-<label><input type="radio" name="methodId" value="m-email" checked> Email</label>
-<input type="radio" id="auth" name="methodId" value="m-auth"><label for="auth">Authenticator app</label>
-<button type="submit">Go</button>
+		"two_factor_form": {
+			body: `<form action="/oauth2/two-factor">
+<input type="hidden" name="twoFactorId" value="tf-1"><input type="hidden" name="methodId" value="m-auth">
+<label for="code">Code</label><input id="code" name="code" type="text">
+<label><input type="checkbox" name="trustComputer" value="true"> Trust this computer</label>
+<button type="submit">Verify</button>
 </form>`,
 			forms: []*htmlForm{{
-				action: "/methods",
+				action: "/oauth2/two-factor",
 				inputs: []htmlInput{
-					{name: "methodId", value: "m-email", inputType: "radio", checked: true, label: "Email"},
-					{name: "methodId", value: "m-auth", id: "auth", inputType: "radio", label: "Authenticator app"},
+					{name: "twoFactorId", value: "tf-1", inputType: "hidden"},
+					{name: "methodId", value: "m-auth", inputType: "hidden"},
+					{name: "code", inputType: "text"},
+					{name: "trustComputer", value: "true", inputType: "checkbox"},
 					{inputType: "submit"},
 				},
 			}},
@@ -119,38 +122,6 @@ func Test_loginPageError(t *testing.T) {
 			err := loginPageError(&htmlPage{errors: testCase.errors})
 			assert.ErrorIs(t, err, testCase.errWrapped)
 			assert.ErrorContains(t, err, testCase.errMessage)
-		})
-	}
-}
-
-func Test_isTwoFactorMethodsForm(t *testing.T) {
-	t.Parallel()
-
-	testCases := map[string]struct {
-		inputs  []htmlInput
-		matches bool
-	}{
-		"no_input": {},
-		"hidden_method": {
-			inputs: []htmlInput{{name: "methodId", value: "m-email", inputType: "hidden"}},
-		},
-		"other_radio": {
-			inputs: []htmlInput{{name: "choice", value: "m-email", inputType: "radio"}},
-		},
-		"radio_methods": {
-			inputs: []htmlInput{
-				{name: "twoFactorId", value: "tf-1", inputType: "hidden"},
-				{name: "methodId", value: "m-auth", inputType: "radio"},
-			},
-			matches: true,
-		},
-	}
-
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			form := &htmlForm{inputs: testCase.inputs}
-			assert.Equal(t, testCase.matches, isTwoFactorMethodsForm(form))
 		})
 	}
 }

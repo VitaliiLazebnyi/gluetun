@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"time"
 
@@ -44,7 +43,7 @@ func (c *Client) authenticate(ctx context.Context) (token string, err error) {
 	passwordSubmitted := false
 	loginForm := page.findForm(isLoginForm)
 	switch {
-	case page.findForm(isTwoFactorForm) != nil, page.findForm(isTwoFactorMethodsForm) != nil:
+	case page.findForm(isTwoFactorForm) != nil:
 		// The single sign-on session is still valid but the two-factor
 		// trusted device cookie expired, so go straight to two-factor.
 	case loginForm == nil:
@@ -58,16 +57,6 @@ func (c *Client) authenticate(ctx context.Context) (token string, err error) {
 			return "", fmt.Errorf("submitting login form: %w", err)
 		}
 		passwordSubmitted = true
-	}
-
-	// Note the two-factor code page can also contain a form to
-	// choose another two-factor method, so it is checked first.
-	if page.findForm(isTwoFactorForm) == nil && page.findForm(isTwoFactorMethodsForm) != nil {
-		page, err = c.selectTwoFactorMethod(ctx, page)
-		if err != nil {
-			return "", err
-		}
-		passwordSubmitted = false
 	}
 
 	if page.findForm(isTwoFactorForm) != nil {
@@ -106,32 +95,6 @@ func (c *Client) submitLoginForm(ctx context.Context, page *htmlPage,
 	values.Set("loginId", c.credentials.Username)
 	values.Set("password", c.credentials.Password)
 	return c.submitForm(ctx, page, loginForm, values)
-}
-
-func (c *Client) selectTwoFactorMethod(ctx context.Context, page *htmlPage) (*htmlPage, error) {
-	form := page.findForm(isTwoFactorMethodsForm)
-	values := form.values()
-	methodID := ""
-	for _, input := range form.inputs {
-		if !isTwoFactorMethodInput(input) {
-			continue
-		}
-		description := strings.ToLower(input.label + " " + input.id + " " + input.value)
-		if strings.Contains(description, "authenticator") {
-			methodID = input.value
-			break
-		}
-	}
-	if methodID == "" {
-		// Only email or SMS methods are available.
-		return nil, errTwoFactorMethodUnsupported
-	}
-	values.Set("methodId", methodID)
-	page, err := c.submitForm(ctx, page, form, values)
-	if err != nil {
-		return nil, fmt.Errorf("selecting two-factor method: %w", err)
-	}
-	return page, nil
 }
 
 // submitTwoFactorCode submits the two-factor code generated from the
@@ -309,10 +272,8 @@ type htmlForm struct {
 type htmlInput struct {
 	name      string
 	value     string
-	id        string
 	inputType string
 	checked   bool
-	label     string
 }
 
 func (p *htmlPage) findForm(match func(form *htmlForm) bool) *htmlForm {
@@ -361,18 +322,6 @@ func isTwoFactorForm(form *htmlForm) bool {
 	return form.hasInput("code") && form.hasInput("twoFactorId")
 }
 
-// isTwoFactorMethodsForm returns true if the form is a two-factor
-// method selection form, with radio buttons to choose the method.
-// A two-factor code form can contain a hidden methodId input, which
-// does not make it a method selection form.
-func isTwoFactorMethodsForm(form *htmlForm) bool {
-	return slices.ContainsFunc(form.inputs, isTwoFactorMethodInput)
-}
-
-func isTwoFactorMethodInput(input htmlInput) bool {
-	return input.name == "methodId" && input.inputType == "radio"
-}
-
 // parseHTML extracts the forms and the error messages from an HTML page.
 // FusionAuth themes show errors in elements with an "error" class or
 // an "alert" role.
@@ -382,25 +331,14 @@ func parseHTML(body []byte) (forms []*htmlForm, errorMessages []string) {
 		return nil, nil
 	}
 
-	parser := &htmlParser{labels: make(map[string]string)}
+	parser := &htmlParser{}
 	parser.walk(root, false, false)
-
-	for _, form := range parser.forms {
-		for i := range form.inputs {
-			label, ok := parser.labels[form.inputs[i].id]
-			if ok {
-				form.inputs[i].label = label
-			}
-		}
-	}
 	return parser.forms, parser.errorMessages
 }
 
 type htmlParser struct {
 	forms         []*htmlForm
 	currentForm   *htmlForm
-	labels        map[string]string // input id to label text
-	enclosingText string            // text of the label element enclosing the current node
 	errorMessages []string
 }
 
@@ -408,13 +346,9 @@ type htmlParser struct {
 // is an error element, whose text content was already collected, and
 // hidden is true if the node or an ancestor is hidden.
 func (p *htmlParser) walk(node *html.Node, insideError, hidden bool) {
-	previousEnclosingText := p.enclosingText
 	if node.Type == html.ElementNode {
 		hidden = hidden || isHiddenElement(node)
 		p.handleElement(node)
-		if node.Data == "label" && attribute(node, "for") == "" {
-			p.enclosingText = strings.TrimSpace(textContent(node))
-		}
 		if !insideError && !hidden && isErrorElement(node) {
 			insideError = true
 			text := strings.Join(strings.Fields(textContent(node)), " ")
@@ -426,7 +360,6 @@ func (p *htmlParser) walk(node *html.Node, insideError, hidden bool) {
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
 		p.walk(child, insideError, hidden)
 	}
-	p.enclosingText = previousEnclosingText
 }
 
 func (p *htmlParser) handleElement(node *html.Node) {
@@ -442,16 +375,9 @@ func (p *htmlParser) handleElement(node *html.Node) {
 		p.currentForm.inputs = append(p.currentForm.inputs, htmlInput{
 			name:      attribute(node, "name"),
 			value:     attribute(node, "value"),
-			id:        attribute(node, "id"),
 			inputType: strings.ToLower(attribute(node, "type")),
 			checked:   checked,
-			label:     p.enclosingText,
 		})
-	case "label":
-		forID := attribute(node, "for")
-		if forID != "" {
-			p.labels[forID] = strings.TrimSpace(textContent(node))
-		}
 	}
 }
 
