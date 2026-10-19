@@ -313,6 +313,7 @@ func Test_Client_doAuthRequest(t *testing.T) {
 	testCases := map[string]struct {
 		status     int
 		rawURL     string
+		errWrapped error
 		errMessage string
 	}{
 		"invalid_url": {
@@ -321,6 +322,7 @@ func Test_Client_doAuthRequest(t *testing.T) {
 		},
 		"server_error": {
 			status:     http.StatusInternalServerError,
+			errWrapped: errUnexpectedResponse,
 			errMessage: "unexpected response from PureVPN: %s returned 500 Internal Server Error",
 		},
 		"client_error_page_parsed": {
@@ -349,7 +351,11 @@ func Test_Client_doAuthRequest(t *testing.T) {
 				if testCase.rawURL == "" {
 					errMessage = fmt.Sprintf(errMessage, server.URL+"/page")
 				}
-				assert.EqualError(t, err, errMessage)
+				if testCase.errWrapped != nil {
+					assert.ErrorIs(t, err, testCase.errWrapped)
+				}
+				assert.ErrorContains(t, err, errMessage)
+				assert.NotContains(t, err.Error(), "secret")
 				assert.Nil(t, page)
 				return
 			}

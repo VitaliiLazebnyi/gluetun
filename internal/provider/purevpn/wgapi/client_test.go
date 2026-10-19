@@ -399,11 +399,14 @@ func Test_Client_FetchConfig(t *testing.T) {
 		credentials Credentials
 		session     Session
 		request     func(request *ServerRequest)
-		ctxTimeout  time.Duration
 		errWrapped  error
 		errMessage  string
 		authCookies map[string]string
 		counters    fakeCounters
+
+		// cancelAfterTwoFactorCode cancels the context once the
+		// response to the first two-factor code submission is read.
+		cancelAfterTwoFactorCode bool
 	}{
 		"password_login": {
 			credentials: credentials,
@@ -472,11 +475,11 @@ func Test_Client_FetchConfig(t *testing.T) {
 				fake.twoFactor = true
 				fake.rejectCodes = 1
 			},
-			credentials: credentialsWithTOTP,
-			ctxTimeout:  2 * time.Second,
-			errWrapped:  context.DeadlineExceeded,
-			errMessage:  "waiting for the next two-factor code",
-			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1},
+			credentials:              credentialsWithTOTP,
+			cancelAfterTwoFactorCode: true,
+			errWrapped:               context.Canceled,
+			errMessage:               "waiting for the next two-factor code",
+			counters:                 fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1},
 		},
 		"two_factor_invalid_secret": {
 			setup: func(fake *fakePureVPN) { fake.twoFactor = true },
@@ -737,13 +740,22 @@ func Test_Client_FetchConfig(t *testing.T) {
 			client := newTestClient(t, server.URL, testCase.credentials, testCase.session)
 			client.timeNow = func() time.Time { return now }
 			ctx := context.Background()
-			if testCase.ctxTimeout > 0 {
+			if testCase.cancelAfterTwoFactorCode {
 				// Set the clock at the start of a time step, so retrying
-				// a rejected code waits for about 30 seconds.
+				// a rejected code waits for about 30 seconds, and cancel
+				// the context once the rejected code response is read.
 				client.timeNow = func() time.Time { return now.Add(time.Millisecond) }
 				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, testCase.ctxTimeout)
+				ctx, cancel = context.WithCancel(ctx)
 				defer cancel()
+				transport := client.httpClient.Transport
+				client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					response, err := transport.RoundTrip(request)
+					if err == nil && request.URL.Path == "/oauth2/two-factor" {
+						response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
+					}
+					return response, err
+				})
 			}
 			request := newTestRequest()
 			if testCase.request != nil {
@@ -832,6 +844,17 @@ type roundTripFunc func(request *http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+// cancelOnClose cancels a context when the response body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	c.cancel()
+	return c.ReadCloser.Close()
 }
 
 func Test_New(t *testing.T) {
@@ -1070,10 +1093,10 @@ func Test_Client_readBodyError(t *testing.T) {
 	require.NoError(t, err)
 
 	err = client.apiRequest(context.Background(), "token", "/v2/api/test", nil, nil)
-	assert.EqualError(t, err, "reading response body: test read error")
+	assert.ErrorContains(t, err, "reading response body: test read error")
 
 	page, err := client.doAuthRequest(context.Background(), http.MethodGet, defaultAuthURL, nil)
-	assert.EqualError(t, err, "reading response body: test read error")
+	assert.ErrorContains(t, err, "reading response body: test read error")
 	assert.Nil(t, page)
 }
 
@@ -1113,8 +1136,9 @@ func Test_wrapRequestError(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			err := wrapRequestError(testCase.err)
-			assert.EqualError(t, err, testCase.errMessage)
 			assert.ErrorIs(t, err, testCase.err)
+			assert.ErrorContains(t, err, testCase.errMessage)
+			assert.NotContains(t, err.Error(), "secret")
 		})
 	}
 }
@@ -1163,7 +1187,7 @@ func Test_Client_login_credentialsNotSet(t *testing.T) {
 			token, err := client.login(context.Background())
 
 			assert.Empty(t, token)
-			assert.EqualError(t, err, errCredentialsNotSet.Error())
+			assert.ErrorIs(t, err, errCredentialsNotSet)
 		})
 	}
 }
