@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -164,10 +165,11 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 	_, ok := network.openCtx.Deadline()
 	assert.True(t, ok, "requests must be bounded by a timeout")
 	hostnames, cleanups := network.opened()
-	assert.Greater(t, api.requestsCount(), uint(1))
-	assert.Equal(t, []string{strings.TrimPrefix(server.URL, "https://")}, hostnames,
-		"requests to the same host must share one connection")
-	assert.Equal(t, []uint{1}, cleanups, "the connection must be cleaned up")
+	requestsCount := int(api.requestsCount())
+	assert.Greater(t, requestsCount, 1)
+	assert.Equal(t, slices.Repeat([]string{strings.TrimPrefix(server.URL, "https://")}, requestsCount), hostnames,
+		"each request must open its own connection")
+	assert.Equal(t, slices.Repeat([]uint{1}, requestsCount), cleanups, "each connection must be cleaned up once")
 
 	key, err := wgtypes.ParseKey(connection.PrivateKey)
 	require.NoError(t, err)
@@ -245,7 +247,7 @@ func Test_Provider_FetchWireguardConnection(t *testing.T) {
 
 	require.NoError(t, err)
 	hostnames, _ := network.opened()
-	assert.Len(t, hostnames, 1, "the restricted network given to New must be used")
+	assert.Len(t, hostnames, int(api.requestsCount()), "the restricted network given to New must be used")
 	assert.Equal(t, key.String(), connection.PrivateKey)
 	assert.Equal(t, key.PublicKey().String(), api.clientPubKey)
 	assert.Equal(t, netip.MustParseAddr("203.0.113.5"), connection.Connection.IP)
@@ -326,7 +328,7 @@ func Test_wireguardFetcher_fetch_cleanupError(t *testing.T) {
 	server, network := newTestServer(t, api)
 	// For example the firewall got disabled during the fetch,
 	// so removing the firewall rule fails.
-	network.cleanupErr = errors.New("test error")
+	network.cleanupErrs = map[uint]error{0: errors.New("test error")}
 
 	logger := NewMockLogger(ctrl)
 	gomock.InOrder(

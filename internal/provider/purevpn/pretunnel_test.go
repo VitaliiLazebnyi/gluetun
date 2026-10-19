@@ -13,34 +13,32 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
-	"github.com/qdm12/gluetun/internal/restrictednet"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // fakeNetwork is a restricted network dialing a test server once per
-// HTTP client opened, and whose HTTP clients can dial only once, failing
-// with [restrictednet.ErrDialedMoreThanOnce] otherwise, like the restricted
-// network HTTP clients. It records the hostnames opened, the context of the
-// last open and the number of cleanups for each HTTP client opened.
+// HTTP client opened, and whose HTTP clients can dial only once, like
+// the restricted network HTTP clients. It records the hostnames opened,
+// the context of the last open and the number of cleanups for each HTTP
+// client opened.
 type fakeNetwork struct {
 	serverAddress string
 	rootCAs       *x509.CertPool
 	// openErrs maps the index of an open call to the error it returns.
 	openErrs map[uint]error
-	// cleanupErr, if set, is wrapped and returned by each cleanup.
-	cleanupErr error
+	// cleanupErrs maps the index of an open call to the error
+	// wrapped and returned by its cleanup.
+	cleanupErrs map[uint]error
 
-	mutex       sync.Mutex
-	hostnames   []string
-	openCtx     context.Context
-	cleanups    []uint
-	connections []*closeNotifyingConn
+	mutex     sync.Mutex
+	hostnames []string
+	openCtx   context.Context
+	cleanups  []uint
 }
 
 func newFakeNetwork(server *httptest.Server) *fakeNetwork {
@@ -61,26 +59,20 @@ func (n *fakeNetwork) OpenHTTPSByHostname(ctx context.Context, hostname string) 
 	n.openCtx = ctx
 	n.cleanups = append(n.cleanups, 0)
 	openErr := n.openErrs[index]
+	cleanupErr := n.cleanupErrs[index]
 	n.mutex.Unlock()
 	if openErr != nil {
 		return nil, nil, openErr
 	}
 
 	dialer := net.Dialer{}
-	rawConnection, err := dialer.DialContext(ctx, "tcp", n.serverAddress)
+	connection, err := dialer.DialContext(ctx, "tcp", n.serverAddress)
 	if err != nil {
 		return nil, nil, err
 	}
-	connection := &closeNotifyingConn{Conn: rawConnection, closed: make(chan struct{})}
-	n.mutex.Lock()
-	n.connections = append(n.connections, connection)
-	n.mutex.Unlock()
 
 	var dialed atomic.Bool
 	httpClient := &http.Client{Transport: &http.Transport{
-		MaxIdleConns:        1,
-		MaxIdleConnsPerHost: 1,
-		MaxConnsPerHost:     1,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    n.rootCAs,
@@ -89,7 +81,7 @@ func (n *fakeNetwork) OpenHTTPSByHostname(ctx context.Context, hostname string) 
 		},
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			if !dialed.CompareAndSwap(false, true) {
-				return nil, restrictednet.ErrDialedMoreThanOnce
+				return nil, errors.New("dial function called more than once")
 			}
 			return connection, nil
 		},
@@ -101,8 +93,8 @@ func (n *fakeNetwork) OpenHTTPSByHostname(ctx context.Context, hostname string) 
 		n.mutex.Lock()
 		defer n.mutex.Unlock()
 		n.cleanups[index]++
-		if n.cleanupErr != nil {
-			return fmt.Errorf("cleanup %d: %w", index, n.cleanupErr)
+		if cleanupErr != nil {
+			return fmt.Errorf("cleanup %d: %w", index, cleanupErr)
 		}
 		return nil
 	}
@@ -126,54 +118,22 @@ func (n *fakeNetwork) opened() (hostnames []string, cleanups []uint) {
 	return slices.Clone(n.hostnames), slices.Clone(n.cleanups)
 }
 
-// waitClosed waits for all the connections opened to be closed,
-// for example by the HTTP transport after the server closed them.
-func (n *fakeNetwork) waitClosed(t *testing.T) {
-	t.Helper()
-	n.mutex.Lock()
-	connections := slices.Clone(n.connections)
-	n.mutex.Unlock()
-	for _, connection := range connections {
-		select {
-		case <-connection.closed:
-		case <-t.Context().Done():
-			t.Fatal(t.Context().Err())
-		}
-	}
-}
-
-// closeNotifyingConn is a connection closing its closed channel
-// the first time it is closed.
-type closeNotifyingConn struct {
-	net.Conn
-	closeOnce sync.Once
-	closed    chan struct{}
-}
-
-func (c *closeNotifyingConn) Close() error {
-	c.closeOnce.Do(func() { close(c.closed) })
-	return c.Conn.Close()
-}
-
-// transportTestRequest is a request sent through the restricted transport.
+// transportTestRequest is a GET request sent through the restricted transport.
 type transportTestRequest struct {
 	scheme string // defaults to https
 	host   string
 	// defaultPort omits the port from the request URL.
 	defaultPort bool
-	// path is the request URL path. The `/drop` path makes the server
-	// close all the client connections after reading the request,
-	// without responding.
+	// path is the request URL path. The `/redirect` path makes the
+	// server redirect to the `/` path on the localhost host.
 	path string
-	body *string
-	// notReplayable makes the request body impossible to read again.
-	notReplayable bool
-	// getBodyErr, if set, is returned by the request GetBody function.
-	getBodyErr error
-	// closeConnectionsBefore closes the server side of the connections
-	// before sending the request, and waits for the client side of the
-	// connections to be closed.
-	closeConnectionsBefore bool
+	// keepBodyOpen leaves the response body open.
+	keepBodyOpen bool
+	// opens is the number of restricted connections the request opens.
+	opens uint
+	// closeErrMessage is the expected response body close error
+	// message substring, if any.
+	closeErrMessage string
 	// errWrapped is the expected sentinel error wrapped, if any.
 	errWrapped error
 	// errMessage is the expected error message substring,
@@ -189,142 +149,69 @@ func Test_restrictedTransport(t *testing.T) {
 	testCases := map[string]struct {
 		untrustedServer bool
 		openErrs        map[uint]error
-		cleanupErr      error
+		cleanupErrs     map[uint]error
 		requests        []transportTestRequest
 		// openedHosts are the hosts expected to be opened, with the
 		// test server port appended if they have no port.
-		openedHosts    []string
-		serverRequests uint32
-		cleanupErrs    []string
+		openedHosts        []string
+		cleanupErrMessages []string
 	}{
-		"same_host_reuses_connection": {
+		"sequential_requests_each_open_a_connection": {
 			requests: []transportTestRequest{
-				{host: "127.0.0.1"},
-				{host: "127.0.0.1", body: new("data")},
-				{host: "127.0.0.1"},
+				{host: "127.0.0.1", opens: 1},
+				{host: "127.0.0.1", opens: 1},
+				{host: "localhost", opens: 1},
 			},
-			openedHosts:    []string{"127.0.0.1"},
-			serverRequests: 3,
+			openedHosts: []string{"127.0.0.1", "127.0.0.1", "localhost"},
+		},
+		"redirect_hops_each_open_a_connection": {
+			requests: []transportTestRequest{
+				{host: "127.0.0.1", path: "/redirect", opens: 2},
+			},
+			openedHosts: []string{"127.0.0.1", "localhost"},
 		},
 		"default_https_port": {
 			requests: []transportTestRequest{
-				{host: "localhost", defaultPort: true},
+				{host: "localhost", defaultPort: true, opens: 1},
 			},
-			openedHosts:    []string{"localhost:443"},
-			serverRequests: 1,
+			openedHosts: []string{"localhost:443"},
 		},
-		"different_hosts_use_different_connections": {
+		"open_error": {
+			openErrs: map[uint]error{0: testErr},
 			requests: []transportTestRequest{
-				{host: "127.0.0.1"},
-				{host: "localhost"},
-				{host: "127.0.0.1"},
-				{host: "localhost"},
-			},
-			openedHosts:    []string{"127.0.0.1", "localhost"},
-			serverRequests: 4,
-		},
-		"server_closed_connection_reopened": {
-			requests: []transportTestRequest{
-				{host: "127.0.0.1"},
-				{host: "127.0.0.1", closeConnectionsBefore: true},
-				{host: "127.0.0.1"},
-			},
-			openedHosts:    []string{"127.0.0.1", "127.0.0.1"},
-			serverRequests: 3,
-		},
-		"server_closed_connection_reopened_with_body": {
-			requests: []transportTestRequest{
-				{host: "127.0.0.1"},
-				{host: "127.0.0.1", body: new("data"), closeConnectionsBefore: true},
-			},
-			openedHosts:    []string{"127.0.0.1", "127.0.0.1"},
-			serverRequests: 2,
-		},
-		"server_closed_connection_body_not_replayable": {
-			requests: []transportTestRequest{
-				{host: "127.0.0.1"},
 				{
-					host: "127.0.0.1", body: new("data"), notReplayable: true,
-					closeConnectionsBefore: true,
-					errWrapped:             restrictednet.ErrDialedMoreThanOnce,
-					errMessage:             "dial function called more than once",
-				},
-				// The failed connection is replaced on the next request.
-				{host: "127.0.0.1"},
-			},
-			openedHosts:    []string{"127.0.0.1", "127.0.0.1"},
-			serverRequests: 2,
-		},
-		"server_closed_connection_get_body_error": {
-			requests: []transportTestRequest{
-				{host: "127.0.0.1"},
-				{
-					host: "127.0.0.1", body: new("data"), getBodyErr: testErr,
-					closeConnectionsBefore: true,
-					errWrapped:             testErr,
-					errMessage: "dial function called more than once\n" +
-						"getting request body: test error",
-				},
-			},
-			openedHosts:    []string{"127.0.0.1"},
-			serverRequests: 1,
-		},
-		"server_closed_connection_reopen_error": {
-			openErrs: map[uint]error{1: testErr},
-			requests: []transportTestRequest{
-				{host: "127.0.0.1"},
-				{
-					host: "127.0.0.1", closeConnectionsBefore: true,
+					host: "127.0.0.1", opens: 1,
 					errWrapped: testErr,
 					errMessage: "opening restricted HTTPS connection: test error",
 				},
+				{host: "127.0.0.1", opens: 1},
 			},
-			openedHosts:    []string{"127.0.0.1", "127.0.0.1"},
-			serverRequests: 1,
+			openedHosts: []string{"127.0.0.1", "127.0.0.1"},
 		},
-		"server_closed_connection_retried_request_error": {
-			requests: []transportTestRequest{
-				{host: "127.0.0.1"},
-				{
-					host: "127.0.0.1", path: "/drop", closeConnectionsBefore: true,
-					errMessage: "EOF",
-				},
-				// The failed connection is replaced on the next request.
-				{host: "127.0.0.1"},
-			},
-			openedHosts:    []string{"127.0.0.1", "127.0.0.1", "127.0.0.1"},
-			serverRequests: 3,
-		},
-		"request_processed_then_connection_closed_not_replayed": {
-			requests: []transportTestRequest{
-				{host: "127.0.0.1"},
-				{
-					host: "127.0.0.1", path: "/drop", body: new("data"),
-					errMessage: "EOF",
-				},
-				// The failed connection is replaced on the next request.
-				{host: "127.0.0.1"},
-			},
-			openedHosts:    []string{"127.0.0.1", "127.0.0.1"},
-			serverRequests: 3,
-		},
-		"fresh_connection_error_not_retried": {
+		"round_trip_error": {
 			untrustedServer: true,
 			requests: []transportTestRequest{
-				{host: "127.0.0.1", errMessage: "certificate signed by unknown authority"},
+				{host: "127.0.0.1", opens: 1, errMessage: "certificate signed by unknown authority"},
 			},
 			openedHosts: []string{"127.0.0.1"},
 		},
-		"cleanup_errors_joined": {
-			cleanupErr: testErr,
+		"cleanup_leftovers": {
 			requests: []transportTestRequest{
-				{host: "127.0.0.1"},
-				{host: "localhost"},
-				{host: "127.0.0.1", closeConnectionsBefore: true},
+				{host: "127.0.0.1", opens: 1},
+				{host: "127.0.0.1", opens: 1, keepBodyOpen: true},
+				{host: "localhost", opens: 1, keepBodyOpen: true},
 			},
-			openedHosts:    []string{"127.0.0.1", "localhost", "127.0.0.1"},
-			serverRequests: 3,
-			cleanupErrs:    []string{"cleanup 0: test error", "cleanup 1: test error", "cleanup 2: test error"},
+			openedHosts: []string{"127.0.0.1", "127.0.0.1", "localhost"},
+		},
+		"cleanup_errors_joined": {
+			cleanupErrs: map[uint]error{0: testErr, 2: testErr},
+			requests: []transportTestRequest{
+				{host: "127.0.0.1", opens: 1, closeErrMessage: "cleanup 0: test error"},
+				{host: "127.0.0.1", opens: 1},
+				{host: "localhost", opens: 1, keepBodyOpen: true},
+			},
+			openedHosts:        []string{"127.0.0.1", "127.0.0.1", "localhost"},
+			cleanupErrMessages: []string{"cleanup 0: test error", "cleanup 2: test error"},
 		},
 		"non_https_rejected": {
 			requests: []transportTestRequest{
@@ -346,17 +233,16 @@ func Test_restrictedTransport(t *testing.T) {
 			t.Run(name+"_"+protocolName, func(t *testing.T) {
 				t.Parallel()
 
-				var serverRequests atomic.Uint32
 				var server *httptest.Server
 				server = httptest.NewUnstartedServer(http.HandlerFunc(
 					func(writer http.ResponseWriter, request *http.Request) {
-						serverRequests.Add(1)
-						body, _ := io.ReadAll(request.Body)
-						if request.URL.Path == "/drop" {
-							server.CloseClientConnections()
+						if request.URL.Path == "/redirect" {
+							_, port, _ := net.SplitHostPort(server.Listener.Addr().String())
+							redirectURL := url.URL{Scheme: "https", Host: net.JoinHostPort("localhost", port), Path: "/"}
+							http.Redirect(writer, request, redirectURL.String(), http.StatusFound)
 							return
 						}
-						_, _ = writer.Write([]byte(request.Method + " " + string(body))) //nolint:gosec
+						_, _ = writer.Write([]byte(request.URL.Path)) //nolint:gosec
 					}))
 				server.EnableHTTP2 = protocol.serverHTTP2
 				server.StartTLS()
@@ -369,27 +255,26 @@ func Test_restrictedTransport(t *testing.T) {
 					network.rootCAs = x509.NewCertPool()
 				}
 				network.openErrs = testCase.openErrs
-				network.cleanupErr = testCase.cleanupErr
+				network.cleanupErrs = testCase.cleanupErrs
 				transport := &restrictedTransport{network: network}
 				httpClient := &http.Client{Transport: transport}
 
 				for _, testRequest := range testCase.requests {
-					checkTransportTestRequest(t, server, network, httpClient, protocol.protoMajor, testRequest)
+					checkTransportTestRequest(t, port, network, httpClient, protocol.protoMajor, testRequest)
 				}
 
 				expectedHostnames, expectedCleanups := expectedOpened(testCase.openedHosts, port, testCase.openErrs)
 				hostnames, _ := network.opened()
 				assert.Equal(t, expectedHostnames, hostnames)
-				assert.Equal(t, testCase.serverRequests, serverRequests.Load())
 
 				err = transport.cleanup()
 
-				if len(testCase.cleanupErrs) == 0 {
+				if len(testCase.cleanupErrMessages) == 0 {
 					assert.NoError(t, err)
 				}
-				for _, cleanupErr := range testCase.cleanupErrs {
-					assert.ErrorIs(t, err, testCase.cleanupErr)
-					assert.ErrorContains(t, err, cleanupErr)
+				for _, cleanupErrMessage := range testCase.cleanupErrMessages {
+					assert.ErrorIs(t, err, testErr)
+					assert.ErrorContains(t, err, cleanupErrMessage)
 				}
 				_, cleanups := network.opened()
 				assert.Equal(t, expectedCleanups, cleanups, "each connection must be cleaned up once")
@@ -426,64 +311,73 @@ func expectedOpened(hosts []string, port string, openErrs map[uint]error) (
 	return hostnames, cleanups
 }
 
-// checkTransportTestRequest sends the test request, a GET request if
-// it has no body, or a POST request with its body otherwise, and checks
-// the outcome.
-func checkTransportTestRequest(t *testing.T, server *httptest.Server, network *fakeNetwork,
+// checkTransportTestRequest sends the test GET request and checks its outcome,
+// and that the connections it opened are cleaned up only once done with.
+func checkTransportTestRequest(t *testing.T, serverPort string, network *fakeNetwork,
 	httpClient *http.Client, protoMajor int, testRequest transportTestRequest,
 ) {
 	t.Helper()
 
-	if testRequest.closeConnectionsBefore {
-		server.CloseClientConnections()
-		network.waitClosed(t)
-	}
 	scheme := "https"
 	if testRequest.scheme != "" {
 		scheme = testRequest.scheme
 	}
 	host := testRequest.host
 	if !testRequest.defaultPort {
-		_, port, err := net.SplitHostPort(server.Listener.Addr().String())
-		require.NoError(t, err)
-		host = net.JoinHostPort(testRequest.host, port)
+		host = net.JoinHostPort(testRequest.host, serverPort)
 	}
 	requestURL := url.URL{Scheme: scheme, Host: host, Path: testRequest.path}
-
-	method := http.MethodGet
-	var body io.Reader
-	expectedBody := "GET "
-	if testRequest.body != nil {
-		method = http.MethodPost
-		body = strings.NewReader(*testRequest.body)
-		if testRequest.notReplayable {
-			// The request GetBody field is only set for known body types.
-			body = io.NopCloser(body)
-		}
-		expectedBody = "POST " + *testRequest.body
-	}
-	request, err := http.NewRequestWithContext(t.Context(), method, requestURL.String(), body)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, requestURL.String(), nil)
 	require.NoError(t, err)
-	if testRequest.getBodyErr != nil {
-		request.GetBody = func() (io.ReadCloser, error) {
-			return nil, testRequest.getBodyErr
-		}
-	}
+
+	_, cleanupsBefore := network.opened()
 
 	response, err := httpClient.Do(request)
 
+	_, cleanups := network.opened()
+	newCleanups := cleanups[len(cleanupsBefore):]
+	require.Len(t, newCleanups, int(testRequest.opens))
 	if testRequest.errMessage != "" {
 		if testRequest.errWrapped != nil {
 			assert.ErrorIs(t, err, testRequest.errWrapped)
 		}
 		assert.ErrorContains(t, err, testRequest.errMessage)
+		for i, cleanup := range newCleanups {
+			openIndex := uint(len(cleanupsBefore) + i)
+			if network.openErrs[openIndex] != nil {
+				assert.Zero(t, cleanup, "a connection failing to open must not be cleaned up")
+				continue
+			}
+			assert.Equal(t, uint(1), cleanup, "a failed request connection must be cleaned up")
+		}
 		return
 	}
 	require.NoError(t, err)
+	last := len(newCleanups) - 1
+	for _, cleanup := range newCleanups[:last] {
+		assert.Equal(t, uint(1), cleanup, "a redirect response connection must be cleaned up")
+	}
+	assert.Zero(t, newCleanups[last], "the connection must not be cleaned up before the body is closed")
+
 	responseBody, err := io.ReadAll(response.Body)
 	require.NoError(t, err)
-	err = response.Body.Close()
-	require.NoError(t, err)
 	assert.Equal(t, protoMajor, response.ProtoMajor)
+	expectedBody := testRequest.path
+	if expectedBody == "" || expectedBody == "/redirect" {
+		expectedBody = "/"
+	}
 	assert.Equal(t, expectedBody, string(responseBody))
+
+	if testRequest.keepBodyOpen {
+		return
+	}
+	err = response.Body.Close()
+	if testRequest.closeErrMessage == "" {
+		assert.NoError(t, err)
+	} else {
+		assert.ErrorContains(t, err, testRequest.closeErrMessage)
+	}
+	_, cleanups = network.opened()
+	assert.Equal(t, uint(1), cleanups[len(cleanupsBefore)+last],
+		"the connection must be cleaned up once the body is closed")
 }
