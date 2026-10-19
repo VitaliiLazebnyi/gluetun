@@ -157,7 +157,7 @@ func newCookieJar(authURL *url.URL, authCookies map[string]string) *cookiejar.Ja
 	jar, _ := cookiejar.New(nil) // never returns an error
 	cookies := make([]*http.Cookie, 0, len(authCookies))
 	for name, value := range authCookies {
-		cookies = append(cookies, &http.Cookie{Name: name, Value: value, Path: "/"})
+		cookies = append(cookies, &http.Cookie{Name: name, Value: value, Path: "/"}) //nolint:gosec // client-side cookie jar
 	}
 	jar.SetCookies(authURL, cookies)
 	return jar

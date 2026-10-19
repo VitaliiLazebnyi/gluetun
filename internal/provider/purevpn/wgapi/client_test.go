@@ -162,7 +162,7 @@ func (f *fakePureVPN) issueToken(writer http.ResponseWriter, request *http.Reque
 	f.counters.tokens++
 	f.latestToken = makeJWT(time.Now().Add(time.Hour), f.counters.tokens)
 	f.validTokens[f.latestToken] = true
-	http.SetCookie(writer, &http.Cookie{Name: "fusionauth.sso", Value: testSSOCookie, Path: "/"})
+	http.SetCookie(writer, &http.Cookie{Name: "fusionauth.sso", Value: testSSOCookie, Path: "/"}) //nolint:gosec
 	http.Redirect(writer, request, "/v2/api/fusionauth/login?code=abc", http.StatusFound)
 }
 
@@ -216,7 +216,7 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	case "POST /oauth2/two-factor":
 		f.serveTwoFactorCode(writer, request)
 	case "GET /v2/api/fusionauth/login":
-		http.SetCookie(writer, &http.Cookie{Name: accessToken, Value: f.latestToken, Path: "/"})
+		http.SetCookie(writer, &http.Cookie{Name: accessToken, Value: f.latestToken, Path: "/"}) //nolint:gosec
 		http.Redirect(writer, request, "/v2/dashboard", http.StatusFound)
 	case "GET /v2/dashboard":
 		fmt.Fprint(writer, "<html>dashboard</html>")
@@ -272,7 +272,7 @@ func (f *fakePureVPN) serveTwoFactorCode(writer http.ResponseWriter, request *ht
 		f.writeTwoFactorPage(writer, `<div class="error">Invalid code</div>`)
 		return
 	}
-	http.SetCookie(writer, &http.Cookie{Name: "fusionauth.trust", Value: "trusted", Path: "/"})
+	http.SetCookie(writer, &http.Cookie{Name: "fusionauth.trust", Value: "trusted", Path: "/"}) //nolint:gosec
 	f.issueToken(writer, request)
 }
 
@@ -1116,10 +1116,10 @@ func Test_Client_saveSession(t *testing.T) {
 		Credentials{}, Session{})
 	require.NoError(t, err)
 	client.httpClient.Jar.SetCookies(client.authURL, []*http.Cookie{
-		{Name: "fusionauth.sso", Value: "general", Path: "/"},
-		{Name: "fusionauth.sso", Value: "specific", Path: "/oauth2"},
-		{Name: "fusionauth.trust", Value: "trusted", Path: "/"},
-		{Name: "other", Value: "x", Path: "/"},
+		{Name: "fusionauth.sso", Value: "general", Path: "/"},        //nolint:gosec // client-side cookie jar
+		{Name: "fusionauth.sso", Value: "specific", Path: "/oauth2"}, //nolint:gosec // client-side cookie jar
+		{Name: "fusionauth.trust", Value: "trusted", Path: "/"},      //nolint:gosec // client-side cookie jar
+		{Name: "other", Value: "x", Path: "/"},                       //nolint:gosec // client-side cookie jar
 	})
 
 	client.saveSession("token")
