@@ -665,7 +665,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			},
 			credentials: credentials,
 			errWrapped:  errUnexpectedResponse,
-			errMessage:  "getting WireGuard server: unexpected response from PureVPN: no WireGuard configuration",
+			errMessage:  "getting Wireguard server: unexpected response from PureVPN: no Wireguard configuration",
 			authCookies: ssoCookies,
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},

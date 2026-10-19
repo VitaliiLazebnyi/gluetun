@@ -12,13 +12,13 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// Config is the WireGuard configuration returned by PureVPN.
+// Config is the Wireguard configuration returned by PureVPN.
 // The client private key is not part of it, since PureVPN
 // returns a {clientPrivateKey} placeholder in its place.
 type Config struct {
 	// Addresses are the interface addresses assigned to the client.
 	Addresses []netip.Prefix
-	// ServerPublicKey is the WireGuard public key of the server.
+	// ServerPublicKey is the Wireguard public key of the server.
 	ServerPublicKey wgtypes.Key
 	// EndpointHost is the server endpoint host, either an IP
 	// address or a hostname.
@@ -52,7 +52,7 @@ var (
 	errEndpointMissing  = errors.New("peer endpoint is missing")
 )
 
-// parseConfig parses a wg-quick style WireGuard configuration.
+// parseConfig parses a wg-quick style Wireguard configuration.
 func parseConfig(content string) (config Config, err error) {
 	section := ""
 	for line := range strings.Lines(content) {

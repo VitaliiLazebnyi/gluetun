@@ -1,5 +1,5 @@
 // Package wgapi implements a client for the undocumented PureVPN
-// member area API used to generate WireGuard configurations.
+// member area API used to generate Wireguard configurations.
 // PureVPN does not provide an official API, so the endpoints and
 // login flow were reverse engineered from https://my.purevpn.com
 // and may change without notice.

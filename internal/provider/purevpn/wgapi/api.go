@@ -14,7 +14,7 @@ import (
 	"strings"
 )
 
-// ServerRequest contains the parameters to request a WireGuard server.
+// ServerRequest contains the parameters to request a Wireguard server.
 type ServerRequest struct {
 	// CountryCode is the uppercase ISO 3166 alpha-2 country code, for example "US".
 	CountryCode string
@@ -26,12 +26,12 @@ type ServerRequest struct {
 	// VPNUsername is the optional VPN username (purevpn0sXXXXX)
 	// to use, if the subscription has more than one.
 	VPNUsername string
-	// ClientPublicKey is the WireGuard public key of the client,
+	// ClientPublicKey is the Wireguard public key of the client,
 	// whose private key never leaves the client.
 	ClientPublicKey string
 }
 
-// FetchConfig logs in if needed and requests a WireGuard configuration.
+// FetchConfig logs in if needed and requests a Wireguard configuration.
 // If the API rejects the stored access token, it logs in again once and
 // retries. An access token obtained by logging in during this call is not
 // retried, since logging in again would only double the login attempts.
@@ -73,7 +73,7 @@ func (c *Client) fetchConfig(ctx context.Context, token string, request ServerRe
 	config, err = c.getWireguardServer(ctx, token, request, subscriptionID,
 		vpnUsername, encryptedPassword)
 	if err != nil {
-		return Config{}, fmt.Errorf("getting WireGuard server: %w", err)
+		return Config{}, fmt.Errorf("getting Wireguard server: %w", err)
 	}
 	return config, nil
 }
@@ -270,12 +270,12 @@ func (c *Client) getWireguardServer(ctx context.Context, token string,
 		return Config{}, err
 	}
 	if len(servers) == 0 || servers[0].Configuration == "" {
-		return Config{}, fmt.Errorf("%w: no WireGuard configuration in response", errUnexpectedResponse)
+		return Config{}, fmt.Errorf("%w: no Wireguard configuration in response", errUnexpectedResponse)
 	}
 
 	config, err = parseConfig(servers[0].Configuration)
 	if err != nil {
-		return Config{}, fmt.Errorf("%w: parsing WireGuard configuration: %w", errUnexpectedResponse, err)
+		return Config{}, fmt.Errorf("%w: parsing Wireguard configuration: %w", errUnexpectedResponse, err)
 	}
 	if servers[0].ProtocolIP != "" {
 		protocolIP, err := netip.ParseAddr(servers[0].ProtocolIP)
