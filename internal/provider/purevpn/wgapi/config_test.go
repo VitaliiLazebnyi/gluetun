@@ -1,0 +1,144 @@
+package wgapi
+
+import (
+	"net/netip"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+)
+
+func Test_parseConfig(t *testing.T) {
+	t.Parallel()
+
+	serverKey, err := wgtypes.ParseKey(testServerKey)
+	require.NoError(t, err)
+
+	testCases := map[string]struct {
+		content    string
+		config     Config
+		errMessage string
+	}{
+		"full": {
+			content: "[Interface]\nPrivateKey = {clientPrivateKey}\n" +
+				"Address = 10.14.0.3/32, fd00::3/128\nDNS = 1.1.1.1\n\n" +
+				"[Peer]\n# comment\nPublicKey = " + testServerKey + "\n" +
+				"AllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.1:51820\n",
+			config: Config{
+				Addresses: []netip.Prefix{
+					netip.MustParsePrefix("10.14.0.3/32"),
+					netip.MustParsePrefix("fd00::3/128"),
+				},
+				ServerPublicKey: serverKey,
+				EndpointHost:    "198.51.100.1",
+				EndpointPort:    51820,
+			},
+		},
+		"keepalive": {
+			content: "[Interface]\nAddress=172.21.6.133,\nNoValue\n[Peer]\nPublicKey=" + testServerKey +
+				"\nEndpoint=host.example:51820\nPersistentKeepalive=25",
+			config: Config{
+				Addresses:           []netip.Prefix{netip.MustParsePrefix("172.21.6.133/32")},
+				ServerPublicKey:     serverKey,
+				EndpointHost:        "host.example",
+				EndpointPort:        51820,
+				PersistentKeepalive: 25 * time.Second,
+			},
+		},
+		"unterminated_section_header_ignored": {
+			content: "[Interface]\nAddress=10.0.0.1\n[Peer\n[Peer]\nPublicKey=" + testServerKey +
+				"\nEndpoint=1.2.3.4:51820",
+			config: Config{
+				Addresses:       []netip.Prefix{netip.MustParsePrefix("10.0.0.1/32")},
+				ServerPublicKey: serverKey,
+				EndpointHost:    "1.2.3.4",
+				EndpointPort:    51820,
+			},
+		},
+		"missing_address": {
+			content:    "[Peer]\nPublicKey=" + testServerKey + "\nEndpoint=1.2.3.4:51820",
+			errMessage: "interface address is missing",
+		},
+		"invalid_public_key": {
+			content:    "[Interface]\nAddress=10.0.0.1\n[Peer]\nPublicKey=abc\nEndpoint=1.2.3.4:51820",
+			errMessage: "parsing peer publickey: wgtypes: failed to parse base64-encoded key",
+		},
+		"invalid_address": {
+			content:    "[Interface]\nAddress=10.0.0.300\n",
+			errMessage: "parsing interface address: parsing address: ParseAddr(\"10.0.0.300\")",
+		},
+		"invalid_prefix": {
+			content:    "[Interface]\nAddress=10.0.0.1/33\n",
+			errMessage: "parsing interface address: parsing prefix: netip.ParsePrefix(\"10.0.0.1/33\")",
+		},
+		"invalid_endpoint": {
+			content:    "[Peer]\nEndpoint=1.2.3.4\n",
+			errMessage: "parsing peer endpoint: splitting host and port: address 1.2.3.4: missing port in address",
+		},
+		"invalid_endpoint_port": {
+			content:    "[Peer]\nEndpoint=1.2.3.4:70000\n",
+			errMessage: "parsing peer endpoint: parsing port: strconv.ParseUint",
+		},
+		"invalid_persistent_keepalive": {
+			content:    "[Peer]\nPersistentKeepalive=-1\n",
+			errMessage: "parsing peer persistentkeepalive: strconv.ParseUint",
+		},
+		"missing_public_key": {
+			content:    "[Interface]\nAddress=10.0.0.1\n[Peer]\nEndpoint=1.2.3.4:51820",
+			errMessage: "peer public key is missing",
+		},
+		"missing_endpoint": {
+			content:    "[Interface]\nAddress=10.0.0.1\n[Peer]\nPublicKey=" + testServerKey,
+			errMessage: "peer endpoint is missing",
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			config, err := parseConfig(testCase.content)
+			if testCase.errMessage != "" {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, testCase.errMessage)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, testCase.config, config)
+		})
+	}
+}
+
+func Test_Config_EndpointIP(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		config Config
+		ip     netip.Addr
+		ok     bool
+	}{
+		"protocol_ip": {
+			config: Config{EndpointHost: "198.51.100.1", ProtocolIP: netip.MustParseAddr("203.0.113.7")},
+			ip:     netip.MustParseAddr("203.0.113.7"),
+			ok:     true,
+		},
+		"endpoint_host_ip": {
+			config: Config{EndpointHost: "::ffff:198.51.100.1"},
+			ip:     netip.MustParseAddr("198.51.100.1"),
+			ok:     true,
+		},
+		"endpoint_hostname": {
+			config: Config{EndpointHost: "host.example"},
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ip, ok := testCase.config.EndpointIP()
+			assert.Equal(t, testCase.ip, ip)
+			assert.Equal(t, testCase.ok, ok)
+		})
+	}
+}

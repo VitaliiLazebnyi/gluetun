@@ -7,6 +7,7 @@ import (
 
 	"github.com/qdm12/gluetun/internal/configuration/settings/helpers"
 	"github.com/qdm12/gluetun/internal/configuration/settings/validation"
+	"github.com/qdm12/gluetun/internal/constants"
 	"github.com/qdm12/gluetun/internal/constants/providers"
 	"github.com/qdm12/gluetun/internal/constants/vpn"
 	"github.com/qdm12/gluetun/internal/models"
@@ -92,22 +93,33 @@ func (ss *ServerSelection) validate(vpnServiceProvider string,
 		return fmt.Errorf("the selection mode specified is not valid: %w", err)
 	}
 
-	filterChoices, err := getLocationFilterChoices(vpnServiceProvider, ss, filterChoicesGetter, warner)
-	if err != nil {
-		return err // already wrapped error
-	}
+	if vpnServiceProvider == providers.Purevpn && ss.VPN == vpn.Wireguard {
+		// PureVPN Wireguard servers are not in the servers data, which only
+		// contains PureVPN OpenVPN servers, so the location filters are
+		// validated independently of it.
+		err = validatePureVPNWireguard(*ss, warner)
+		if err != nil {
+			return fmt.Errorf("for VPN service provider %s: %w", vpnServiceProvider, err)
+		}
+	} else {
+		var filterChoices models.FilterChoices
+		filterChoices, err = getLocationFilterChoices(vpnServiceProvider, ss, filterChoicesGetter, warner)
+		if err != nil {
+			return err // already wrapped error
+		}
 
-	// Retro-compatibility
-	switch vpnServiceProvider {
-	case providers.Nordvpn:
-		*ss = nordvpnRetroRegion(*ss, filterChoices.Regions, filterChoices.Countries)
-	case providers.Surfshark:
-		*ss = surfsharkRetroRegion(*ss)
-	}
+		// Retro-compatibility
+		switch vpnServiceProvider {
+		case providers.Nordvpn:
+			*ss = nordvpnRetroRegion(*ss, filterChoices.Regions, filterChoices.Countries)
+		case providers.Surfshark:
+			*ss = surfsharkRetroRegion(*ss)
+		}
 
-	err = validateServerFilters(*ss, filterChoices, vpnServiceProvider, warner)
-	if err != nil {
-		return fmt.Errorf("for VPN service provider %s: %w", vpnServiceProvider, err)
+		err = validateServerFilters(*ss, filterChoices, vpnServiceProvider, warner)
+		if err != nil {
+			return fmt.Errorf("for VPN service provider %s: %w", vpnServiceProvider, err)
+		}
 	}
 
 	err = validateSubscriptionTierFilters(*ss, vpnServiceProvider)
@@ -132,6 +144,48 @@ func (ss *ServerSelection) validate(vpnServiceProvider string,
 		}
 	}
 
+	return nil
+}
+
+// validatePureVPNWireguard validates the server selection for PureVPN
+// Wireguard, for which the server location is only selected with a
+// single country and the PureVPN city ID setting. Other location
+// filters are ignored with a warning, whatever their values.
+func validatePureVPNWireguard(ss ServerSelection, warner Warner) (err error) {
+	switch {
+	case len(ss.Countries) == 0:
+		return errors.New("exactly one country must be set with PureVPN Wireguard, but got none")
+	case len(ss.Countries) > 1:
+		return fmt.Errorf("exactly one country must be set with PureVPN Wireguard, but got %d: %s",
+			len(ss.Countries), strings.Join(ss.Countries, ", "))
+	}
+	_, ok := constants.CountryNameToCode(ss.Countries[0])
+	if !ok {
+		return fmt.Errorf("country code not found for country %q", ss.Countries[0])
+	}
+
+	filters := [...]struct {
+		name string
+		set  bool
+	}{
+		{name: "regions", set: len(ss.Regions) > 0},
+		{name: "cities", set: len(ss.Cities) > 0},
+		{name: "ISPs", set: len(ss.ISPs) > 0},
+		{name: "names", set: len(ss.Names) > 0},
+		{name: "numbers", set: len(ss.Numbers) > 0},
+		{name: "hostnames", set: len(ss.Hostnames) > 0},
+		{name: "categories", set: len(ss.Categories) > 0},
+	}
+	var setFilterNames []string
+	for _, filter := range filters {
+		if filter.set {
+			setFilterNames = append(setFilterNames, filter.name)
+		}
+	}
+	if len(setFilterNames) > 0 {
+		warner.Warn("server selection filters " + strings.Join(setFilterNames, ", ") +
+			" are ignored with PureVPN Wireguard, use PUREVPN_CITY_ID to select a city")
+	}
 	return nil
 }
 
