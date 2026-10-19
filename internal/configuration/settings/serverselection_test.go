@@ -10,12 +10,6 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
-type noopFilterChoicesGetter struct{}
-
-func (noopFilterChoicesGetter) GetFilterChoices(string) models.FilterChoices {
-	return models.FilterChoices{}
-}
-
 func Test_ServerSelection_setDefaults_mode(t *testing.T) {
 	t.Parallel()
 
@@ -73,12 +67,17 @@ func Test_ServerSelection_validate_mode(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			ctrl := gomock.NewController(t)
+			filterChoicesGetter := NewMockFilterChoicesGetter(ctrl)
+			if testCase.errMessage == "" {
+				filterChoicesGetter.EXPECT().GetFilterChoices(providers.Mullvad).
+					Return(models.FilterChoices{}).Times(1)
+			}
 			warner := NewMockWarner(ctrl)
 
 			ss := ServerSelection{}.WithDefaults(providers.Mullvad)
 			ss.Mode = testCase.mode
 
-			err := ss.validate(providers.Mullvad, noopFilterChoicesGetter{}, warner)
+			err := ss.validate(providers.Mullvad, filterChoicesGetter, warner)
 
 			if testCase.errMessage != "" {
 				assert.ErrorContains(t, err, testCase.errMessage)

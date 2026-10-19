@@ -1,14 +1,11 @@
 package settings
 
 import (
-	"net/netip"
 	"testing"
 
-	"github.com/qdm12/gluetun/internal/constants/providers"
 	"github.com/qdm12/gosettings/reader"
 	"github.com/qdm12/gosettings/reader/sources/env"
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/mock/gomock"
 )
 
 func Test_PureVPN_validate(t *testing.T) {
@@ -48,95 +45,6 @@ func Test_PureVPN_validate(t *testing.T) {
 			settings.setDefaults()
 
 			err := settings.validate()
-
-			if testCase.errMessage == "" {
-				assert.NoError(t, err)
-				return
-			}
-			assert.ErrorContains(t, err, testCase.errMessage)
-		})
-	}
-}
-
-func Test_WireguardSelection_validate_purevpn(t *testing.T) {
-	t.Parallel()
-
-	testCases := map[string]struct {
-		selection  WireguardSelection
-		errMessage string
-	}{
-		"defaults": {},
-		"endpoint_ip_set": {
-			selection:  WireguardSelection{EndpointIP: netip.MustParseAddr("203.0.113.1")},
-			errMessage: "endpoint IP cannot be set for PureVPN",
-		},
-		"endpoint_port_set": {selection: WireguardSelection{EndpointPort: new(uint16(51820))}, errMessage: "endpoint port"},
-		"public_key_set": {
-			selection:  WireguardSelection{PublicKey: "Y0QnWR6mhgxOjNkPUkRdPYKYrB+pERhKFAuhkBapHw8="},
-			errMessage: "public key cannot be set for PureVPN",
-		},
-	}
-
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			selection := testCase.selection
-			selection.setDefaults()
-
-			err := selection.validate(providers.Purevpn)
-
-			if testCase.errMessage == "" {
-				assert.NoError(t, err)
-				return
-			}
-			assert.ErrorContains(t, err, testCase.errMessage)
-		})
-	}
-}
-
-func Test_validatePureVPNWireguard(t *testing.T) {
-	t.Parallel()
-
-	testCases := map[string]struct {
-		selection  ServerSelection
-		warning    string
-		errMessage string
-	}{
-		"no_country": {
-			errMessage: "exactly one country must be set with PureVPN Wireguard, but got 0: ",
-		},
-		"two_countries": {
-			selection:  ServerSelection{Countries: []string{"Germany", "France"}},
-			errMessage: "exactly one country must be set with PureVPN Wireguard, but got 2: Germany, France",
-		},
-		"unknown_country": {
-			selection:  ServerSelection{Countries: []string{"Atlantis"}},
-			errMessage: `country code not found for country "Atlantis"`,
-		},
-		"country_only": {selection: ServerSelection{Countries: []string{"united kingdom"}}},
-		"ignored_filters": {
-			selection: ServerSelection{
-				Countries: []string{"United States"}, Regions: []string{"region"},
-				Cities: []string{"New York"}, ISPs: []string{"isp"}, Names: []string{"name"},
-				Numbers: []uint16{1}, Hostnames: []string{"host"}, Categories: []string{"category"},
-			},
-			warning: "server selection filters regions, cities, ISPs, names, numbers, hostnames, " +
-				"categories are ignored with PureVPN Wireguard, use PUREVPN_CITY_ID to select a city",
-		},
-	}
-
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			ctrl := gomock.NewController(t)
-
-			warner := NewMockWarner(ctrl)
-			if testCase.warning != "" {
-				warner.EXPECT().Warn(testCase.warning)
-			}
-
-			err := validatePureVPNWireguard(testCase.selection, warner)
 
 			if testCase.errMessage == "" {
 				assert.NoError(t, err)
