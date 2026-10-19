@@ -168,7 +168,9 @@ func waitFor(ctx context.Context, duration time.Duration) error {
 }
 
 func totpCode(secret string, now time.Time) (code string, err error) {
-	secret = strings.ToUpper(strings.ReplaceAll(secret, " ", ""))
+	// The padding is removed since the library adds its own padding
+	// to the secret, and it uppercases the secret.
+	secret = strings.TrimRight(strings.ReplaceAll(secret, " ", ""), "=")
 	code, err = totp.GenerateCode(secret, now)
 	if err != nil {
 		return "", fmt.Errorf("generating two-factor code from TOTP secret: %w", err)

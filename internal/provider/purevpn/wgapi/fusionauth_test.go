@@ -9,7 +9,9 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -89,6 +91,56 @@ func Test_parseHTML(t *testing.T) {
 			forms, errorMessages := parseHTML([]byte(testCase.body))
 			assert.Equal(t, testCase.forms, forms)
 			assert.Equal(t, testCase.errorMessages, errorMessages)
+		})
+	}
+}
+
+func Test_totpCode(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_000_000, 0)
+	testCases := map[string]struct {
+		secret         string
+		expectedSecret string
+		errMessage     string
+	}{
+		"unpadded": {
+			secret:         testTOTPSecret,
+			expectedSecret: testTOTPSecret,
+		},
+		"lowercase_with_spaces": { //nolint:gosec // test value
+			secret:         "jbsw y3dp ehpk 3pxp",
+			expectedSecret: testTOTPSecret,
+		},
+		"extra_padding": {
+			secret:         testTOTPSecret + "====",
+			expectedSecret: testTOTPSecret,
+		},
+		"padded": { //nolint:gosec // test value
+			secret:         "JBSWY3DPEE======",
+			expectedSecret: "JBSWY3DPEE",
+		},
+		"invalid_secret": {
+			secret:     "INVALID1",
+			errMessage: "generating two-factor code from TOTP secret: Decoding of secret as base32 failed.",
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			code, err := totpCode(testCase.secret, now)
+
+			if testCase.errMessage != "" {
+				assert.ErrorContains(t, err, testCase.errMessage)
+				assert.Empty(t, code)
+				return
+			}
+			require.NoError(t, err)
+			expectedCode, err := totp.GenerateCode(testCase.expectedSecret, now)
+			require.NoError(t, err)
+			assert.Equal(t, expectedCode, code)
 		})
 	}
 }
