@@ -61,6 +61,7 @@ type fakePureVPN struct {
 	rejectToken         string            // API rejects this access token once
 	ssoDisabled         bool              // ignore the single sign-on cookie
 	pages               map[string]string // HTML page served for "METHOD /path"
+	challengePath       string            // path answered with a Cloudflare challenge
 	// State
 	counters    fakeCounters
 	latestToken string
@@ -72,6 +73,7 @@ type fakeCounters struct {
 	passwordLogins  uint
 	twoFactorLogins uint
 	tokens          uint
+	dashboardPages  uint
 }
 
 type fakeResponse struct {
@@ -195,6 +197,11 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		http.SetCookie(writer, &http.Cookie{Name: accessToken, Value: f.latestToken, Path: "/"}) //nolint:gosec
 		http.Redirect(writer, request, "/v2/dashboard", http.StatusFound)
 	case "GET /v2/dashboard":
+		f.counters.dashboardPages++
+		if f.challengePath == request.URL.Path {
+			writeCloudflareChallenge(writer)
+			return
+		}
 		fmt.Fprint(writer, "<html>dashboard</html>")
 	default:
 		f.serveAPI(writer, request)
@@ -217,6 +224,13 @@ func (f *fakePureVPN) serveAuthorizePage(writer http.ResponseWriter, request *ht
 
 func writeCloudflareBlock(writer http.ResponseWriter) {
 	writer.Header().Set("Server", "cloudflare")
+	writer.WriteHeader(http.StatusForbidden)
+	fmt.Fprint(writer, "<html><title>Just a moment...</title></html>")
+}
+
+func writeCloudflareChallenge(writer http.ResponseWriter) {
+	writer.Header().Set("Server", "cloudflare")
+	writer.Header().Set("Cf-Mitigated", "challenge")
 	writer.WriteHeader(http.StatusForbidden)
 	fmt.Fprint(writer, "<html><title>Just a moment...</title></html>")
 }
@@ -636,6 +650,22 @@ func Test_Client_FetchConfig(t *testing.T) {
 			errWrapped:  errUnexpectedResponse,
 			errMessage:  "parsing protocol IP",
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"challenged_page_after_login": {
+			// The page after the access token is set is not requested.
+			setup:       func(fake *fakePureVPN) { fake.challengePath = "/v2/dashboard" },
+			credentials: credentials,
+			authCookies: ssoCookies,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"challenged_page_after_two_factor_login": {
+			setup: func(fake *fakePureVPN) {
+				fake.twoFactor = true
+				fake.challengePath = "/v2/dashboard"
+			},
+			credentials: credentialsWithTOTP,
+			authCookies: trustedCookies,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1, tokens: 1},
 		},
 		"no_city_id": {
 			setup:       func(fake *fakePureVPN) { fake.noCityID = true },

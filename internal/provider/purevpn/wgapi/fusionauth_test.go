@@ -314,3 +314,82 @@ func Test_Client_doAuthRequest(t *testing.T) {
 		})
 	}
 }
+
+func Test_Client_accessTokenSet(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		loginChallenged    bool
+		apiRequest         bool
+		pagePath           string
+		redirectedRequests uint
+	}{
+		"auth_redirect_not_followed": {
+			pagePath: "/login",
+		},
+		"auth_challenge_ignored": {
+			loginChallenged: true,
+			pagePath:        "/login",
+		},
+		"api_redirect_followed": {
+			apiRequest:         true,
+			redirectedRequests: 1,
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			redirectedRequests := uint(0)
+			var mutex sync.Mutex
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/oauth2/authorize":
+					http.Redirect(writer, request, "/login", http.StatusFound)
+				case "/login":
+					http.SetCookie(writer, &http.Cookie{Name: accessToken, Value: "token", Path: "/"}) //nolint:gosec
+					if testCase.loginChallenged {
+						writeCloudflareChallenge(writer)
+						return
+					}
+					http.Redirect(writer, request, "/redirected", http.StatusFound)
+				case "/v2/api/test":
+					http.Redirect(writer, request, "/redirected", http.StatusFound)
+				case "/redirected":
+					mutex.Lock()
+					redirectedRequests++
+					mutex.Unlock()
+					if request.Header.Get("Authorization") == "" {
+						writeCloudflareChallenge(writer)
+						return
+					}
+					fmt.Fprint(writer, `{"status":true}`)
+				default:
+					t.Errorf("unexpected request path %s", request.URL.Path)
+				}
+			}))
+			t.Cleanup(server.Close)
+			// The auth and app URLs are on the same host, so the auth
+			// flow is told apart from API requests by the Authorization header.
+			client := newTestClient(t, server.URL, Credentials{}, Session{})
+
+			if testCase.apiRequest {
+				client.httpClient.Jar.SetCookies(client.appURL, []*http.Cookie{
+					{Name: accessToken, Value: "token", Path: "/"}, //nolint:gosec // client-side cookie jar
+				})
+				err := client.apiRequest(t.Context(), "token", "/v2/api/test", nil, nil)
+				assert.NoError(t, err)
+			} else {
+				page, err := client.doAuthRequest(t.Context(), http.MethodGet, server.URL+"/oauth2/authorize", nil)
+				require.NoError(t, err)
+				assert.Equal(t, testCase.pagePath, page.url.Path)
+				assert.Empty(t, page.forms)
+			}
+
+			assert.Equal(t, "token", client.getAccessTokenCookie())
+			mutex.Lock()
+			assert.Equal(t, testCase.redirectedRequests, redirectedRequests)
+			mutex.Unlock()
+		})
+	}
+}

@@ -108,6 +108,11 @@ func New(httpClient *http.Client, authURL, appURL string,
 	httpClientCopy.CheckRedirect = func(request *http.Request, via []*http.Request) error {
 		err := client.checkHost(request.URL)
 		switch {
+		case isAuthRequest(via[0], client.authURL) && client.getAccessTokenCookie() != "":
+			// Logged in, so stop following the auth flow redirects: the
+			// next page, such as the member area dashboard, is not needed
+			// and can be blocked by a Cloudflare challenge.
+			return http.ErrUseLastResponse
 		case err != nil:
 			return fmt.Errorf("redirect: %w", err)
 		case httpClient.CheckRedirect != nil:
@@ -137,6 +142,13 @@ func (c *Client) checkHost(target *url.URL) error {
 		}
 	}
 	return fmt.Errorf("%w: %s", errHostNotAllowed, target.Host)
+}
+
+// isAuthRequest returns true if the request given is an auth flow
+// request, which is sent to the auth host without an access token,
+// unlike member area API requests.
+func isAuthRequest(request *http.Request, authURL *url.URL) bool {
+	return request.URL.Host == authURL.Host && request.Header.Get("Authorization") == ""
 }
 
 // Session returns a copy of the current session.

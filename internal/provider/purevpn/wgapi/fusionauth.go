@@ -211,8 +211,8 @@ func (c *Client) submitForm(ctx context.Context, page *htmlPage,
 	return c.doAuthRequest(ctx, http.MethodPost, action.String(), values)
 }
 
-// doAuthRequest does a request to the auth server, following redirects,
-// and returns the final HTML page.
+// doAuthRequest does a request to the auth server, following redirects
+// until the access token cookie is set, and returns the final HTML page.
 func (c *Client) doAuthRequest(ctx context.Context, method, rawURL string,
 	form url.Values,
 ) (page *htmlPage, err error) {
@@ -238,15 +238,16 @@ func (c *Client) doAuthRequest(ctx context.Context, method, rawURL string,
 		return nil, err
 	}
 
+	page = &htmlPage{url: response.Request.URL}
+	if c.getAccessTokenCookie() != "" {
+		// Logged in, the final page content does not matter, and it
+		// can be a redirect response or a Cloudflare challenge page.
+		return page, nil
+	}
+
 	err = checkBlocked(response, responseBody)
 	if err != nil {
 		return nil, err
-	}
-
-	page = &htmlPage{url: response.Request.URL}
-	if c.getAccessTokenCookie() != "" {
-		// Logged in, the final page content does not matter.
-		return page, nil
 	}
 
 	if response.StatusCode >= http.StatusInternalServerError {
