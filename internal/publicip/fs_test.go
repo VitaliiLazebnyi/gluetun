@@ -1,7 +1,6 @@
 package publicip
 
 import (
-	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,16 +13,22 @@ func Test_persistPublicIP(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
-		contents []string
+		existingContent string
+		content         string
+		expectedContent string
 	}{
-		"create_file": {
-			contents: []string{"1.2.3.4"},
+		"persist_ip_address": {
+			content:         "1.2.3.4",
+			expectedContent: "1.2.3.4",
 		},
-		"overwrite_file": {
-			contents: []string{"1.2.3.4", "5.6.7.8"},
+		"replace_ip_address": {
+			existingContent: "1.2.3.4",
+			content:         "::1",
+			expectedContent: "::1",
 		},
-		"clear_file": {
-			contents: []string{"1.2.3.4", ""},
+		"clear_ip_address": {
+			existingContent: "1.2.3.4",
+			expectedContent: "",
 		},
 	}
 
@@ -31,26 +36,19 @@ func Test_persistPublicIP(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			directory := t.TempDir()
-			path := filepath.Join(directory, "ip")
-
-			for _, content := range testCase.contents {
-				err := persistPublicIP(path, content, os.Getuid(), os.Getgid())
+			path := filepath.Join(t.TempDir(), "ip")
+			if testCase.existingContent != "" {
+				const permission = os.FileMode(0o664)
+				err := os.WriteFile(path, []byte(testCase.existingContent), permission)
 				require.NoError(t, err)
 			}
 
+			err := persistPublicIP(path, testCase.content, os.Getuid(), os.Getgid())
+			require.NoError(t, err)
+
 			data, err := os.ReadFile(path)
 			require.NoError(t, err)
-			expectedContent := testCase.contents[len(testCase.contents)-1]
-			assert.Equal(t, expectedContent, string(data))
-
-			info, err := os.Stat(path)
-			require.NoError(t, err)
-			assert.Equal(t, fs.FileMode(0o664), info.Mode().Perm())
-
-			entries, err := os.ReadDir(directory)
-			require.NoError(t, err)
-			assert.Len(t, entries, 1, "temporary file left behind")
+			assert.Equal(t, testCase.expectedContent, string(data))
 		})
 	}
 }

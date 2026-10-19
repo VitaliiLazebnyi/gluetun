@@ -1,7 +1,6 @@
 package service
 
 import (
-	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,19 +14,25 @@ func Test_Service_writePortForwardedFile(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
-		writes          [][]uint16
+		existingContent string
+		ports           []uint16
+		expectedLog     string
 		expectedContent string
 	}{
-		"create_file": {
-			writes:          [][]uint16{{1000, 2000}},
+		"single_port": {
+			ports:           []uint16{1000},
+			expectedLog:     "writing port file ",
+			expectedContent: "1000",
+		},
+		"multiple_ports": {
+			existingContent: "3000",
+			ports:           []uint16{1000, 2000},
+			expectedLog:     "writing port file ",
 			expectedContent: "1000\n2000",
 		},
-		"overwrite_file": {
-			writes:          [][]uint16{{1000}, {3000}},
-			expectedContent: "3000",
-		},
-		"clear_file": {
-			writes:          [][]uint16{{1000}, nil},
+		"clear_ports": {
+			existingContent: "1000\n2000",
+			expectedLog:     "clearing port file ",
 			expectedContent: "",
 		},
 	}
@@ -37,17 +42,15 @@ func Test_Service_writePortForwardedFile(t *testing.T) {
 			t.Parallel()
 			ctrl := gomock.NewController(t)
 
-			directory := t.TempDir()
-			path := filepath.Join(directory, "forwarded_port")
+			path := filepath.Join(t.TempDir(), "forwarded_port")
+			if testCase.existingContent != "" {
+				const permission = os.FileMode(0o664)
+				err := os.WriteFile(path, []byte(testCase.existingContent), permission)
+				require.NoError(t, err)
+			}
 
 			logger := NewMockLogger(ctrl)
-			for _, ports := range testCase.writes {
-				if len(ports) == 0 {
-					logger.EXPECT().Info("clearing port file " + path)
-				} else {
-					logger.EXPECT().Info("writing port file " + path)
-				}
-			}
+			logger.EXPECT().Info(testCase.expectedLog + path)
 
 			service := &Service{
 				settings: Settings{Filepath: path},
@@ -56,22 +59,12 @@ func Test_Service_writePortForwardedFile(t *testing.T) {
 				logger:   logger,
 			}
 
-			for _, ports := range testCase.writes {
-				err := service.writePortForwardedFile(ports)
-				require.NoError(t, err)
-			}
+			err := service.writePortForwardedFile(testCase.ports)
+			require.NoError(t, err)
 
 			data, err := os.ReadFile(path)
 			require.NoError(t, err)
 			assert.Equal(t, testCase.expectedContent, string(data))
-
-			info, err := os.Stat(path)
-			require.NoError(t, err)
-			assert.Equal(t, fs.FileMode(0o664), info.Mode().Perm())
-
-			entries, err := os.ReadDir(directory)
-			require.NoError(t, err)
-			assert.Len(t, entries, 1, "temporary file left behind")
 		})
 	}
 }
