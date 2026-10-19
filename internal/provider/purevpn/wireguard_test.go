@@ -52,41 +52,41 @@ func (f *fakeAPI) requestsCount() uint {
 	return f.requests
 }
 
-func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (f *fakeAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	f.mutex.Lock()
 	f.requests++
 	f.mutex.Unlock()
-	if r.URL.Path == "/oauth2/authorize" {
-		cookie, err := r.Cookie("fusionauth.sso")
+	if request.URL.Path == "/oauth2/authorize" {
+		cookie, err := request.Cookie("fusionauth.sso")
 		if err == nil && cookie.Value == testSSOCookie {
 			// Logged in through the single sign-on session.
-			http.SetCookie(w, &http.Cookie{Name: "fa_token", Value: f.token, Path: "/"}) //nolint:gosec
-			_, _ = w.Write([]byte("<html>dashboard</html>"))
+			http.SetCookie(writer, &http.Cookie{Name: "fa_token", Value: f.token, Path: "/"}) //nolint:gosec
+			_, _ = writer.Write([]byte("<html>dashboard</html>"))
 			return
 		}
 	}
-	if r.Header.Get("Authorization") != "Bearer "+f.token {
+	if request.Header.Get("Authorization") != "Bearer "+f.token {
 		// Not logged in: show the login page, as the auth server would.
-		w.Header().Set("Content-Type", "text/html")
+		writer.Header().Set("Content-Type", "text/html")
 		page := `<form action="/oauth2/authorize" method="post">` +
 			`<input name="loginId"><input name="password"></form>`
 		if f.loginError != "" {
 			page += `<div class="error">` + f.loginError + `</div>`
 		}
-		_, _ = w.Write([]byte(page))
+		_, _ = writer.Write([]byte(page))
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	_ = r.ParseForm()
+	request.Body = http.MaxBytesReader(writer, request.Body, 1<<20)
+	_ = request.ParseForm()
 	var body string
-	switch r.URL.Path {
+	switch request.URL.Path {
 	case "/v2/api/subscription":
 		body = `[{"id":"s1","state":"active","vpnusernames":["purevpn0s1"]}]`
 	case "/v2/api/wireguard/get-encrypt-password":
 		body = `{"encrypPass":"x"}`
 	case "/v2/api/wireguard/get-wg-server":
 		f.mutex.Lock()
-		f.clientPubKey = r.PostForm.Get("sClientPublicKey")
+		f.clientPubKey = request.PostForm.Get("sClientPublicKey")
 		f.mutex.Unlock()
 		config := "[Interface]\nAddress=172.21.7.9\n[Peer]\nPublicKey=" + testServerPublicKey +
 			"\nEndpoint=" + f.endpoint + "\nPersistentKeepalive=21\n"
@@ -96,63 +96,10 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		body = `[{"wireguard_configuration":` + string(configJSON) + `}]`
 	default:
-		w.WriteHeader(http.StatusNotFound)
+		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
-	_, _ = w.Write([]byte(`{"status":true,"body":` + body + `}`))
-}
-
-// fakeNetwork is a restricted network using the HTTP client of a test
-// server, recording the hostnames opened and the cleanups done.
-type fakeNetwork struct {
-	httpClient *http.Client
-	openErr    error
-	// cleanupErr is returned by the first cleanup only.
-	cleanupErr error
-
-	mutex     sync.Mutex
-	hostnames []string
-	openCtx   context.Context
-	cleanups  uint
-}
-
-func (n *fakeNetwork) OpenHTTPSByHostname(ctx context.Context, hostname string) (
-	*http.Client, func() error, error,
-) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-	n.hostnames = append(n.hostnames, hostname)
-	n.openCtx = ctx
-	if n.openErr != nil {
-		return nil, nil, n.openErr
-	}
-	cleanup := func() error {
-		n.mutex.Lock()
-		defer n.mutex.Unlock()
-		n.cleanups++
-		if n.cleanups == 1 {
-			return n.cleanupErr
-		}
-		return nil
-	}
-	return n.httpClient, cleanup, nil
-}
-
-func (n *fakeNetwork) ResolveName(_ context.Context, host string) ([]netip.Addr, error) {
-	switch host {
-	case "us-ny.purevpn.net":
-		return []netip.Addr{netip.MustParseAddr("198.51.100.9")}, nil
-	case "empty.purevpn.net":
-		return nil, nil
-	default:
-		return nil, errors.New("unknown host " + host)
-	}
-}
-
-func (n *fakeNetwork) opened() (count uint, cleanups uint) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-	return uint(len(n.hostnames)), n.cleanups
+	_, _ = writer.Write([]byte(`{"status":true,"body":` + body + `}`))
 }
 
 // newTestServer returns a test HTTPS server for the API given,
@@ -161,7 +108,7 @@ func newTestServer(t *testing.T, api *fakeAPI) (server *httptest.Server, network
 	t.Helper()
 	server = httptest.NewTLSServer(api)
 	t.Cleanup(server.Close)
-	return server, &fakeNetwork{httpClient: server.Client()}
+	return server, newFakeNetwork(server)
 }
 
 func newTestFetcher(t *testing.T, serverURL string, network RestrictedNetwork) *wireguardFetcher {
@@ -216,11 +163,11 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 
 	_, ok := network.openCtx.Deadline()
 	assert.True(t, ok, "requests must be bounded by a timeout")
-	opened, cleanups := network.opened()
+	hostnames, cleanups := network.opened()
 	assert.Greater(t, api.requestsCount(), uint(1))
-	assert.Equal(t, uint(1), opened, "requests to the same host must share one connection")
-	assert.Equal(t, uint(1), cleanups, "the connection must be cleaned up")
-	assert.Equal(t, strings.TrimPrefix(server.URL, "https://"), network.hostnames[0])
+	assert.Equal(t, []string{strings.TrimPrefix(server.URL, "https://")}, hostnames,
+		"requests to the same host must share one connection")
+	assert.Equal(t, []uint{1}, cleanups, "the connection must be cleaned up")
 
 	key, err := wgtypes.ParseKey(connection.PrivateKey)
 	require.NoError(t, err)
@@ -297,8 +244,8 @@ func Test_Provider_FetchWireguardConnection(t *testing.T) {
 		testVPNSettings(testSSOCookie, key.String()), logger)
 
 	require.NoError(t, err)
-	opened, _ := network.opened()
-	assert.Equal(t, uint(1), opened, "the restricted network given to New must be used")
+	hostnames, _ := network.opened()
+	assert.Len(t, hostnames, 1, "the restricted network given to New must be used")
 	assert.Equal(t, key.String(), connection.PrivateKey)
 	assert.Equal(t, key.PublicKey().String(), api.clientPubKey)
 	assert.Equal(t, netip.MustParseAddr("203.0.113.5"), connection.Connection.IP)
@@ -387,7 +334,7 @@ func Test_wireguardFetcher_fetch_cleanupError(t *testing.T) {
 		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
 		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
 		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
-		logger.EXPECT().Warn("cleaning up connections to PureVPN: test error"),
+		logger.EXPECT().Warn("cleaning up connections to PureVPN: cleanup 0: test error"),
 	)
 	fetcher := newTestFetcher(t, server.URL, network)
 
@@ -882,7 +829,7 @@ func Test_wireguardFetcher_fetch_errors(t *testing.T) {
 			}
 			api := &fakeAPI{token: testJWT, endpoint: endpoint}
 			server, network := newTestServer(t, api)
-			network.openErr = testCase.openErr
+			network.openErrs = map[uint]error{0: testCase.openErr}
 
 			fetcher := newTestFetcher(t, server.URL, network)
 			if testCase.modifyFetcher != nil {

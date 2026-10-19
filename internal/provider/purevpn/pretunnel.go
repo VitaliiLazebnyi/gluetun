@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"sync"
+
+	"github.com/qdm12/gluetun/internal/restrictednet"
 )
 
 // restrictedTransport is an [http.RoundTripper] reaching HTTPS hosts before
@@ -16,15 +17,13 @@ import (
 // PureVPN websites. The connections are kept open, and their firewall rules
 // kept in place, until [restrictedTransport.cleanup] is called.
 //
-// Since a restricted network HTTP client dials only once, requests must be sent
-// sequentially and each response body must be fully read and closed before the
-// next request is sent. The wgapi client always reads and closes the response
-// bodies, and the [http.Client] closes redirect response bodies before following
-// redirects.
+// It must be used by one goroutine only, sending requests sequentially:
+// a restricted network HTTP client dials only once, so each response body
+// must also be fully read and closed before the next request is sent.
+// The wgapi client always reads and closes the response bodies, and the
+// [http.Client] closes redirect response bodies before following redirects.
 type restrictedTransport struct {
 	network RestrictedNetwork
-	// mutex is held during each round trip, to send requests sequentially.
-	mutex   sync.Mutex
 	clients map[string]restrictedClient
 	// cleanupErrs are the errors encountered cleaning up clients
 	// replaced during round trips.
@@ -46,11 +45,8 @@ func (t *restrictedTransport) RoundTrip(request *http.Request) (*http.Response, 
 	}
 	hostname := net.JoinHostPort(request.URL.Hostname(), port)
 
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
-
-	client, reused := t.clients[hostname]
-	if !reused {
+	client, ok := t.clients[hostname]
+	if !ok {
 		var err error
 		client, err = t.open(request, hostname)
 		if err != nil {
@@ -64,13 +60,20 @@ func (t *restrictedTransport) RoundTrip(request *http.Request) (*http.Response, 
 	}
 	// The single connection of the client is unusable after an error.
 	t.discard(hostname)
-	if !reused || request.Context().Err() != nil {
+	if !errors.Is(err, restrictednet.ErrDialedMoreThanOnce) {
+		// The request may have been processed by the server, so it must
+		// not be sent again, for example to not submit a one time
+		// password twice.
 		return nil, err
 	}
 
-	// The server likely closed the connection of the client reused,
-	// for example after an idle timeout or with a `Connection: close`
-	// response header, so retry once with a new connection if possible.
+	// The connection was already unusable when the request was about to be
+	// sent, for example since the server closed it after an idle timeout or
+	// with a `Connection: close` response header, and the HTTP transport
+	// dialed again, which the restricted network HTTP client refuses.
+	// The HTTP transport only dials again before sending the request, or to
+	// retry a request it considers safe to retry, so retry once on a new
+	// connection.
 	retryRequest, ok, rewindErr := rewind(request)
 	switch {
 	case rewindErr != nil:
@@ -98,7 +101,7 @@ func roundTrip(client restrictedClient, request *http.Request) (*http.Response, 
 }
 
 // open opens a restricted HTTPS connection to the hostname and stores
-// its client for the hostname. It must be called with the mutex locked.
+// its client for the hostname.
 func (t *restrictedTransport) open(request *http.Request, hostname string) (
 	client restrictedClient, err error,
 ) {
@@ -115,7 +118,6 @@ func (t *restrictedTransport) open(request *http.Request, hostname string) (
 }
 
 // discard cleans up the client for the hostname and removes it.
-// It must be called with the mutex locked.
 func (t *restrictedTransport) discard(hostname string) {
 	err := t.clients[hostname].cleanup()
 	if err != nil {
@@ -125,7 +127,9 @@ func (t *restrictedTransport) discard(hostname string) {
 }
 
 // rewind returns a request to send again, and false if the request
-// cannot be sent again since its body cannot be read again.
+// cannot be sent again since its body cannot be read again. The body
+// of the request given is consumed or closed by the HTTP transport,
+// even if the request was not sent.
 func rewind(request *http.Request) (rewound *http.Request, ok bool, err error) {
 	switch {
 	case request.Body == nil || request.Body == http.NoBody:
@@ -146,8 +150,6 @@ func rewind(request *http.Request) (rewound *http.Request, ok bool, err error) {
 // returning all the errors encountered, including the ones encountered
 // cleaning up connections replaced during the round trips.
 func (t *restrictedTransport) cleanup() error {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
 	errs := t.cleanupErrs
 	for _, client := range t.clients {
 		errs = append(errs, client.cleanup())
