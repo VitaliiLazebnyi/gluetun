@@ -169,16 +169,19 @@ func newCookieJar(authURL *url.URL, authCookies map[string]string) *cookiejar.Ja
 	return jar
 }
 
-// saveSession records the current access token and auth cookies
-// from the cookie jar into the session.
-func (c *Client) saveSession(token string) {
-	c.session.AccessToken = token
-	authCookies := make(map[string]string)
+// saveAuthCookies records the auth cookies from the cookie jar into
+// the session. The cookie jar holds the stored auth cookies it was
+// created with, unless the auth server replaced or deleted them.
+func (c *Client) saveAuthCookies() {
+	var authCookies map[string]string
 	// Cookies are sorted with the most specific path first.
 	for _, cookie := range c.httpClient.Jar.Cookies(joinURL(c.authURL, "/oauth2/authorize")) {
 		_, alreadySet := authCookies[cookie.Name]
 		if !strings.HasPrefix(cookie.Name, "fusionauth.") || alreadySet {
 			continue
+		}
+		if authCookies == nil {
+			authCookies = make(map[string]string)
 		}
 		authCookies[cookie.Name] = cookie.Value
 	}
@@ -323,10 +326,14 @@ func (c *Client) login(ctx context.Context) (token string, err error) {
 	c.httpClient.Jar = newCookieJar(c.authURL, c.session.AuthCookies)
 
 	token, err = c.authenticate(ctx)
+	// Auth cookies are saved even if authentication failed, since the
+	// auth server may have set new ones, such as the fusionauth.trust
+	// two-factor trusted device cookie, before the failure.
+	c.saveAuthCookies()
 	if err != nil {
 		return "", err
 	}
-	c.saveSession(token)
+	c.session.AccessToken = token
 	return token, nil
 }
 

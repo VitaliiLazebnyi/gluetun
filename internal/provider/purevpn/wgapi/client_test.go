@@ -194,6 +194,10 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	case "POST /oauth2/two-factor":
 		f.serveTwoFactorCode(writer, request)
 	case "GET /v2/api/fusionauth/login":
+		if f.challengePath == request.URL.Path {
+			writeCloudflareChallenge(writer)
+			return
+		}
 		http.SetCookie(writer, &http.Cookie{Name: accessToken, Value: f.latestToken, Path: "/"}) //nolint:gosec
 		http.Redirect(writer, request, "/v2/dashboard", http.StatusFound)
 	case "GET /v2/dashboard":
@@ -526,10 +530,11 @@ func Test_Client_FetchConfig(t *testing.T) {
 			counters: fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},
 		"expired_stored_session_without_credentials": {
-			session:    Session{AuthCookies: map[string]string{"fusionauth.sso": "expired"}},
-			errWrapped: errSessionExpired,
-			errMessage: "PureVPN account username and password are not set",
-			counters:   fakeCounters{authorizePages: 1},
+			session:     Session{AuthCookies: map[string]string{"fusionauth.sso": "expired"}},
+			errWrapped:  errSessionExpired,
+			errMessage:  "PureVPN account username and password are not set",
+			authCookies: map[string]string{"fusionauth.sso": "expired"},
+			counters:    fakeCounters{authorizePages: 1},
 		},
 		"stored_session_with_expired_trusted_device": {
 			setup:       func(fake *fakePureVPN) { fake.twoFactor = true },
@@ -546,6 +551,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			session:     Session{AuthCookies: map[string]string{"fusionauth.sso": "stale"}},
 			errWrapped:  errUnexpectedResponse,
 			errMessage:  "login form not found",
+			authCookies: map[string]string{"fusionauth.sso": "stale"},
 			counters:    fakeCounters{authorizePages: 1},
 		},
 		"rejected_access_token_triggers_login": {
@@ -572,6 +578,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			},
 			credentials: credentials,
 			errWrapped:  errNoActiveSubscription,
+			authCookies: ssoCookies,
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},
 		"subscription_selected_by_id": {
@@ -605,6 +612,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			request:     func(request *ServerRequest) { request.SubscriptionID = testSubsID },
 			errWrapped:  errSubscriptionNotFound,
 			errMessage:  "available subscriptions are none",
+			authCookies: ssoCookies,
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},
 		"subscription_not_found": {
@@ -613,7 +621,8 @@ func Test_Client_FetchConfig(t *testing.T) {
 			errWrapped:  errSubscriptionNotFound,
 			errMessage: "available subscriptions are expired (expired) with 1 VPN username(s); " +
 				testSubsID + " (active) with 1 VPN username(s)",
-			counters: fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+			authCookies: ssoCookies,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},
 		"encrypted_password_empty": {
 			setup: func(fake *fakePureVPN) {
@@ -624,6 +633,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: credentials,
 			errWrapped:  errUnexpectedResponse,
 			errMessage:  "getting VPN password: unexpected response from PureVPN: encrypted password is empty",
+			authCookies: ssoCookies,
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},
 		"wireguard_server_list_empty": {
@@ -635,6 +645,7 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: credentials,
 			errWrapped:  errUnexpectedResponse,
 			errMessage:  "getting WireGuard server: unexpected response from PureVPN: no WireGuard configuration",
+			authCookies: ssoCookies,
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},
 		"wireguard_server_invalid_protocol_ip": {
@@ -649,7 +660,21 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: credentials,
 			errWrapped:  errUnexpectedResponse,
 			errMessage:  "parsing protocol IP",
+			authCookies: ssoCookies,
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"challenged_login_callback_after_two_factor": {
+			// The new single sign-on and trusted device cookies are
+			// saved although the login failed.
+			setup: func(fake *fakePureVPN) {
+				fake.twoFactor = true
+				fake.challengePath = "/v2/api/fusionauth/login"
+			},
+			credentials: credentialsWithTOTP,
+			errWrapped:  errBlocked,
+			errMessage:  "submitting two-factor code",
+			authCookies: trustedCookies,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1, tokens: 1},
 		},
 		"challenged_page_after_login": {
 			// The page after the access token is set is not requested.
@@ -715,14 +740,15 @@ func Test_Client_FetchConfig(t *testing.T) {
 				assert.ErrorContains(t, err, testCase.errMessage)
 			}
 			assert.Equal(t, testCase.counters, fake.getCounters())
+			session := client.Session()
+			// Auth cookies are saved even if the login fails.
+			assert.Equal(t, testCase.authCookies, session.AuthCookies)
 			if err != nil {
 				return
 			}
 			assert.Equal(t, newExpectedConfig(t), config)
-			session := client.Session()
 			_, isJWT := jwtExpiry(session.AccessToken)
 			assert.True(t, isJWT)
-			assert.Equal(t, testCase.authCookies, session.AuthCookies)
 		})
 	}
 }
@@ -835,13 +861,16 @@ func Test_Client_FetchConfig_network_error(t *testing.T) {
 		}),
 	}
 	credentials := Credentials{Username: testUsername, Password: testPassword}
-	client, err := New(httpClient, "", "", credentials, Session{})
+	authCookies := map[string]string{"fusionauth.sso": "stored", "fusionauth.trust": "trusted"}
+	client, err := New(httpClient, "", "", credentials, Session{AuthCookies: authCookies})
 	require.NoError(t, err)
 
 	_, err = client.FetchConfig(context.Background(), newTestRequest())
 	require.ErrorIs(t, err, errTest)
 	assert.ErrorContains(t, err, "https://auth.purevpn.com/oauth2/authorize")
 	assert.NotContains(t, err.Error(), "client_id")
+	// The stored auth cookies are kept without any response.
+	assert.Equal(t, Session{AuthCookies: authCookies}, client.Session())
 }
 
 func Test_Client_apiRequest(t *testing.T) {
@@ -1072,7 +1101,7 @@ func Test_wrapRequestError(t *testing.T) {
 	}
 }
 
-func Test_Client_saveSession(t *testing.T) {
+func Test_Client_saveAuthCookies(t *testing.T) {
 	t.Parallel()
 
 	client, err := New(&http.Client{}, "https://auth.example.com", "https://app.example.com",
@@ -1085,10 +1114,9 @@ func Test_Client_saveSession(t *testing.T) {
 		{Name: "other", Value: "x", Path: "/"},                       //nolint:gosec // client-side cookie jar
 	})
 
-	client.saveSession("token")
+	client.saveAuthCookies()
 
 	assert.Equal(t, Session{
-		AccessToken: "token",
 		AuthCookies: map[string]string{"fusionauth.sso": "specific", "fusionauth.trust": "trusted"},
 	}, client.Session())
 }
