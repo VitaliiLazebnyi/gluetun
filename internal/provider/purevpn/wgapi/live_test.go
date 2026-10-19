@@ -19,11 +19,11 @@ import (
 
 // Test_Live talks to the real PureVPN website. It is only built with the
 // live build tag, and only runs if the PUREVPN_LIVE_TEST environment
-// variable is set to the path of an env file such as purevpn-wireguard.env
-// at the repository root, which must set SERVER_COUNTRIES to a single
-// country name and the PureVPN account settings, for example:
+// variable is set to the path of an env file, which must set SERVER_COUNTRIES
+// to a single country name and the PureVPN account settings. Keep this file
+// outside the repository so its credentials cannot be committed, for example:
 //
-//	PUREVPN_LIVE_TEST=$PWD/purevpn-wireguard.env go test -tags live -run Test_Live -v ./internal/provider/purevpn/wgapi/
+//	PUREVPN_LIVE_TEST=~/purevpn-wireguard.env go test -tags live -run Test_Live -v ./internal/provider/purevpn/wgapi/
 //
 // It logs in, fetches a Wireguard configuration and prints it, without
 // the private key. Set PUREVPN_LIVE_EXPECT=invalid_credentials to check
