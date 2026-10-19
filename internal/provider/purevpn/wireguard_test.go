@@ -216,8 +216,9 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 	_, ok := network.openCtx.Deadline()
 	assert.True(t, ok, "requests must be bounded by a timeout")
 	opened, cleanups := network.opened()
-	assert.Equal(t, api.requestsCount(), opened, "each request must use its own connection")
-	assert.Equal(t, opened, cleanups, "each connection must be cleaned up")
+	assert.Greater(t, api.requestsCount(), uint(1))
+	assert.Equal(t, uint(1), opened, "requests to the same host must share one connection")
+	assert.Equal(t, uint(1), cleanups, "the connection must be cleaned up")
 	assert.Equal(t, strings.TrimPrefix(server.URL, "https://"), network.hostnames[0])
 
 	key, err := wgtypes.ParseKey(connection.PrivateKey)
@@ -293,7 +294,7 @@ func Test_Provider_FetchWireguardConnection(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, key.String(), connection.PrivateKey)
 	opened, _ := network.opened()
-	assert.Equal(t, api.requestsCount(), opened, "the restricted network given to New must be used")
+	assert.Equal(t, uint(1), opened, "the restricted network given to New must be used")
 }
 
 func Test_wireguardFetcher_fetch_settingsPrivateKey(t *testing.T) {
