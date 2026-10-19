@@ -16,7 +16,7 @@ import (
 
 // ServerRequest contains the parameters to request a WireGuard server.
 type ServerRequest struct {
-	// CountryCode is the ISO 3166 alpha-2 country code, for example "US".
+	// CountryCode is the uppercase ISO 3166 alpha-2 country code, for example "US".
 	CountryCode string
 	// CityID is the optional PureVPN city ID, for example 8778 for New York.
 	CityID uint32
@@ -252,7 +252,7 @@ func (c *Client) getWireguardServer(ctx context.Context, token string,
 	form := url.Values{}
 	form.Set("sUsername", vpnUsername)
 	form.Set("sPassword", encryptedPassword)
-	form.Set("sCountrySlug", strings.ToUpper(request.CountryCode))
+	form.Set("sCountrySlug", request.CountryCode)
 	form.Set("sDeviceType", "linux")
 	form.Set("sClientPublicKey", request.ClientPublicKey)
 	form.Set("sSubsId", subscriptionID)

@@ -26,11 +26,10 @@ type PureVPN struct {
 	// two-factor authentication is disabled.
 	// It cannot be nil in the internal state.
 	TOTPSecret *string `json:"totp_secret"`
-	// SessionToken is a session token copied from a browser logged
-	// in the PureVPN member area: either the value of the
-	// fusionauth.sso cookie of auth.purevpn.com, or the fa_token
-	// access token cookie of my.purevpn.com. It can be the empty
-	// string, and cannot be nil in the internal state.
+	// SessionToken is the value of the fusionauth.sso cookie of
+	// auth.purevpn.com, copied from a browser logged in the PureVPN
+	// member area. It can be the empty string, and cannot be nil
+	// in the internal state.
 	SessionToken *string `json:"session_token"`
 	// CityID is the PureVPN city ID of the server location, in the
 	// country set with the server selection countries filter.

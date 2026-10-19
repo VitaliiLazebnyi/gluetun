@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/qdm12/gluetun/internal/configuration/settings"
@@ -41,25 +40,14 @@ type wireguardFetcher struct {
 	// and are left empty to use the default ones.
 	authURL string
 	appURL  string
-	timeNow func() time.Time
 
-	mutex       sync.Mutex
 	state       wireguardState
 	stateLoaded bool
-	// authErr is the last authentication error, returned again without
-	// contacting PureVPN as long as the PureVPN settings fingerprint is
-	// authErrFingerprint and, if set, until authErrUntil, to avoid having
-	// the account locked out or requiring a captcha because of repeated
-	// failed logins.
-	authErr            error
-	authErrFingerprint string
-	authErrUntil       time.Time
 }
 
 func newWireguardFetcher() *wireguardFetcher {
 	return &wireguardFetcher{
 		statePath: "/gluetun/purevpn-wireguard.json",
-		timeNow:   time.Now,
 	}
 }
 
@@ -67,6 +55,7 @@ func newWireguardFetcher() *wireguardFetcher {
 // and requests a new Wireguard configuration. It should be called on
 // every connection attempt, since PureVPN removes unused peers.
 // The restricted network given is used to reach PureVPN before the VPN is up.
+// It is not safe for concurrent use.
 func (p *Provider) FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN,
 	network *restrictednet.Client, logger wireguard.Logger,
 ) (connection models.WireguardConnection, err error) {
@@ -76,24 +65,10 @@ func (p *Provider) FetchWireguardConnection(ctx context.Context, vpnSettings set
 func (f *wireguardFetcher) fetch(ctx context.Context,
 	vpnSettings settings.VPN, network RestrictedNetwork, logger Logger,
 ) (connection models.WireguardConnection, err error) {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-
 	purevpnSettings := vpnSettings.PureVPN
 	// The settings validation ensures there is exactly one known country.
 	countryCode, _ := constants.CountryNameToCode(vpnSettings.Provider.ServerSelection.Countries[0])
 	countryCode = strings.ToUpper(countryCode)
-	fingerprint := settingsFingerprint(purevpnSettings, countryCode)
-	if f.authErr != nil {
-		if fingerprint == f.authErrFingerprint &&
-			(f.authErrUntil.IsZero() || f.timeNow().Before(f.authErrUntil)) {
-			return models.WireguardConnection{}, fmt.Errorf(
-				"not retrying with unchanged PureVPN settings: %w", f.authErr)
-		}
-		f.authErr = nil
-		f.authErrFingerprint = ""
-		f.authErrUntil = time.Time{}
-	}
 
 	// Bound the whole fetch so it does not block the VPN loop for too long,
 	// for example preventing it from being stopped or its settings changed.
@@ -143,23 +118,7 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	f.state.Session = client.Session()
 	f.saveState(logger) // save even on error, the session may have changed
 	if err != nil {
-		err = fmt.Errorf("requesting configuration from PureVPN: %w", err)
-		switch {
-		case wgapi.IsCaptchaError(err):
-			// The captcha may no longer be required after some time without login attempts.
-			const captchaCooldown = time.Hour
-			f.authErrUntil = f.timeNow().Add(captchaCooldown)
-			err = fmt.Errorf("%w - not contacting PureVPN again before %s, unless the PureVPN settings change",
-				err, f.authErrUntil.Format(time.RFC3339))
-			f.authErr = err
-			f.authErrFingerprint = fingerprint
-		case wgapi.IsAuthError(err):
-			err = fmt.Errorf("%w - change the PureVPN settings to retry, through the control "+
-				"server or by restarting with fixed settings", err)
-			f.authErr = err
-			f.authErrFingerprint = fingerprint
-		}
-		return models.WireguardConnection{}, err
+		return models.WireguardConnection{}, fmt.Errorf("requesting configuration from PureVPN: %w", err)
 	}
 
 	endpointIP, ok := config.EndpointIP()
@@ -192,23 +151,6 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 		Addresses:           config.Addresses,
 		PersistentKeepalive: config.PersistentKeepalive,
 	}, nil
-}
-
-// settingsFingerprint returns a hash of the PureVPN settings, to detect
-// a change in the settings without keeping the secrets in memory twice.
-func settingsFingerprint(purevpnSettings settings.PureVPN, countryCode string) string {
-	fields := [...]string{
-		*purevpnSettings.Username,
-		*purevpnSettings.Password,
-		*purevpnSettings.TOTPSecret,
-		*purevpnSettings.SessionToken,
-		countryCode,
-		fmt.Sprint(*purevpnSettings.CityID),
-		*purevpnSettings.SubscriptionID,
-		*purevpnSettings.VPNUsername,
-	}
-	hash := sha256.Sum256([]byte(strings.Join(fields[:], "\x00")))
-	return hex.EncodeToString(hash[:])
 }
 
 func describeLocation(countryCode string, cityID uint32) string {
@@ -245,9 +187,9 @@ func (f *wireguardFetcher) keyPair(settingsKey string, logger Logger) (
 }
 
 // applySessionToken seeds the session with the session token from
-// the settings, if it is set and different from the one used last.
-// Other authentication cookies, such as the two-factor trusted device
-// cookie, are kept.
+// the settings, which is the fusionauth.sso single sign-on cookie, if
+// it is set and different from the one used last. Other authentication
+// cookies, such as the two-factor trusted device cookie, are kept.
 func (f *wireguardFetcher) applySessionToken(token string, logger Logger) {
 	if token == "" {
 		return
@@ -258,11 +200,7 @@ func (f *wireguardFetcher) applySessionToken(token string, logger Logger) {
 		return // already applied, the stored session is more recent
 	}
 
-	if wgapi.IsJWT(token) {
-		logger.Debug("using PureVPN session token as access token")
-	} else {
-		logger.Debug("using PureVPN session token as single sign-on cookie")
-	}
+	logger.Debug("using PureVPN session token as single sign-on cookie")
 	f.state.Session = f.state.Session.WithSessionToken(token)
 	f.state.SessionTokenHash = tokenHash
 }

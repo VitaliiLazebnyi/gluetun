@@ -331,7 +331,7 @@ func (f *fakePureVPN) parseForm(writer http.ResponseWriter, request *http.Reques
 
 func newTestRequest() ServerRequest {
 	return ServerRequest{
-		CountryCode:     "us",
+		CountryCode:     "US",
 		CityID:          8778,
 		ClientPublicKey: testClientKey,
 	}
@@ -376,17 +376,15 @@ func Test_Client_FetchConfig(t *testing.T) {
 		`<span class="error">Invalid login credentials.</span>`)
 
 	testCases := map[string]struct {
-		setup        func(fake *fakePureVPN)
-		credentials  Credentials
-		session      Session
-		request      func(request *ServerRequest)
-		ctxTimeout   time.Duration
-		errWrapped   error
-		errMessage   string
-		authError    bool
-		captchaError bool
-		authCookies  map[string]string
-		counters     fakeCounters
+		setup       func(fake *fakePureVPN)
+		credentials Credentials
+		session     Session
+		request     func(request *ServerRequest)
+		ctxTimeout  time.Duration
+		errWrapped  error
+		errMessage  string
+		authCookies map[string]string
+		counters    fakeCounters
 	}{
 		"password_login": {
 			credentials: credentials,
@@ -397,26 +395,22 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: Credentials{Username: testUsername, Password: "wrong"},
 			errWrapped:  errInvalidCredentials,
 			errMessage:  "Invalid login credentials.",
-			authError:   true,
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1},
 		},
 		"captcha_required": {
-			setup:        func(fake *fakePureVPN) { fake.captcha = true },
-			credentials:  credentials,
-			errWrapped:   errCaptchaRequired,
-			errMessage:   "Please complete the captcha.",
-			captchaError: true,
-			counters:     fakeCounters{authorizePages: 1, passwordLogins: 1},
+			setup:       func(fake *fakePureVPN) { fake.captcha = true },
+			credentials: credentials,
+			errWrapped:  errCaptchaRequired,
+			errMessage:  "Please complete the captcha.",
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1},
 		},
 		"credentials_not_set": {
 			errWrapped: errCredentialsNotSet,
-			authError:  true,
 		},
 		"two_factor_required_without_secret": {
 			setup:       func(fake *fakePureVPN) { fake.twoFactor = true },
 			credentials: credentials,
 			errWrapped:  errTwoFactorRequired,
-			authError:   true,
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1},
 		},
 		"two_factor_with_valid_secret": {
@@ -432,7 +426,6 @@ func Test_Client_FetchConfig(t *testing.T) {
 			},
 			errWrapped: errTwoFactorCodeInvalid,
 			errMessage: "Invalid code",
-			authError:  true,
 			counters:   fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 2},
 		},
 		"two_factor_code_rejected_once": {
@@ -522,7 +515,6 @@ func Test_Client_FetchConfig(t *testing.T) {
 			session:    Session{AuthCookies: map[string]string{"fusionauth.sso": "expired"}},
 			errWrapped: errSessionExpired,
 			errMessage: "PureVPN account username and password are not set",
-			authError:  true,
 			counters:   fakeCounters{authorizePages: 1},
 		},
 		"stored_session_with_expired_trusted_device": {
@@ -553,7 +545,6 @@ func Test_Client_FetchConfig(t *testing.T) {
 			session:    Session{AccessToken: makeJWT(time.Now().Add(time.Hour), 0)},
 			errWrapped: errCredentialsNotSet,
 			errMessage: "logging in again after access token was rejected",
-			authError:  true,
 		},
 		"cloudflare_block": {
 			setup:       func(fake *fakePureVPN) { fake.cloudflare = true },
@@ -693,15 +684,14 @@ func Test_Client_FetchConfig(t *testing.T) {
 			if testCase.errMessage != "" {
 				assert.ErrorContains(t, err, testCase.errMessage)
 			}
-			assert.Equal(t, testCase.authError, IsAuthError(err))
-			assert.Equal(t, testCase.captchaError, IsCaptchaError(err))
 			assert.Equal(t, testCase.counters, fake.getCounters())
 			if err != nil {
 				return
 			}
 			assert.Equal(t, newExpectedConfig(t), config)
 			session := client.Session()
-			assert.True(t, IsJWT(session.AccessToken))
+			_, isJWT := jwtExpiry(session.AccessToken)
+			assert.True(t, isJWT)
 			assert.Equal(t, testCase.authCookies, session.AuthCookies)
 		})
 	}
@@ -799,8 +789,8 @@ func Test_New(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, DefaultAuthURL, client.authURL.String())
-			assert.Equal(t, DefaultAppURL, client.appURL.String())
+			assert.Equal(t, defaultAuthURL, client.authURL.String())
+			assert.Equal(t, defaultAppURL, client.appURL.String())
 		})
 	}
 }
@@ -822,7 +812,6 @@ func Test_Client_FetchConfig_network_error(t *testing.T) {
 	require.ErrorIs(t, err, errTest)
 	assert.ErrorContains(t, err, "https://auth.purevpn.com/oauth2/authorize")
 	assert.NotContains(t, err.Error(), "client_id")
-	assert.False(t, IsAuthError(err))
 }
 
 func Test_Client_apiRequest(t *testing.T) {
@@ -1006,7 +995,7 @@ func Test_Client_readBodyError(t *testing.T) {
 	err = client.apiRequest(context.Background(), "token", "/v2/api/test", nil, nil)
 	assert.EqualError(t, err, "reading response body: test read error")
 
-	page, err := client.doAuthRequest(context.Background(), http.MethodGet, DefaultAuthURL, nil)
+	page, err := client.doAuthRequest(context.Background(), http.MethodGet, defaultAuthURL, nil)
 	assert.EqualError(t, err, "reading response body: test read error")
 	assert.Nil(t, page)
 }
@@ -1131,21 +1120,11 @@ func Test_joinURL(t *testing.T) {
 func Test_Session_WithSessionToken(t *testing.T) {
 	t.Parallel()
 
-	jwt := makeJWT(time.Unix(1_000_000, 0), 0)
 	testCases := map[string]struct {
 		session  Session
 		token    string
 		expected Session
 	}{
-		"jwt_on_empty_session": {
-			token:    jwt,
-			expected: Session{AccessToken: jwt},
-		},
-		"jwt_keeps_cookies": {
-			session:  Session{AccessToken: "old", AuthCookies: map[string]string{"fusionauth.trust": "trusted"}},
-			token:    jwt,
-			expected: Session{AccessToken: jwt, AuthCookies: map[string]string{"fusionauth.trust": "trusted"}},
-		},
 		"sso_cookie_on_empty_session": {
 			token:    "sso",
 			expected: Session{AuthCookies: map[string]string{"fusionauth.sso": "sso"}},

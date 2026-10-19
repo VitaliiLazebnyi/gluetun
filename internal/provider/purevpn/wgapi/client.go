@@ -15,11 +15,11 @@ import (
 	"time"
 )
 
-// DefaultAuthURL is the PureVPN FusionAuth server base URL.
-const DefaultAuthURL = "https://auth.purevpn.com"
+// defaultAuthURL is the PureVPN FusionAuth server base URL.
+const defaultAuthURL = "https://auth.purevpn.com"
 
-// DefaultAppURL is the PureVPN member area base URL.
-const DefaultAppURL = "https://my.purevpn.com"
+// defaultAppURL is the PureVPN member area base URL.
+const defaultAppURL = "https://my.purevpn.com"
 
 // clientID is the FusionAuth client identifier of the
 // PureVPN member area application.
@@ -53,22 +53,16 @@ type Session struct {
 }
 
 // WithSessionToken returns a copy of the session using the session
-// token given. A JWT token is used as the access token, and any other
-// token is used as the fusionauth.sso single sign-on cookie, in which
-// case the access token from the previous single sign-on session is
-// cleared. Other authentication cookies are kept.
+// token given as the fusionauth.sso single sign-on cookie, and with
+// the access token from the previous single sign-on session cleared.
+// Other authentication cookies are kept.
 func (s Session) WithSessionToken(token string) Session {
-	updated := Session{AccessToken: s.AccessToken, AuthCookies: maps.Clone(s.AuthCookies)}
-	if IsJWT(token) {
-		updated.AccessToken = token
-		return updated
+	authCookies := maps.Clone(s.AuthCookies)
+	if authCookies == nil {
+		authCookies = make(map[string]string, 1)
 	}
-	if updated.AuthCookies == nil {
-		updated.AuthCookies = make(map[string]string, 1)
-	}
-	updated.AuthCookies["fusionauth.sso"] = token
-	updated.AccessToken = ""
-	return updated
+	authCookies["fusionauth.sso"] = token
+	return Session{AuthCookies: authCookies}
 }
 
 // Client is a PureVPN member area API client.
@@ -92,10 +86,10 @@ func New(httpClient *http.Client, authURL, appURL string,
 	credentials Credentials, session Session,
 ) (client *Client, err error) {
 	if authURL == "" {
-		authURL = DefaultAuthURL
+		authURL = defaultAuthURL
 	}
 	if appURL == "" {
-		appURL = DefaultAppURL
+		appURL = defaultAppURL
 	}
 	client = &Client{
 		credentials: credentials,
@@ -212,12 +206,6 @@ func jwtExpiry(token string) (expiry time.Time, ok bool) {
 		return time.Time{}, false
 	}
 	return time.Unix(claims.Exp, 0), true
-}
-
-// IsJWT returns true if the token looks like a JWT.
-func IsJWT(token string) bool {
-	_, ok := jwtExpiry(token)
-	return ok
 }
 
 func setBrowserHeaders(request *http.Request) {
