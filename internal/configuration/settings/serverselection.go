@@ -93,22 +93,33 @@ func (ss *ServerSelection) validate(vpnServiceProvider string,
 		return fmt.Errorf("the selection mode specified is not valid: %w", err)
 	}
 
-	filterChoices, err := getLocationFilterChoices(vpnServiceProvider, ss, filterChoicesGetter, warner)
-	if err != nil {
-		return err // already wrapped error
-	}
+	if vpnServiceProvider == providers.Purevpn && ss.VPN == vpn.Wireguard {
+		// PureVPN Wireguard servers are not in the servers data, which only
+		// contains PureVPN OpenVPN servers, so the location filters are
+		// validated independently of it.
+		err = validatePureVPNWireguard(*ss, warner)
+		if err != nil {
+			return fmt.Errorf("for VPN service provider %s: %w", vpnServiceProvider, err)
+		}
+	} else {
+		var filterChoices models.FilterChoices
+		filterChoices, err = getLocationFilterChoices(vpnServiceProvider, ss, filterChoicesGetter, warner)
+		if err != nil {
+			return err // already wrapped error
+		}
 
-	// Retro-compatibility
-	switch vpnServiceProvider {
-	case providers.Nordvpn:
-		*ss = nordvpnRetroRegion(*ss, filterChoices.Regions, filterChoices.Countries)
-	case providers.Surfshark:
-		*ss = surfsharkRetroRegion(*ss)
-	}
+		// Retro-compatibility
+		switch vpnServiceProvider {
+		case providers.Nordvpn:
+			*ss = nordvpnRetroRegion(*ss, filterChoices.Regions, filterChoices.Countries)
+		case providers.Surfshark:
+			*ss = surfsharkRetroRegion(*ss)
+		}
 
-	err = validateServerFilters(*ss, filterChoices, vpnServiceProvider, warner)
-	if err != nil {
-		return fmt.Errorf("for VPN service provider %s: %w", vpnServiceProvider, err)
+		err = validateServerFilters(*ss, filterChoices, vpnServiceProvider, warner)
+		if err != nil {
+			return fmt.Errorf("for VPN service provider %s: %w", vpnServiceProvider, err)
+		}
 	}
 
 	err = validateSubscriptionTierFilters(*ss, vpnServiceProvider)
@@ -119,13 +130,6 @@ func (ss *ServerSelection) validate(vpnServiceProvider string,
 	err = validateFeatureFilters(*ss, vpnServiceProvider)
 	if err != nil {
 		return fmt.Errorf("for VPN service provider %s: %w", vpnServiceProvider, err)
-	}
-
-	if vpnServiceProvider == providers.Purevpn && ss.VPN == vpn.Wireguard {
-		err = validatePureVPNWireguard(*ss, warner)
-		if err != nil {
-			return fmt.Errorf("for VPN service provider %s: %w", vpnServiceProvider, err)
-		}
 	}
 
 	if ss.VPN == vpn.OpenVPN {
@@ -145,7 +149,8 @@ func (ss *ServerSelection) validate(vpnServiceProvider string,
 
 // validatePureVPNWireguard validates the server selection for PureVPN
 // Wireguard, for which the server location is only selected with a
-// single country and the PureVPN city ID setting.
+// single country and the PureVPN city ID setting. Other location
+// filters are ignored with a warning, whatever their values.
 func validatePureVPNWireguard(ss ServerSelection, warner Warner) (err error) {
 	switch {
 	case len(ss.Countries) == 0:

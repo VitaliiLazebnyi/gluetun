@@ -14,9 +14,12 @@ func Test_VPN_Validate_purevpn(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
-		vpnType    string
-		pureVPN    PureVPN
-		errMessage string
+		vpnType string
+		pureVPN PureVPN
+		// usesFilterChoices is true if the location filters are
+		// validated against the servers data filter choices.
+		usesFilterChoices bool
+		errMessage        string
 	}{
 		"wireguard_without_purevpn_credentials": {
 			vpnType:    vpn.Wireguard,
@@ -27,7 +30,8 @@ func Test_VPN_Validate_purevpn(t *testing.T) {
 			pureVPN: PureVPN{SessionToken: new("token")},
 		},
 		"openvpn_without_purevpn_credentials": {
-			vpnType: vpn.OpenVPN,
+			vpnType:           vpn.OpenVPN,
+			usesFilterChoices: true,
 		},
 	}
 
@@ -36,10 +40,12 @@ func Test_VPN_Validate_purevpn(t *testing.T) {
 			t.Parallel()
 			ctrl := gomock.NewController(t)
 
-			filterChoices := models.FilterChoices{Countries: []string{"Germany"}}
 			filterChoicesGetter := NewMockFilterChoicesGetter(ctrl)
-			filterChoicesGetter.EXPECT().GetFilterChoices(providers.Purevpn).
-				Return(filterChoices).Times(1)
+			if testCase.usesFilterChoices {
+				filterChoices := models.FilterChoices{Countries: []string{"Germany"}}
+				filterChoicesGetter.EXPECT().GetFilterChoices(providers.Purevpn).
+					Return(filterChoices).Times(1)
+			}
 			warner := NewMockWarner(ctrl)
 
 			settings := VPN{
