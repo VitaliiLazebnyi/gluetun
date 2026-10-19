@@ -1,0 +1,102 @@
+//go:build live
+
+package wgapi
+
+import (
+	"bufio"
+	"context"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/qdm12/gluetun/internal/constants"
+	"github.com/stretchr/testify/require"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+)
+
+// Test_Live talks to the real PureVPN website. It is only built with the
+// live build tag, and only runs if the PUREVPN_LIVE_TEST environment
+// variable is set to the path of an env file, which must set SERVER_COUNTRIES
+// to a single country name and the PureVPN account settings. Keep this file
+// outside the repository so its credentials cannot be committed, for example:
+//
+//	PUREVPN_LIVE_TEST=~/purevpn-wireguard.env go test -tags live -run Test_Live -v ./internal/provider/purevpn/wgapi/
+//
+// It logs in, fetches a Wireguard configuration and prints it, without
+// the private key. Set PUREVPN_LIVE_EXPECT=invalid_credentials to check
+// that fake credentials are rejected as such.
+// It does not run in parallel to avoid concurrent requests to the real website.
+func Test_Live(t *testing.T) { //nolint:paralleltest
+	envPath := os.Getenv("PUREVPN_LIVE_TEST")
+	if envPath == "" {
+		t.Skip("PUREVPN_LIVE_TEST is not set")
+	}
+	env := readEnvFile(t, envPath)
+
+	session := Session{}
+	if env["PUREVPN_SESSION_TOKEN"] != "" {
+		session = session.WithSessionToken(env["PUREVPN_SESSION_TOKEN"])
+	}
+	credentials := Credentials{
+		Username:   env["PUREVPN_USERNAME"],
+		Password:   env["PUREVPN_PASSWORD"],
+		TOTPSecret: env["PUREVPN_TOTP_SECRET"],
+	}
+	client, err := New(&http.Client{Timeout: 30 * time.Second}, "", "", credentials, session)
+	require.NoError(t, err)
+
+	key, err := wgtypes.GeneratePrivateKey()
+	require.NoError(t, err)
+	var cityID uint64
+	if env["PUREVPN_CITY_ID"] != "" {
+		cityID, err = strconv.ParseUint(env["PUREVPN_CITY_ID"], 10, 32)
+		require.NoError(t, err)
+	}
+
+	countryCode, ok := constants.CountryNameToCode(env["SERVER_COUNTRIES"])
+	require.True(t, ok, "SERVER_COUNTRIES must be set to a single known country name")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	config, err := client.FetchConfig(ctx, ServerRequest{
+		CountryCode:     strings.ToUpper(countryCode),
+		CityID:          uint32(cityID),
+		SubscriptionID:  env["PUREVPN_SUBSCRIPTION_ID"],
+		VPNUsername:     env["PUREVPN_VPN_USERNAME"],
+		ClientPublicKey: key.PublicKey().String(),
+	})
+	if os.Getenv("PUREVPN_LIVE_EXPECT") == "invalid_credentials" {
+		require.ErrorIs(t, err, errInvalidCredentials)
+		t.Logf("rejected as expected: %s", err)
+		return
+	}
+	require.NoError(t, err)
+	t.Logf("configuration: %+v", config)
+	t.Logf("session cookies stored: %d", len(client.Session().AuthCookies))
+}
+
+func readEnvFile(t *testing.T, path string) map[string]string {
+	t.Helper()
+	file, err := os.Open(path) //nolint:gosec // path set by the developer running the test
+	require.NoError(t, err)
+	defer file.Close()
+
+	env := make(map[string]string)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		env[strings.TrimSpace(key)] = strings.Trim(strings.TrimSpace(value), `"'`)
+	}
+	require.NoError(t, scanner.Err())
+	return env
+}

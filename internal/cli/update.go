@@ -127,7 +127,7 @@ func (c *CLI) Update(ctx context.Context, args []string, logger UpdaterLogger) e
 	openvpnFileExtractor := extract.New()
 
 	providers := provider.NewProviders(storage, time.Now, logger, httpClient,
-		unzipper, parallelResolver, openvpnFileExtractor, options)
+		unzipper, parallelResolver, openvpnFileExtractor, options, nil)
 
 	updater := updater.New(httpClient, storage, providers, logger, *options.PreferDirectDownload)
 	err = updater.UpdateServers(ctx, options.Providers, options.MinRatio)
