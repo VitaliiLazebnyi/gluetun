@@ -11,7 +11,7 @@ import (
 	"github.com/qdm12/gotree"
 )
 
-// PureVPN contains settings to fetch WireGuard configurations
+// PureVPN contains settings to fetch Wireguard configurations
 // from the PureVPN member area, using the PureVPN account.
 // It is only used with the PureVPN provider and Wireguard.
 type PureVPN struct {
