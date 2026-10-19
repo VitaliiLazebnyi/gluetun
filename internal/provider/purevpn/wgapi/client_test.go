@@ -59,6 +59,7 @@ type fakePureVPN struct {
 	subscriptions       []subscription
 	noCityID            bool              // the city ID is not expected in the server request
 	rejectToken         string            // API rejects this access token once
+	rejectTokens        bool              // API rejects all access tokens
 	ssoDisabled         bool              // ignore the single sign-on cookie
 	pages               map[string]string // HTML page served for "METHOD /path"
 	challengePath       string            // path answered with a Cloudflare challenge
@@ -272,7 +273,7 @@ func (f *fakePureVPN) serveTwoFactorCode(writer http.ResponseWriter, request *ht
 
 func (f *fakePureVPN) serveAPI(writer http.ResponseWriter, request *http.Request) {
 	token := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
-	if token == f.rejectToken || !f.validTokens[token] {
+	if f.rejectTokens || token == f.rejectToken || !f.validTokens[token] {
 		f.rejectToken = ""
 		delete(f.validTokens, token)
 		// The real API answers like this for any token it does not accept.
@@ -558,6 +559,23 @@ func Test_Client_FetchConfig(t *testing.T) {
 			credentials: credentials,
 			// The token looks valid locally but the API rejects it.
 			session:     Session{AccessToken: makeJWT(time.Now().Add(time.Hour), 0)},
+			authCookies: ssoCookies,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"rejected_fresh_access_token_not_retried": {
+			setup:       func(fake *fakePureVPN) { fake.rejectTokens = true },
+			credentials: credentials,
+			errWrapped:  errUnauthorized,
+			errMessage:  "selecting subscription: requesting subscriptions",
+			authCookies: ssoCookies,
+			// Logging in again would only double the login attempts.
+			counters: fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"rejected_access_token_and_new_access_token": {
+			setup:       func(fake *fakePureVPN) { fake.rejectTokens = true },
+			credentials: credentials,
+			session:     Session{AccessToken: makeJWT(time.Now().Add(time.Hour), 0)},
+			errWrapped:  errUnauthorized,
 			authCookies: ssoCookies,
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
 		},

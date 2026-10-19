@@ -32,31 +32,33 @@ type ServerRequest struct {
 }
 
 // FetchConfig logs in if needed and requests a WireGuard configuration.
-// If the API rejects the access token, it logs in again once and retries.
+// If the API rejects the stored access token, it logs in again once and
+// retries. An access token obtained by logging in during this call is not
+// retried, since logging in again would only double the login attempts.
 func (c *Client) FetchConfig(ctx context.Context, request ServerRequest) (
 	config Config, err error,
 ) {
-	config, err = c.fetchConfig(ctx, request)
-	if !errors.Is(err, errUnauthorized) {
-		return config, err
-	}
-
-	// The access token was likely revoked or expired early.
-	_, err = c.login(ctx)
-	if err != nil {
-		return Config{}, fmt.Errorf("logging in again after access token was rejected: %w", err)
-	}
-	return c.fetchConfig(ctx, request)
-}
-
-func (c *Client) fetchConfig(ctx context.Context, request ServerRequest) (
-	config Config, err error,
-) {
-	token, err := c.ensureAccessToken(ctx)
+	token, loggedIn, err := c.ensureAccessToken(ctx)
 	if err != nil {
 		return Config{}, err
 	}
 
+	config, err = c.fetchConfig(ctx, token, request)
+	if !errors.Is(err, errUnauthorized) || loggedIn {
+		return config, err
+	}
+
+	// The stored access token was likely revoked or expired early.
+	token, err = c.login(ctx)
+	if err != nil {
+		return Config{}, fmt.Errorf("logging in again after access token was rejected: %w", err)
+	}
+	return c.fetchConfig(ctx, token, request)
+}
+
+func (c *Client) fetchConfig(ctx context.Context, token string, request ServerRequest) (
+	config Config, err error,
+) {
 	subscriptionID, vpnUsername, err := c.selectSubscription(ctx, token,
 		request.SubscriptionID, request.VPNUsername)
 	if err != nil {

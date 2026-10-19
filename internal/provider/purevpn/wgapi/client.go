@@ -306,11 +306,17 @@ func (c *Client) getAccessTokenCookie() string {
 }
 
 // ensureAccessToken returns a valid access token, logging in if needed.
-func (c *Client) ensureAccessToken(ctx context.Context) (token string, err error) {
+// loggedIn is true if the token was obtained by logging in, and false
+// if it is the stored access token.
+func (c *Client) ensureAccessToken(ctx context.Context) (token string, loggedIn bool, err error) {
 	if accessTokenValid(c.session.AccessToken, c.timeNow()) {
-		return c.session.AccessToken, nil
+		return c.session.AccessToken, false, nil
 	}
-	return c.login(ctx)
+	token, err = c.login(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	return token, true, nil
 }
 
 // login obtains a new access token, using the stored single sign-on
