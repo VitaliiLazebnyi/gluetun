@@ -301,15 +301,15 @@ func (f *htmlForm) hasInput(name string) bool {
 	return false
 }
 
-// values returns the form values, excluding unchecked radio
-// buttons and checkboxes, and submit buttons.
+// values returns the form values, excluding unchecked
+// checkboxes, and submit and other buttons.
 func (f *htmlForm) values() url.Values {
 	values := url.Values{}
 	for _, input := range f.inputs {
 		switch {
 		case input.name == "",
 			input.inputType == "submit", input.inputType == "button",
-			(input.inputType == "radio" || input.inputType == "checkbox") && !input.checked:
+			input.inputType == "checkbox" && !input.checked:
 			continue
 		}
 		values.Set(input.name, input.value)
@@ -370,7 +370,7 @@ func (p *htmlParser) handleElement(node *html.Node) {
 	case "form":
 		p.currentForm = &htmlForm{action: attribute(node, "action")}
 		p.forms = append(p.forms, p.currentForm)
-	case "input", "button", "textarea", "select":
+	case "input", "button":
 		if p.currentForm == nil {
 			return
 		}

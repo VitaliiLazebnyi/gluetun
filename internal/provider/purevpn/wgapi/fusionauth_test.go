@@ -57,12 +57,7 @@ func Test_parseHTML(t *testing.T) {
 <div class="alert-danger" style="visibility: hidden">Captcha visibility hidden</div>
 <div class="error"> </div>
 <ul class="errors"><li>Errors list</li></ul>
-<div class="alert alert-danger">Danger</div>
-<form action="/f"><textarea name="comment"></textarea><select name="choice"></select></form>`,
-			forms: []*htmlForm{{
-				action: "/f",
-				inputs: []htmlInput{{name: "comment"}, {name: "choice"}},
-			}},
+<div class="alert alert-danger">Danger</div>`,
 			errorMessages: []string{"Errors list", "Danger"},
 		},
 		"two_factor_form": {
@@ -186,15 +181,12 @@ func Test_htmlForm_values(t *testing.T) {
 		{value: "no name", inputType: "text"},
 		{name: "submit", value: "Login", inputType: "submit"},
 		{name: "button", value: "Cancel", inputType: "button"},
-		{name: "method", value: "m-email", inputType: "radio"},
-		{name: "method", value: "m-auth", inputType: "radio", checked: true},
 		{name: "remember", value: "true", inputType: "checkbox"},
 		{name: "trust", value: "true", inputType: "checkbox", checked: true},
 	}}
 
 	assert.Equal(t, url.Values{
 		"loginId": {"user"},
-		"method":  {"m-auth"},
 		"trust":   {"true"},
 	}, form.values())
 }
