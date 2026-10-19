@@ -150,3 +150,46 @@ func Test_Wireguard_validate(t *testing.T) {
 		})
 	}
 }
+
+func Test_Wireguard_toLinesNode(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		provider  string
+		addresses []netip.Prefix
+		expected  string
+	}{
+		"mullvad_with_addresses": {
+			provider:  providers.Mullvad,
+			addresses: []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")},
+			expected: `Wireguard settings:
+├── Interface addresses:
+|   └── 10.0.0.2/32
+├── Allowed IPs:
+|   ├── 0.0.0.0/0
+|   └── ::/0
+└── Network interface: wg0
+    └── MTU: use path MTU discovery`,
+		},
+		"purevpn_without_addresses": {
+			provider: providers.Purevpn,
+			expected: `Wireguard settings:
+├── Allowed IPs:
+|   ├── 0.0.0.0/0
+|   └── ::/0
+└── Network interface: wg0
+    └── MTU: use path MTU discovery`,
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			settings := Wireguard{Addresses: testCase.addresses}
+			settings.setDefaults(testCase.provider)
+
+			assert.Equal(t, testCase.expected, settings.String())
+		})
+	}
+}

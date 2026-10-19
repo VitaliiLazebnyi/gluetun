@@ -231,9 +231,13 @@ func (w Wireguard) toLinesNode() (node *gotree.Node) {
 		node.Appendf("Pre-shared key: %s", s)
 	}
 
-	addressesNode := node.Appendf("Interface addresses:")
-	for _, address := range w.Addresses {
-		addressesNode.Append(address.String())
+	// Interface addresses are not set with providers such as PureVPN,
+	// where they are assigned at runtime.
+	if len(w.Addresses) > 0 {
+		addressesNode := node.Appendf("Interface addresses:")
+		for _, address := range w.Addresses {
+			addressesNode.Append(address.String())
+		}
 	}
 
 	allowedIPsNode := node.Appendf("Allowed IPs:")
