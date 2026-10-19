@@ -27,6 +27,10 @@ import (
 type wireguardState struct {
 	PrivateKey string        `json:"private_key"`
 	Session    wgapi.Session `json:"session"`
+	// UsernameHash is the hash of the account username from the
+	// settings the session belongs to, so the session of a previous
+	// account is not used after changing the username.
+	UsernameHash string `json:"username_hash,omitempty"`
 	// SessionTokenHash is the hash of the session token from the
 	// settings which was used to seed the session, so a changed
 	// token in the settings replaces the stored session.
@@ -80,7 +84,7 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	if err != nil {
 		return models.WireguardConnection{}, err
 	}
-	f.applySessionToken(*purevpnSettings.SessionToken, logger)
+	f.applyAccount(*purevpnSettings.Username, *purevpnSettings.SessionToken, logger)
 
 	transport := &restrictedTransport{network: network}
 	defer func() {
@@ -184,23 +188,45 @@ func (f *wireguardFetcher) keyPair(settingsKey string, logger Logger) (
 	return privateKey, key.PublicKey().String(), nil
 }
 
-// applySessionToken seeds the session with the session token from
-// the settings, which is the fusionauth.sso single sign-on cookie, if
-// it is set and different from the one used last. Other authentication
-// cookies, such as the two-factor trusted device cookie, are kept.
-func (f *wireguardFetcher) applySessionToken(token string, logger Logger) {
-	if token == "" {
+// applyAccount discards the stored session if it belongs to another
+// account than the one from the settings, and then seeds the session
+// with the session token from the settings, which is the fusionauth.sso
+// single sign-on cookie, if it is set and different from the one used
+// last. When the username is unchanged, other authentication cookies,
+// such as the two-factor trusted device cookie, are kept.
+// A password change alone keeps the session, which stays valid for
+// the same account.
+func (f *wireguardFetcher) applyAccount(username, sessionToken string, logger Logger) {
+	usernameHash := hashHex(username)
+	if usernameHash != f.state.UsernameHash {
+		// A missing username hash, for example for a new state or a state
+		// written by an older program version, means the account of the
+		// stored session is unknown, so the session is discarded to be safe.
+		hasSession := f.state.Session.AccessToken != "" || len(f.state.Session.AuthCookies) > 0
+		if hasSession {
+			logger.Info("discarding the stored PureVPN session since it is not for the configured account")
+		}
+		f.state.Session = wgapi.Session{}
+		f.state.SessionTokenHash = ""
+		f.state.UsernameHash = usernameHash
+	}
+
+	if sessionToken == "" {
 		return
 	}
-	hash := sha256.Sum256([]byte(token))
-	tokenHash := hex.EncodeToString(hash[:])
+	tokenHash := hashHex(sessionToken)
 	if tokenHash == f.state.SessionTokenHash {
 		return // already applied, the stored session is more recent
 	}
 
 	logger.Debug("using PureVPN session token as single sign-on cookie")
-	f.state.Session = f.state.Session.WithSessionToken(token)
+	f.state.Session = f.state.Session.WithSessionToken(sessionToken)
 	f.state.SessionTokenHash = tokenHash
+}
+
+func hashHex(value string) string {
+	hash := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(hash[:])
 }
 
 func (f *wireguardFetcher) loadState(logger Logger) {

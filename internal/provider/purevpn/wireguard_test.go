@@ -249,7 +249,8 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 	require.NoError(t, json.Unmarshal(data, &state))
 	assert.Equal(t, connection.PrivateKey, state.PrivateKey)
 	assert.Equal(t, api.token, state.Session.AccessToken)
-	assert.NotEmpty(t, state.SessionTokenHash)
+	assert.Equal(t, hashHex(testSSOCookie), state.SessionTokenHash)
+	assert.Equal(t, hashHex(""), state.UsernameHash)
 	assert.NotContains(t, string(data), "Bearer")
 
 	// A restarted fetcher reuses the persisted key pair and session,
@@ -412,37 +413,149 @@ func Test_wireguardFetcher_fetch_cleanupError(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func Test_wireguardFetcher_applySessionToken(t *testing.T) {
+func Test_wireguardFetcher_applyAccount(t *testing.T) {
 	t.Parallel()
+
+	const discardedMessage = "discarding the stored PureVPN session since it is not for the configured account"
+	const seededMessage = "using PureVPN session token as single sign-on cookie"
+	storedSession := wgapi.Session{
+		AccessToken: "stored-access-token",
+		AuthCookies: map[string]string{"fusionauth.sso": "stored-sso", "fusionauth.trust": "trusted"},
+	}
 
 	testCases := map[string]struct {
 		initialState wireguardState
+		username     string
 		token        string
+		info         string
 		debug        string
-		session      wgapi.Session
-		appliedHash  bool
+		state        wireguardState
 	}{
-		"empty_token": {
-			initialState: wireguardState{Session: wgapi.Session{AccessToken: "existing"}},
-			session:      wgapi.Session{AccessToken: "existing"},
+		"new_state_without_token": {
+			username: "alice",
+			state:    wireguardState{UsernameHash: hashHex("alice")},
 		},
-		"sso_token_keeps_other_cookies": {
-			initialState: wireguardState{Session: wgapi.Session{
-				AccessToken: "old-access-token",
-				AuthCookies: map[string]string{"fusionauth.sso": "old", "fusionauth.trust": "trusted"},
-			}},
-			token: "sso-cookie-value",
-			debug: "using PureVPN session token as single sign-on cookie",
-			session: wgapi.Session{
-				AuthCookies: map[string]string{"fusionauth.sso": "sso-cookie-value", "fusionauth.trust": "trusted"},
+		"new_state_with_token": {
+			username: "alice",
+			token:    "new-sso",
+			debug:    seededMessage,
+			state: wireguardState{
+				Session:          wgapi.Session{AuthCookies: map[string]string{"fusionauth.sso": "new-sso"}},
+				UsernameHash:     hashHex("alice"),
+				SessionTokenHash: hashHex("new-sso"),
 			},
-			appliedHash: true,
 		},
-		"sso_token_without_cookies": {
-			token:       "sso-cookie-value",
-			debug:       "using PureVPN session token as single sign-on cookie",
-			session:     wgapi.Session{AuthCookies: map[string]string{"fusionauth.sso": "sso-cookie-value"}},
-			appliedHash: true,
+		"unchanged_account_without_token": {
+			initialState: wireguardState{
+				PrivateKey:   "key",
+				Session:      storedSession,
+				UsernameHash: hashHex("alice"),
+			},
+			username: "alice",
+			state: wireguardState{
+				PrivateKey:   "key",
+				Session:      storedSession,
+				UsernameHash: hashHex("alice"),
+			},
+		},
+		"unchanged_account_and_token": {
+			initialState: wireguardState{
+				PrivateKey:       "key",
+				Session:          storedSession,
+				UsernameHash:     hashHex("alice"),
+				SessionTokenHash: hashHex("old-sso"),
+			},
+			username: "alice",
+			token:    "old-sso",
+			state: wireguardState{
+				PrivateKey:       "key",
+				Session:          storedSession,
+				UsernameHash:     hashHex("alice"),
+				SessionTokenHash: hashHex("old-sso"),
+			},
+		},
+		"token_removed": {
+			initialState: wireguardState{
+				PrivateKey:       "key",
+				Session:          storedSession,
+				UsernameHash:     hashHex("alice"),
+				SessionTokenHash: hashHex("old-sso"),
+			},
+			username: "alice",
+			state: wireguardState{
+				PrivateKey:       "key",
+				Session:          storedSession,
+				UsernameHash:     hashHex("alice"),
+				SessionTokenHash: hashHex("old-sso"),
+			},
+		},
+		"changed_token_keeps_other_cookies": {
+			initialState: wireguardState{
+				PrivateKey:       "key",
+				Session:          storedSession,
+				UsernameHash:     hashHex("alice"),
+				SessionTokenHash: hashHex("old-sso"),
+			},
+			username: "alice",
+			token:    "new-sso",
+			debug:    seededMessage,
+			state: wireguardState{
+				PrivateKey: "key",
+				Session: wgapi.Session{
+					AuthCookies: map[string]string{"fusionauth.sso": "new-sso", "fusionauth.trust": "trusted"},
+				},
+				UsernameHash:     hashHex("alice"),
+				SessionTokenHash: hashHex("new-sso"),
+			},
+		},
+		"changed_username_discards_session": {
+			initialState: wireguardState{
+				PrivateKey:       "key",
+				Session:          storedSession,
+				UsernameHash:     hashHex("alice"),
+				SessionTokenHash: hashHex("old-sso"),
+			},
+			username: "bob",
+			info:     discardedMessage,
+			state: wireguardState{
+				PrivateKey:   "key",
+				UsernameHash: hashHex("bob"),
+			},
+		},
+		"changed_username_with_same_token": {
+			initialState: wireguardState{
+				PrivateKey:       "key",
+				Session:          storedSession,
+				UsernameHash:     hashHex("alice"),
+				SessionTokenHash: hashHex("old-sso"),
+			},
+			username: "bob",
+			token:    "old-sso",
+			info:     discardedMessage,
+			debug:    seededMessage,
+			state: wireguardState{
+				PrivateKey:       "key",
+				Session:          wgapi.Session{AuthCookies: map[string]string{"fusionauth.sso": "old-sso"}},
+				UsernameHash:     hashHex("bob"),
+				SessionTokenHash: hashHex("old-sso"),
+			},
+		},
+		"missing_username_hash_discards_session": {
+			initialState: wireguardState{
+				PrivateKey:       "key",
+				Session:          storedSession,
+				SessionTokenHash: hashHex("old-sso"),
+			},
+			username: "alice",
+			token:    "old-sso",
+			info:     discardedMessage,
+			debug:    seededMessage,
+			state: wireguardState{
+				PrivateKey:       "key",
+				Session:          wgapi.Session{AuthCookies: map[string]string{"fusionauth.sso": "old-sso"}},
+				UsernameHash:     hashHex("alice"),
+				SessionTokenHash: hashHex("old-sso"),
+			},
 		},
 	}
 
@@ -452,20 +565,84 @@ func Test_wireguardFetcher_applySessionToken(t *testing.T) {
 			ctrl := gomock.NewController(t)
 
 			logger := NewMockLogger(ctrl)
+			if testCase.info != "" {
+				logger.EXPECT().Info(testCase.info)
+			}
 			if testCase.debug != "" {
 				logger.EXPECT().Debug(testCase.debug)
 			}
 			fetcher := &wireguardFetcher{state: testCase.initialState}
-			fetcher.applySessionToken(testCase.token, logger)
-			assert.Equal(t, testCase.session, fetcher.state.Session)
-			assert.Equal(t, testCase.appliedHash, fetcher.state.SessionTokenHash != "")
 
-			// A refreshed session is not overwritten by the same token.
+			fetcher.applyAccount(testCase.username, testCase.token, logger)
+			assert.Equal(t, testCase.state, fetcher.state)
+
+			// A refreshed session is kept for the same settings.
 			fetcher.state.Session = wgapi.Session{AccessToken: "refreshed"}
-			fetcher.applySessionToken(testCase.token, logger)
+			fetcher.applyAccount(testCase.username, testCase.token, logger)
 			assert.Equal(t, wgapi.Session{AccessToken: "refreshed"}, fetcher.state.Session)
 		})
 	}
+}
+
+func Test_wireguardFetcher_fetch_accountChange(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+
+	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
+	server, network := newTestServer(t, api)
+	fetcher := newTestFetcher(t, server.URL)
+
+	key, err := wgtypes.GeneratePrivateKey()
+	require.NoError(t, err)
+	fetcher.state.PrivateKey = key.String()
+
+	// Logged in for the first account through the session token.
+	logger := NewMockLogger(ctrl)
+	gomock.InOrder(
+		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
+	)
+	vpnSettings := testVPNSettings(testSSOCookie, "")
+	*vpnSettings.PureVPN.Username = "alice"
+	*vpnSettings.PureVPN.Password = "alice-password"
+	_, err = fetcher.fetch(context.Background(), vpnSettings, network, logger)
+	require.NoError(t, err)
+
+	// Password changed for the same account: the stored session is used.
+	logger = NewMockLogger(ctrl)
+	gomock.InOrder(
+		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
+	)
+	vpnSettings = testVPNSettings("", "")
+	*vpnSettings.PureVPN.Username = "alice"
+	*vpnSettings.PureVPN.Password = "alice-new-password"
+	_, err = fetcher.fetch(context.Background(), vpnSettings, network, logger)
+	require.NoError(t, err)
+
+	// Another account: the stored session of the first account must not
+	// be used, and the login with the new account credentials fails.
+	logger = NewMockLogger(ctrl)
+	gomock.InOrder(
+		logger.EXPECT().Info("discarding the stored PureVPN session since it is not for the configured account"),
+		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+	)
+	vpnSettings = testVPNSettings("", "")
+	*vpnSettings.PureVPN.Username = "bob"
+	*vpnSettings.PureVPN.Password = "bob-password"
+	_, err = fetcher.fetch(context.Background(), vpnSettings, network, logger)
+	require.ErrorContains(t, err, "requesting configuration from PureVPN: ")
+
+	data, err := os.ReadFile(fetcher.statePath)
+	require.NoError(t, err)
+	var state wireguardState
+	require.NoError(t, json.Unmarshal(data, &state))
+	assert.Equal(t, key.String(), state.PrivateKey, "the key pair must be kept")
+	assert.Equal(t, hashHex("bob"), state.UsernameHash)
+	assert.Empty(t, state.SessionTokenHash)
+	assert.NotEqual(t, testJWT, state.Session.AccessToken)
+	assert.NotContains(t, state.Session.AuthCookies, "fusionauth.sso")
 }
 
 func Test_wireguardFetcher_saveState(t *testing.T) {
