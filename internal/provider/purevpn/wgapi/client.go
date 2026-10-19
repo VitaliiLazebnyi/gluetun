@@ -44,12 +44,34 @@ type Session struct {
 	// long lived fusionauth.sso single sign-on session cookie
 	// and the fusionauth.trust two-factor trusted device cookie.
 	AuthCookies map[string]string `json:"auth_cookies,omitempty"`
+
+	// apiCache holds values from the member area API reused between
+	// fetches, and is unexported so it is never persisted.
+	apiCache apiCache
+}
+
+// apiCache holds the selected subscription and the encrypted VPN
+// password, so a later fetch for the same requested subscription ID
+// and VPN username only does the Wireguard server request, since the
+// member area is behind Cloudflare which can challenge API requests.
+// It is cleared if the API answers the Wireguard server request with an
+// error or an unexpected response, and when logging in with the account
+// credentials. It is kept on network errors and Cloudflare blocks.
+type apiCache struct {
+	// wantedSubscriptionID and wantedVPNUsername are the
+	// [ServerRequest] fields the cached values were selected for.
+	wantedSubscriptionID string
+	wantedVPNUsername    string
+	subscriptionID       string
+	vpnUsername          string
+	// encryptedPassword is empty if nothing is cached.
+	encryptedPassword string
 }
 
 // WithSessionToken returns a copy of the session using the session
 // token given as the fusionauth.sso single sign-on cookie, and with
-// the access token from the previous single sign-on session cleared.
-// Other authentication cookies are kept.
+// the access token and the cached API values from the previous single
+// sign-on session cleared. Other authentication cookies are kept.
 func (s Session) WithSessionToken(token string) Session {
 	authCookies := maps.Clone(s.AuthCookies)
 	if authCookies == nil {
@@ -122,7 +144,8 @@ func New(httpClient *http.Client, authURL, appURL string,
 	// The cookie jar is replaced on each login.
 	httpClientCopy.Jar = newCookieJar(client.authURL, nil)
 	client.httpClient = &httpClientCopy
-	client.session = Session{AccessToken: session.AccessToken, AuthCookies: maps.Clone(session.AuthCookies)}
+	client.session = session
+	client.session.AuthCookies = maps.Clone(session.AuthCookies)
 
 	return client, nil
 }
@@ -148,7 +171,9 @@ func isAuthRequest(request *http.Request, authURL *url.URL) bool {
 
 // Session returns a copy of the current session.
 func (c *Client) Session() Session {
-	return Session{AccessToken: c.session.AccessToken, AuthCookies: maps.Clone(c.session.AuthCookies)}
+	session := c.session
+	session.AuthCookies = maps.Clone(c.session.AuthCookies)
+	return session
 }
 
 // newCookieJar returns a cookie jar holding the auth cookies given,

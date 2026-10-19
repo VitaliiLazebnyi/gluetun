@@ -66,6 +66,7 @@ type fakePureVPN struct {
 	challengePath       string            // path answered with a Cloudflare challenge
 	// State
 	counters    fakeCounters
+	apiPaths    []string // paths of the API requests with an accepted token
 	latestToken string
 	validTokens map[string]bool
 }
@@ -287,6 +288,7 @@ func (f *fakePureVPN) serveAPI(writer http.ResponseWriter, request *http.Request
 	if !f.parseForm(writer, request) {
 		return
 	}
+	f.apiPaths = append(f.apiPaths, request.URL.Path)
 
 	subscriptions := f.subscriptions
 	if subscriptions == nil {
@@ -311,7 +313,10 @@ func (f *fakePureVPN) serveAPI(writer http.ResponseWriter, request *http.Request
 		body = map[string]string{"encrypPass": "encrypted"}
 	case "/v2/api/wireguard/get-wg-server":
 		assert.Equal(f.t, testVPNUsername, request.PostForm.Get("sUsername"))
-		assert.Equal(f.t, "encrypted", request.PostForm.Get("sPassword"))
+		if request.PostForm.Get("sPassword") != "encrypted" {
+			fmt.Fprint(writer, `{"status":false,"message":"Invalid VPN credentials","error_code":"other"}`)
+			return
+		}
 		assert.Equal(f.t, "US", request.PostForm.Get("sCountrySlug"))
 		if f.noCityID {
 			assert.False(f.t, request.PostForm.Has("iCityId"))
@@ -855,6 +860,153 @@ func Test_Client_FetchConfig_second_fetch(t *testing.T) {
 	}
 }
 
+func Test_Client_FetchConfig_apiCache(t *testing.T) {
+	t.Parallel()
+
+	const subscriptionPath = "/v2/api/subscription"
+	const passwordPath = "/v2/api/wireguard/get-encrypt-password" //nolint:gosec // not a credential
+	const serverPath = "/v2/api/wireguard/get-wg-server"
+
+	testCases := map[string]struct {
+		// beforeSecondFetch modifies the session given to the client
+		// of the second fetch, the fake server and the second request.
+		beforeSecondFetch func(session *Session, fake *fakePureVPN, request *ServerRequest)
+		errWrapped        error
+		apiPaths          []string
+		encryptedPassword string // cached after the second fetch
+	}{
+		"cache_used": {
+			apiPaths:          []string{serverPath},
+			encryptedPassword: "encrypted",
+		},
+		"cache_ignored_for_other_subscription_id": {
+			beforeSecondFetch: func(_ *Session, _ *fakePureVPN, request *ServerRequest) {
+				request.SubscriptionID = testSubsID
+			},
+			apiPaths:          []string{subscriptionPath, passwordPath, serverPath},
+			encryptedPassword: "encrypted",
+		},
+		"cache_ignored_for_other_vpn_username": {
+			beforeSecondFetch: func(_ *Session, _ *fakePureVPN, request *ServerRequest) {
+				request.VPNUsername = testVPNUsername
+			},
+			apiPaths:          []string{subscriptionPath, passwordPath, serverPath},
+			encryptedPassword: "encrypted",
+		},
+		"stale_cache_retried_with_fresh_values": {
+			beforeSecondFetch: func(session *Session, _ *fakePureVPN, _ *ServerRequest) {
+				session.apiCache.encryptedPassword = "stale"
+			},
+			apiPaths:          []string{serverPath, subscriptionPath, passwordPath, serverPath},
+			encryptedPassword: "encrypted",
+		},
+		"cache_cleared_on_unexpected_response": {
+			beforeSecondFetch: func(_ *Session, fake *fakePureVPN, _ *ServerRequest) {
+				fake.apiResponses = map[string]*fakeResponse{serverPath: {
+					status: http.StatusOK, body: `{"status":true,"body":[]}`,
+				}}
+			},
+			errWrapped: errUnexpectedResponse,
+			apiPaths:   []string{serverPath},
+		},
+		"cache_kept_when_blocked": {
+			beforeSecondFetch: func(_ *Session, fake *fakePureVPN, _ *ServerRequest) {
+				fake.apiResponses = map[string]*fakeResponse{serverPath: {
+					status: http.StatusForbidden, contentType: "text/html", body: "<html>Access denied</html>",
+				}}
+			},
+			errWrapped:        errBlocked,
+			apiPaths:          []string{serverPath},
+			encryptedPassword: "encrypted",
+		},
+		"api_error_with_fresh_values": {
+			beforeSecondFetch: func(session *Session, fake *fakePureVPN, _ *ServerRequest) {
+				session.apiCache.encryptedPassword = "stale"
+				fake.apiResponses = map[string]*fakeResponse{serverPath: {
+					status: http.StatusOK, body: `{"status":false,"message":"No server available"}`,
+				}}
+			},
+			errWrapped: errAPI,
+			apiPaths:   []string{serverPath, subscriptionPath, passwordPath, serverPath},
+		},
+		"cache_cleared_by_credentials_login": {
+			beforeSecondFetch: func(session *Session, fake *fakePureVPN, _ *ServerRequest) {
+				session.AccessToken = ""
+				fake.ssoDisabled = true
+				// Must not be used after logging in with the credentials.
+				session.apiCache.encryptedPassword = "other-account"
+			},
+			apiPaths:          []string{subscriptionPath, passwordPath, serverPath},
+			encryptedPassword: "encrypted",
+		},
+		"cache_kept_by_single_sign_on_login": {
+			beforeSecondFetch: func(session *Session, _ *fakePureVPN, _ *ServerRequest) {
+				session.AccessToken = ""
+			},
+			apiPaths:          []string{serverPath},
+			encryptedPassword: "encrypted",
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fake := newFakePureVPN(t)
+			server := httptest.NewServer(fake)
+			defer server.Close()
+			credentials := Credentials{Username: testUsername, Password: testPassword}
+
+			client := newTestClient(t, server.URL, credentials, Session{})
+			_, err := client.FetchConfig(t.Context(), newTestRequest())
+			require.NoError(t, err)
+
+			// The second fetch uses a new client created from the session
+			// of the first client, as done by the caller between fetches.
+			session := client.Session()
+			request := newTestRequest()
+			fake.mutex.Lock()
+			fake.apiPaths = nil
+			if testCase.beforeSecondFetch != nil {
+				testCase.beforeSecondFetch(&session, fake, &request)
+			}
+			fake.mutex.Unlock()
+			client = newTestClient(t, server.URL, credentials, session)
+
+			config, err := client.FetchConfig(t.Context(), request)
+
+			assert.ErrorIs(t, err, testCase.errWrapped)
+			if testCase.errWrapped == nil {
+				assert.Equal(t, newExpectedConfig(t), config)
+			}
+			fake.mutex.Lock()
+			assert.Equal(t, testCase.apiPaths, fake.apiPaths)
+			fake.mutex.Unlock()
+			assert.Equal(t, testCase.encryptedPassword, client.Session().apiCache.encryptedPassword)
+		})
+	}
+}
+
+func Test_Session_JSON(t *testing.T) {
+	t.Parallel()
+
+	session := Session{
+		AccessToken: "token",
+		AuthCookies: map[string]string{"fusionauth.sso": "sso"},
+		apiCache: apiCache{
+			wantedSubscriptionID: "wanted-subscription",
+			wantedVPNUsername:    "wanted-username",
+			subscriptionID:       "cached-subscription",
+			vpnUsername:          "cached-username",
+			encryptedPassword:    "cached-password",
+		},
+	}
+
+	data, err := json.Marshal(session) //nolint:gosec // test values
+
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"access_token":"token","auth_cookies":{"fusionauth.sso":"sso"}}`, string(data))
+}
+
 type roundTripFunc func(request *http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -1244,10 +1396,10 @@ func Test_Session_WithSessionToken(t *testing.T) {
 			token:    "sso",
 			expected: Session{AuthCookies: map[string]string{"fusionauth.sso": "sso"}},
 		},
-		"sso_cookie_clears_access_token": {
+		"sso_cookie_clears_access_token_and_api_cache": {
 			session: Session{AccessToken: "old", AuthCookies: map[string]string{
 				"fusionauth.sso": "old", "fusionauth.trust": "trusted",
-			}},
+			}, apiCache: apiCache{encryptedPassword: "cached"}},
 			token: "sso",
 			expected: Session{AuthCookies: map[string]string{
 				"fusionauth.sso": "sso", "fusionauth.trust": "trusted",

@@ -53,6 +53,8 @@ func (c *Client) authenticate(ctx context.Context) (token string, err error) {
 		// The login form is only shown without a valid single sign-on session.
 		return "", fmt.Errorf("%w and %w", errSessionExpired, errCredentialsNotSet)
 	default:
+		// Logging in with the credentials starts a new account session.
+		c.session.apiCache = apiCache{}
 		page, err = c.submitLoginForm(ctx, page, loginForm)
 		if err != nil {
 			return "", fmt.Errorf("submitting login form: %w", err)
