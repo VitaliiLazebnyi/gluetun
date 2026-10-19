@@ -46,6 +46,25 @@ func Test_parseHTML(t *testing.T) {
 <p class="alert-error">Visible <script>var captcha = 1;</script>error</p>`,
 			errorMessages: []string{"Visible error"},
 		},
+		"inputs_after_form_end": {
+			body: `<form action="/first"><input name="a" value="1"><button name="go" value="x">Go</button></form>
+<input name="after_first" value="2">
+<form action="/second"><input name="b" value="3"></form>
+<input name="after_second" value="4">`,
+			forms: []*htmlForm{
+				{
+					action: "/first",
+					inputs: []htmlInput{
+						{name: "a", value: "1"},
+						{name: "go", value: "x", inputType: "submit"},
+					},
+				},
+				{
+					action: "/second",
+					inputs: []htmlInput{{name: "b", value: "3"}},
+				},
+			},
+		},
 		"input_outside_form_and_alert": {
 			body:          `<input name="ignored"><div role="alert">Alert <b>text</b></div>`,
 			errorMessages: []string{"Alert text"},
@@ -189,6 +208,13 @@ func Test_htmlForm_values(t *testing.T) {
 		"loginId": {"user"},
 		"trust":   {"true"},
 	}, form.values())
+
+	// The button without type is a submit button, and the input
+	// after the form end is not part of the form.
+	forms, _ := parseHTML([]byte(`<form><input name="loginId" value="user">` +
+		`<button name="action" value="cancel">Cancel</button></form><input name="other" value="x">`))
+	require.Len(t, forms, 1)
+	assert.Equal(t, url.Values{"loginId": {"user"}}, forms[0].values())
 }
 
 func Test_Client_submitForm(t *testing.T) {

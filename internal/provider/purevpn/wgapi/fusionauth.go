@@ -363,6 +363,11 @@ func (p *htmlParser) walk(node *html.Node, insideError, hidden bool) {
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
 		p.walk(child, insideError, hidden)
 	}
+	if node.Type == html.ElementNode && node.Data == "form" {
+		// Inputs after the end of the form are not part of it.
+		// Forms cannot be nested, the HTML parser drops inner forms.
+		p.currentForm = nil
+	}
 }
 
 func (p *htmlParser) handleElement(node *html.Node) {
@@ -375,10 +380,14 @@ func (p *htmlParser) handleElement(node *html.Node) {
 			return
 		}
 		_, checked := attributeExists(node, "checked")
+		inputType := strings.ToLower(attribute(node, "type"))
+		if inputType == "" && node.Data != "input" {
+			inputType = "submit" // a button without type is a submit button
+		}
 		p.currentForm.inputs = append(p.currentForm.inputs, htmlInput{
 			name:      attribute(node, "name"),
 			value:     attribute(node, "value"),
-			inputType: strings.ToLower(attribute(node, "type")),
+			inputType: inputType,
 			checked:   checked,
 		})
 	}
