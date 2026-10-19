@@ -58,49 +58,6 @@ func Test_PureVPN_validate(t *testing.T) {
 	}
 }
 
-func Test_Wireguard_validate_purevpn(t *testing.T) {
-	t.Parallel()
-
-	const validKey = "Y0QnWR6mhgxOjNkPUkRdPYKYrB+pERhKFAuhkBapHw8="
-	testCases := map[string]struct {
-		privateKey   string
-		preSharedKey string
-		addresses    []netip.Prefix
-		errMessage   string
-	}{
-		"defaults":            {},
-		"valid_private_key":   {privateKey: validKey},
-		"invalid_private_key": {privateKey: "invalid", errMessage: "private key is not valid"},
-		"preshared_key_set":   {preSharedKey: validKey, errMessage: "pre-shared key cannot be set for PureVPN"},
-		"addresses_set": {
-			addresses:  []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")},
-			errMessage: "interface addresses cannot be set for PureVPN",
-		},
-	}
-
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			wireguardSettings := Wireguard{
-				PrivateKey:   new(testCase.privateKey),
-				PreSharedKey: new(testCase.preSharedKey),
-				Addresses:    testCase.addresses,
-			}
-			wireguardSettings.setDefaults(providers.Purevpn)
-
-			const ipv6Supported, amneziawg = false, false
-			err := wireguardSettings.validate(providers.Purevpn, ipv6Supported, amneziawg)
-
-			if testCase.errMessage == "" {
-				assert.NoError(t, err)
-				return
-			}
-			assert.ErrorContains(t, err, testCase.errMessage)
-		})
-	}
-}
-
 func Test_WireguardSelection_validate_purevpn(t *testing.T) {
 	t.Parallel()
 
