@@ -166,7 +166,6 @@ type fetcherProvider struct {
 
 func Test_setupWireguard(t *testing.T) {
 	t.Parallel()
-	ctrl := gomock.NewController(t)
 
 	const privateKey = "Y0QnWR6mhgxOjNkPUkRdPYKYrB+pERhKFAuhkBapHw8="
 	const publicKey = "aPxGwq8zERHQ3Q1cOZFdJ+cvJX5Ka4mLN38AyYKYF10="
@@ -176,39 +175,142 @@ func Test_setupWireguard(t *testing.T) {
 		Port:   51820,
 		PubKey: publicKey,
 	}
-	vpnSettings := settings.VPN{
-		Wireguard: settings.Wireguard{
-			PrivateKey:                  new(""),
-			PreSharedKey:                new(""),
-			PersistentKeepaliveInterval: new(time.Duration(0)),
-			Interface:                   "wg0",
-			Implementation:              "userspace",
-			MTU:                         new(uint32(0)),
-			GSO:                         new(false),
-			AllowedIPs:                  []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+	newVPNSettings := func(privateKey string, addresses []netip.Prefix) settings.VPN {
+		return settings.VPN{
+			Provider: settings.Provider{
+				ServerSelection: settings.ServerSelection{VPN: "wireguard", Countries: []string{"Germany"}},
+			},
+			Wireguard: settings.Wireguard{
+				PrivateKey:                  new(privateKey),
+				PreSharedKey:                new(""),
+				Addresses:                   addresses,
+				PersistentKeepaliveInterval: new(time.Duration(0)),
+				Interface:                   "wg0",
+				Implementation:              "userspace",
+				MTU:                         new(uint32(0)),
+				GSO:                         new(false),
+				AllowedIPs:                  []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+			},
+		}
+	}
+	// fetcherSettings are the settings used with a WireguardFetcher
+	// provider, without private key nor interface addresses.
+	fetcherSettings := newVPNSettings("", nil)
+	// connectionSettings are the settings used with a provider
+	// getting its connection from the servers data.
+	connectionSettings := newVPNSettings(privateKey, []netip.Prefix{netip.MustParsePrefix("10.2.0.2/32")})
+	errTest := errors.New("test error")
+
+	testCases := map[string]struct {
+		vpnSettings settings.VPN
+		// buildProvider returns the provider with its mocked calls expected.
+		buildProvider func(ctrl *gomock.Controller, ctx context.Context,
+			logger wireguard.Logger) provider.Provider
+		// connectionFound is true if the provider gives a connection,
+		// so the keys are logged and the firewall is set.
+		connectionFound bool
+		firewallErr     error
+		errMessage      string
+	}{
+		"fetcher_provider": {
+			vpnSettings: fetcherSettings,
+			buildProvider: func(ctrl *gomock.Controller, ctx context.Context,
+				logger wireguard.Logger,
+			) provider.Provider {
+				fetcher := NewMockWireguardFetcher(ctrl)
+				fetcher.EXPECT().FetchWireguardConnection(ctx, fetcherSettings, logger).
+					Return(models.WireguardConnection{
+						Connection: serverConnection,
+						PrivateKey: privateKey,
+						Addresses:  []netip.Prefix{netip.MustParsePrefix("172.21.7.9/32")},
+					}, nil).Times(1)
+				return fetcherProvider{MockWireguardFetcher: fetcher}
+			},
+			connectionFound: true,
+		},
+		"fetcher_provider_error": {
+			vpnSettings: fetcherSettings,
+			buildProvider: func(ctrl *gomock.Controller, ctx context.Context,
+				logger wireguard.Logger,
+			) provider.Provider {
+				fetcher := NewMockWireguardFetcher(ctrl)
+				fetcher.EXPECT().FetchWireguardConnection(ctx, fetcherSettings, logger).
+					Return(models.WireguardConnection{}, errTest).Times(1)
+				return fetcherProvider{MockWireguardFetcher: fetcher}
+			},
+			errMessage: "fetching Wireguard connection: test error",
+		},
+		"servers_data_provider": {
+			vpnSettings: connectionSettings,
+			buildProvider: func(ctrl *gomock.Controller, _ context.Context,
+				_ wireguard.Logger,
+			) provider.Provider {
+				serversDataProvider := NewMockProvider(ctrl)
+				serversDataProvider.EXPECT().GetConnection(connectionSettings.Provider.ServerSelection, false).
+					Return(serverConnection, nil).Times(1)
+				return serversDataProvider
+			},
+			connectionFound: true,
+		},
+		"servers_data_provider_error": {
+			vpnSettings: connectionSettings,
+			buildProvider: func(ctrl *gomock.Controller, _ context.Context,
+				_ wireguard.Logger,
+			) provider.Provider {
+				serversDataProvider := NewMockProvider(ctrl)
+				serversDataProvider.EXPECT().GetConnection(connectionSettings.Provider.ServerSelection, false).
+					Return(models.Connection{}, errTest).Times(1)
+				return serversDataProvider
+			},
+			errMessage: "finding a VPN server: test error",
+		},
+		"firewall_error": {
+			vpnSettings: connectionSettings,
+			buildProvider: func(ctrl *gomock.Controller, _ context.Context,
+				_ wireguard.Logger,
+			) provider.Provider {
+				serversDataProvider := NewMockProvider(ctrl)
+				serversDataProvider.EXPECT().GetConnection(connectionSettings.Provider.ServerSelection, false).
+					Return(serverConnection, nil).Times(1)
+				return serversDataProvider
+			},
+			connectionFound: true,
+			firewallErr:     errTest,
+			errMessage:      "setting firewall: test error",
 		},
 	}
-	ctx := context.Background()
-	firewall := NewMockFirewall(ctrl)
-	logger := NewMockLogger(ctrl)
-	fetcher := NewMockWireguardFetcher(ctrl)
-	fetcher.EXPECT().FetchWireguardConnection(ctx, vpnSettings, logger).
-		Return(models.WireguardConnection{
-			Connection: serverConnection,
-			PrivateKey: privateKey,
-			Addresses:  []netip.Prefix{netip.MustParsePrefix("172.21.7.9/32")},
-		}, nil)
-	logger.EXPECT().Debug("Wireguard server public key: " + publicKey)
-	logger.EXPECT().Debug("Wireguard client private key: Y0Q...w8=")
-	logger.EXPECT().Debug("Wireguard pre-shared key: [not set]")
-	firewall.EXPECT().SetVPNConnection(ctx, serverConnection, "wg0").Return(nil)
 
-	wireguarder, connection, err := setupWireguard(ctx, nil, firewall,
-		fetcherProvider{MockWireguardFetcher: fetcher}, vpnSettings, netlink.IPv6Unsupported, logger)
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctrl := gomock.NewController(t)
 
-	assert.NoError(t, err)
-	assert.NotNil(t, wireguarder)
-	assert.Equal(t, serverConnection, connection)
+			ctx := context.Background()
+			firewall := NewMockFirewall(ctrl)
+			logger := NewMockLogger(ctrl)
+			vpnProvider := testCase.buildProvider(ctrl, ctx, logger)
+			if testCase.connectionFound {
+				logger.EXPECT().Debug("Wireguard server public key: " + publicKey).Times(1)
+				logger.EXPECT().Debug("Wireguard client private key: Y0Q...w8=").Times(1)
+				logger.EXPECT().Debug("Wireguard pre-shared key: [not set]").Times(1)
+				firewall.EXPECT().SetVPNConnection(ctx, serverConnection, "wg0").
+					Return(testCase.firewallErr).Times(1)
+			}
+
+			wireguarder, connection, err := setupWireguard(ctx, nil, firewall,
+				vpnProvider, testCase.vpnSettings, netlink.IPv6Unsupported, logger)
+
+			if testCase.errMessage != "" {
+				assert.ErrorContains(t, err, testCase.errMessage)
+				assert.Nil(t, wireguarder)
+				assert.Equal(t, models.Connection{}, connection)
+				return
+			}
+			assert.NoError(t, err)
+			assert.NotNil(t, wireguarder)
+			assert.Equal(t, serverConnection, connection)
+		})
+	}
 }
 
 func Test_buildWireguardSettings(t *testing.T) {
