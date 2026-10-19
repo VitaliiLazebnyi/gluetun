@@ -3,6 +3,7 @@
 package statusfile
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -12,16 +13,8 @@ import (
 // creating it if needed, sets its permissions to 0664 and chowns it
 // to the given puid and pgid. A puid or pgid of -1 leaves the
 // corresponding ownership unchanged.
-//
-// The file is written in place (and not renamed over) so single file
-// bind mounts, hardlinks and inotify watches on it keep working. The
-// content is written before the chmod and chown, so it is not lost
-// if either of these fails.
-// The file is only chmoded if its permissions differ from 0664:
-// once the file is chowned to puid, chmoding it requires CAP_FOWNER
-// which may not be available, for example with cap_drop ALL.
-// Writing to the file still requires CAP_DAC_OVERRIDE once it is
-// owned by puid.
+// The content is written first, so it is not lost if the chmod or chown
+// fails. Writing in place keeps single file bind mounts working.
 func Write(path string, content []byte, puid, pgid int) (err error) {
 	// TODO v4: remove world permission (0660)
 	const permission = fs.FileMode(0o664)
@@ -48,9 +41,14 @@ func Write(path string, content []byte, puid, pgid int) (err error) {
 
 	// chmod explicitly since OpenFile is subject to the umask,
 	// and it does not change the permissions of an existing file.
+	// Only chmod when needed, since chmoding a file owned by another
+	// user, such as a file previously chowned to puid, requires
+	// CAP_FOWNER which may not be available, for example with cap_drop ALL.
+	// In that case, the permission error is ignored since the content is
+	// already written and only the permissions are left unchanged.
 	if info.Mode().Perm() != permission {
 		err = file.Chmod(permission)
-		if err != nil {
+		if err != nil && !errors.Is(err, fs.ErrPermission) {
 			return fmt.Errorf("setting file permissions: %w", err)
 		}
 	}

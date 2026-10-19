@@ -14,7 +14,6 @@ func Test_Write(t *testing.T) {
 	t.Parallel()
 
 	const root = 0
-	isRoot := os.Geteuid() == root
 
 	testCases := map[string]struct {
 		missingParent   bool
@@ -22,8 +21,9 @@ func Test_Write(t *testing.T) {
 		existingMode    fs.FileMode // 0 means no existing file
 		content         string
 		chownToRoot     bool
-		// errMessage is the expected error message substring,
-		// which can differ depending on whether the test runs as root.
+		// nonRootOnly is set for cases relying on permission checks,
+		// which root bypasses.
+		nonRootOnly     bool
 		errMessage      string
 		expectedContent string
 		expectedMode    fs.FileMode
@@ -64,26 +64,16 @@ func Test_Write(t *testing.T) {
 			existingContent: "1.2.3.4",
 			existingMode:    0o444,
 			content:         "5.6.7.8",
-			errMessage: map[bool]string{
-				true:  "",
-				false: "opening file: open ",
-			}[isRoot],
-			expectedContent: map[bool]string{
-				true:  "5.6.7.8",
-				false: "1.2.3.4",
-			}[isRoot],
-			expectedMode: map[bool]fs.FileMode{
-				true:  0o664,
-				false: 0o444,
-			}[isRoot],
+			nonRootOnly:     true,
+			errMessage:      "opening file: open ",
+			expectedContent: "1.2.3.4",
+			expectedMode:    0o444,
 		},
 		"chown_failure_keeps_content": {
-			content:     "1.2.3.4",
-			chownToRoot: true,
-			errMessage: map[bool]string{
-				true:  "",
-				false: "chowning file: chown ",
-			}[isRoot],
+			content:         "1.2.3.4",
+			chownToRoot:     true,
+			nonRootOnly:     true,
+			errMessage:      "chowning file: chown ",
 			expectedContent: "1.2.3.4",
 			expectedMode:    0o664,
 		},
@@ -97,6 +87,10 @@ func Test_Write(t *testing.T) {
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+
+			if testCase.nonRootOnly && os.Geteuid() == root {
+				t.Skip("root bypasses permission checks")
+			}
 
 			path := filepath.Join(t.TempDir(), "file")
 			if testCase.missingParent {
