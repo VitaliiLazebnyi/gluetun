@@ -52,11 +52,11 @@ func (p PureVPN) validate() (err error) {
 	hasCredentials := *p.Username != "" && *p.Password != ""
 	switch {
 	case !hasCredentials && *p.SessionToken == "":
-		return errors.New("PureVPN account username and password, or session token, are not set")
+		return errors.New("account username and password, or session token, are not set")
 	case *p.Username != "" && *p.Password == "":
-		return errors.New("PureVPN account password is not set")
+		return errors.New("account password is not set")
 	case *p.Username == "" && *p.Password != "":
-		return errors.New("PureVPN account username is not set")
+		return errors.New("account username is not set")
 	}
 
 	if *p.TOTPSecret != "" {

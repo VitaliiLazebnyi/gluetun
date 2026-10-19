@@ -147,7 +147,10 @@ func (ss *ServerSelection) validate(vpnServiceProvider string,
 // Wireguard, for which the server location is only selected with a
 // single country and the PureVPN city ID setting.
 func validatePureVPNWireguard(ss ServerSelection, warner Warner) (err error) {
-	if len(ss.Countries) != 1 {
+	switch {
+	case len(ss.Countries) == 0:
+		return errors.New("exactly one country must be set with PureVPN Wireguard, but got none")
+	case len(ss.Countries) > 1:
 		return fmt.Errorf("exactly one country must be set with PureVPN Wireguard, but got %d: %s",
 			len(ss.Countries), strings.Join(ss.Countries, ", "))
 	}

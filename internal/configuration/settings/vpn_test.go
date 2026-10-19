@@ -19,9 +19,8 @@ func Test_VPN_Validate_purevpn(t *testing.T) {
 		errMessage string
 	}{
 		"wireguard_without_purevpn_credentials": {
-			vpnType: vpn.Wireguard,
-			errMessage: "PureVPN settings: " +
-				"PureVPN account username and password, or session token, are not set",
+			vpnType:    vpn.Wireguard,
+			errMessage: "PureVPN settings: account username and password, or session token, are not set",
 		},
 		"wireguard_with_purevpn_session_token": {
 			vpnType: vpn.Wireguard,

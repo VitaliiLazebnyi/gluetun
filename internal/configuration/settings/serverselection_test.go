@@ -114,7 +114,7 @@ func Test_ServerSelection_validate_pureVPNWireguard(t *testing.T) {
 			provider: providers.Purevpn,
 			vpnType:  vpn.Wireguard,
 			errMessage: "for VPN service provider purevpn: " +
-				"exactly one country must be set with PureVPN Wireguard, but got 0",
+				"exactly one country must be set with PureVPN Wireguard, but got none",
 		},
 		"purevpn_wireguard_two_countries": {
 			provider:  providers.Purevpn,
