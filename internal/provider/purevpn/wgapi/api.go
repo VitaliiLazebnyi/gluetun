@@ -35,8 +35,6 @@ type ServerRequest struct {
 // If the API rejects the stored access token, it logs in again once and
 // retries. An access token obtained by logging in during this call is not
 // retried, since logging in again would only double the login attempts.
-// The subscription and the encrypted VPN password are cached in the
-// session, see [apiCache].
 func (c *Client) FetchConfig(ctx context.Context, request ServerRequest) (
 	config Config, err error,
 ) {
@@ -61,27 +59,6 @@ func (c *Client) FetchConfig(ctx context.Context, request ServerRequest) (
 func (c *Client) fetchConfig(ctx context.Context, token string, request ServerRequest) (
 	config Config, err error,
 ) {
-	cache := c.session.apiCache
-	if cache.encryptedPassword != "" && cache.wantedSubscriptionID == request.SubscriptionID &&
-		cache.wantedVPNUsername == request.VPNUsername {
-		config, err = c.getWireguardServer(ctx, token, request, cache.subscriptionID,
-			cache.vpnUsername, cache.encryptedPassword)
-		switch {
-		case err == nil:
-			return config, nil
-		case ctx.Err() == nil && (errors.Is(err, errAPI) || errors.Is(err, errUnauthorized)):
-			// The cached values may be stale, so retry once with fresh values.
-			c.session.apiCache = apiCache{}
-		case errors.Is(err, errUnexpectedResponse):
-			c.session.apiCache = apiCache{}
-			return Config{}, fmt.Errorf("getting Wireguard server: %w", err)
-		default:
-			// Network errors, Cloudflare blocks and the context being
-			// canceled are not caused by the cached values.
-			return Config{}, fmt.Errorf("getting Wireguard server: %w", err)
-		}
-	}
-
 	subscriptionID, vpnUsername, err := c.selectSubscription(ctx, token,
 		request.SubscriptionID, request.VPNUsername)
 	if err != nil {
@@ -97,13 +74,6 @@ func (c *Client) fetchConfig(ctx context.Context, token string, request ServerRe
 		vpnUsername, encryptedPassword)
 	if err != nil {
 		return Config{}, fmt.Errorf("getting Wireguard server: %w", err)
-	}
-	c.session.apiCache = apiCache{
-		wantedSubscriptionID: request.SubscriptionID,
-		wantedVPNUsername:    request.VPNUsername,
-		subscriptionID:       subscriptionID,
-		vpnUsername:          vpnUsername,
-		encryptedPassword:    encryptedPassword,
 	}
 	return config, nil
 }
