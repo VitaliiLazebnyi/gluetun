@@ -10,8 +10,9 @@ import (
 )
 
 // Write writes the content to the file at the given path in place,
-// creating it if needed, sets its permissions to 0664 and chowns it
-// to the given puid and pgid. A puid or pgid of -1 leaves the
+// creating it if needed, attempts to set its permissions to 0664
+// (permission errors are ignored) and chowns it to the given puid
+// and pgid. A puid or pgid of -1 leaves the
 // corresponding ownership unchanged.
 // The content is written first, so it is not lost if the chmod or chown
 // fails. Writing in place keeps single file bind mounts working.
