@@ -78,6 +78,10 @@ func newHTTPSClient(destinationTLSName string, dial dialFunc) *http.Client {
 			ServerName: destinationTLSName,
 		},
 		DialContext: dial,
+		// HTTP/2 is otherwise disabled since DialContext and TLSClientConfig
+		// are set. Some websites behind Cloudflare, such as my.purevpn.com,
+		// often challenge HTTP/1.1 clients but not HTTP/2 clients.
+		ForceAttemptHTTP2: true,
 	}
 	return &http.Client{
 		Timeout:   timeout,
