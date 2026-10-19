@@ -115,6 +115,7 @@ ENV VPN_SERVICE_PROVIDER=pia \
     WIREGUARD_GSO=on \
     # PureVPN Wireguard
     PUREVPN_USERNAME= \
+    PUREVPN_USERNAME_SECRETFILE=/run/secrets/purevpn_username \
     PUREVPN_PASSWORD= \
     PUREVPN_PASSWORD_SECRETFILE=/run/secrets/purevpn_password \
     PUREVPN_TOTP_SECRET= \
