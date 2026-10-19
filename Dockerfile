@@ -113,6 +113,18 @@ ENV VPN_SERVICE_PROVIDER=pia \
     WIREGUARD_MTU= \
     WIREGUARD_IMPLEMENTATION=auto \
     WIREGUARD_GSO=on \
+    # PureVPN Wireguard
+    PUREVPN_USERNAME= \
+    PUREVPN_USERNAME_SECRETFILE=/run/secrets/purevpn_username \
+    PUREVPN_PASSWORD= \
+    PUREVPN_PASSWORD_SECRETFILE=/run/secrets/purevpn_password \
+    PUREVPN_TOTP_SECRET= \
+    PUREVPN_TOTP_SECRET_SECRETFILE=/run/secrets/purevpn_totp_secret \
+    PUREVPN_SESSION_TOKEN= \
+    PUREVPN_SESSION_TOKEN_SECRETFILE=/run/secrets/purevpn_session_token \
+    PUREVPN_CITY_ID= \
+    PUREVPN_SUBSCRIPTION_ID= \
+    PUREVPN_VPN_USERNAME= \
     # Amnezia
     AMNEZIAWG_ENDPOINT_IP= \
     AMNEZIAWG_ENDPOINT_PORT= \

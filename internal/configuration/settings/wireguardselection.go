@@ -37,6 +37,19 @@ type WireguardSelection struct {
 // Validate validates WireguardSelection settings.
 // It should only be ran if the VPN type chosen is Wireguard.
 func (w WireguardSelection) validate(vpnProvider string) (err error) {
+	if vpnProvider == providers.Purevpn {
+		// The endpoint and public key are fetched at runtime from PureVPN.
+		switch {
+		case w.EndpointIP.IsValid() && !w.EndpointIP.IsUnspecified():
+			return errors.New("endpoint IP cannot be set for PureVPN")
+		case *w.EndpointPort != 0:
+			return errors.New("endpoint port cannot be set for PureVPN")
+		case w.PublicKey != "":
+			return errors.New("public key cannot be set for PureVPN")
+		}
+		return nil
+	}
+
 	// Validate EndpointIP
 	switch vpnProvider {
 	case providers.Airvpn, providers.Fastestvpn, providers.Ivpn,
