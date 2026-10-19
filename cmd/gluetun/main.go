@@ -437,13 +437,6 @@ func _main(ctx context.Context, buildInfo models.BuildInformation,
 	unzipper := unzip.New(httpClient)
 	parallelResolver := resolver.NewParallelResolver(dohDialer)
 	openvpnFileExtractor := extract.New()
-	providers := provider.NewProviders(storage, time.Now, updaterLogger,
-		httpClient, unzipper, parallelResolver, publicIPLooper.Fetcher(),
-		openvpnFileExtractor, allSettings.Updater)
-
-	boringPollLogger := logger.New(log.SetComponent("boring poll"))
-	boringPoll := boringpoll.New(httpClient, boringPollLogger, allSettings.BoringPoll)
-
 	// The restricted network is used to reach VPN provider APIs before the VPN is up.
 	// Only IPv4 is used, through the IPv4 default route interface, since the
 	// IPv6 default route interface, if any, may differ.
@@ -461,10 +454,17 @@ func _main(ctx context.Context, buildInfo models.BuildInformation,
 		UpstreamResolvers: []dnsprovider.Provider{dnsprovider.Cloudflare(), dnsprovider.Google()},
 	})
 
+	providers := provider.NewProviders(storage, time.Now, updaterLogger,
+		httpClient, unzipper, parallelResolver, publicIPLooper.Fetcher(),
+		openvpnFileExtractor, allSettings.Updater, restrictedNet)
+
+	boringPollLogger := logger.New(log.SetComponent("boring poll"))
+	boringPoll := boringpoll.New(httpClient, boringPollLogger, allSettings.BoringPoll)
+
 	vpnLogger := logger.New(log.SetComponent("vpn"))
 	vpnLooper := vpn.NewLoop(allSettings.VPN, ipv6SupportLevel, allSettings.Firewall.VPNInputPorts,
 		providers, storage, boringPoll, allSettings.Health, healthChecker, healthcheckServer,
-		ovpnConf, netLinker, firewallConf, restrictedNet, routingConf, portForwardLooper, cmder, publicIPLooper,
+		ovpnConf, netLinker, firewallConf, routingConf, portForwardLooper, cmder, publicIPLooper,
 		dnsLooper, vpnLogger, httpClient, buildInfo, *allSettings.Version.Enabled)
 	vpnHandler, vpnCtx, vpnDone := goshutdown.NewGoRoutineHandler(
 		"vpn", goroutine.OptionTimeout(time.Second))

@@ -267,6 +267,34 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 	assert.Equal(t, connection.PrivateKey, second.PrivateKey)
 }
 
+func Test_Provider_FetchWireguardConnection(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+
+	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
+	server, network := newTestServer(t, api)
+
+	key, err := wgtypes.GeneratePrivateKey()
+	require.NoError(t, err)
+
+	logger := NewMockWireguardLogger(ctrl)
+	gomock.InOrder(
+		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
+	)
+	provider := New(nil, nil, nil, nil, nil, network)
+	provider.wireguard = newTestFetcher(t, server.URL)
+
+	connection, err := provider.FetchWireguardConnection(context.Background(),
+		testVPNSettings(testSSOCookie, key.String()), logger)
+
+	require.NoError(t, err)
+	assert.Equal(t, key.String(), connection.PrivateKey)
+	opened, _ := network.opened()
+	assert.Equal(t, api.requestsCount(), opened, "the restricted network given to New must be used")
+}
+
 func Test_wireguardFetcher_fetch_settingsPrivateKey(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)

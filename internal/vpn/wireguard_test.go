@@ -12,7 +12,6 @@ import (
 	"github.com/qdm12/gluetun/internal/netlink"
 	"github.com/qdm12/gluetun/internal/provider"
 	"github.com/qdm12/gluetun/internal/provider/purevpn"
-	"github.com/qdm12/gluetun/internal/restrictednet"
 	"github.com/qdm12/gluetun/internal/wireguard"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
@@ -136,14 +135,13 @@ func Test_fetchWireguardConnection(t *testing.T) {
 				},
 			}
 			ctx := context.Background()
-			restrictedNet := &restrictednet.Client{}
 			logger := NewMockLogger(ctrl)
 			fetcher := NewMockWireguardFetcher(ctrl)
-			fetcher.EXPECT().FetchWireguardConnection(ctx, vpnSettings, restrictedNet, logger).
+			fetcher.EXPECT().FetchWireguardConnection(ctx, vpnSettings, logger).
 				Return(testCase.fetched, testCase.fetchErr)
 
 			connection, wireguardSettings, err := fetchWireguardConnection(ctx,
-				fetcher, vpnSettings, restrictedNet, testCase.ipv6Supported, logger)
+				fetcher, vpnSettings, testCase.ipv6Supported, logger)
 
 			if testCase.errMessage != "" {
 				assert.ErrorContains(t, err, testCase.errMessage)
@@ -194,10 +192,9 @@ func Test_setupWireguard(t *testing.T) {
 	}
 	ctx := context.Background()
 	firewall := NewMockFirewall(ctrl)
-	restrictedNet := &restrictednet.Client{}
 	logger := NewMockLogger(ctrl)
 	fetcher := NewMockWireguardFetcher(ctrl)
-	fetcher.EXPECT().FetchWireguardConnection(ctx, vpnSettings, restrictedNet, logger).
+	fetcher.EXPECT().FetchWireguardConnection(ctx, vpnSettings, logger).
 		Return(models.WireguardConnection{
 			Connection: serverConnection,
 			PrivateKey: privateKey,
@@ -208,7 +205,7 @@ func Test_setupWireguard(t *testing.T) {
 	logger.EXPECT().Debug("Wireguard pre-shared key: [not set]")
 	firewall.EXPECT().SetVPNConnection(ctx, serverConnection, "wg0").Return(nil)
 
-	wireguarder, connection, err := setupWireguard(ctx, nil, firewall, restrictedNet,
+	wireguarder, connection, err := setupWireguard(ctx, nil, firewall,
 		fetcherProvider{MockWireguardFetcher: fetcher}, vpnSettings, netlink.IPv6Unsupported, logger)
 
 	assert.NoError(t, err)

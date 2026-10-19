@@ -11,7 +11,6 @@ import (
 	"github.com/qdm12/gluetun/internal/models"
 	"github.com/qdm12/gluetun/internal/netlink"
 	"github.com/qdm12/gluetun/internal/provider"
-	"github.com/qdm12/gluetun/internal/restrictednet"
 	"github.com/qdm12/gluetun/internal/wireguard"
 	"github.com/qdm12/gosettings"
 )
@@ -19,7 +18,7 @@ import (
 // setupWireguard sets Wireguard up using the configurators and settings given.
 // It returns a serverName for port forwarding (PIA) and an error if it fails.
 func setupWireguard(ctx context.Context, netlinker NetLinker,
-	fw Firewall, restrictedNet *restrictednet.Client, providerConf provider.Provider,
+	fw Firewall, providerConf provider.Provider,
 	settings settings.VPN, ipv6SupportLevel netlink.IPv6SupportLevel, logger wireguard.Logger) (
 	wireguarder *wireguard.Wireguard, connection models.Connection, err error,
 ) {
@@ -30,7 +29,7 @@ func setupWireguard(ctx context.Context, netlinker NetLinker,
 		// provider, notably PureVPN, so it is fetched on each connection
 		// attempt, which also takes care of logging in again if needed.
 		connection, settings.Wireguard, err = fetchWireguardConnection(ctx, fetcher,
-			settings, restrictedNet, ipv6SupportLevel.IsSupported(), logger)
+			settings, ipv6SupportLevel.IsSupported(), logger)
 		if err != nil {
 			return nil, models.Connection{}, fmt.Errorf("fetching Wireguard connection: %w", err)
 		}
@@ -65,10 +64,10 @@ func setupWireguard(ctx context.Context, netlinker NetLinker,
 // private key, interface addresses and, if not set by the user, persistent
 // keepalive interval given by the provider.
 func fetchWireguardConnection(ctx context.Context, fetcher WireguardFetcher,
-	vpnSettings settings.VPN, restrictedNet *restrictednet.Client, ipv6Supported bool,
+	vpnSettings settings.VPN, ipv6Supported bool,
 	logger wireguard.Logger,
 ) (connection models.Connection, wireguardSettings settings.Wireguard, err error) {
-	fetched, err := fetcher.FetchWireguardConnection(ctx, vpnSettings, restrictedNet, logger)
+	fetched, err := fetcher.FetchWireguardConnection(ctx, vpnSettings, logger)
 	if err != nil {
 		return models.Connection{}, settings.Wireguard{}, err
 	}

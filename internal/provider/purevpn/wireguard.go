@@ -18,7 +18,6 @@ import (
 	"github.com/qdm12/gluetun/internal/constants/vpn"
 	"github.com/qdm12/gluetun/internal/models"
 	"github.com/qdm12/gluetun/internal/provider/purevpn/wgapi"
-	"github.com/qdm12/gluetun/internal/restrictednet"
 	"github.com/qdm12/gluetun/internal/wireguard"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -54,12 +53,11 @@ func newWireguardFetcher() *wireguardFetcher {
 // FetchWireguardConnection logs in the PureVPN member area if needed,
 // and requests a new Wireguard configuration. It should be called on
 // every connection attempt, since PureVPN removes unused peers.
-// The restricted network given is used to reach PureVPN before the VPN is up.
 // It is not safe for concurrent use.
 func (p *Provider) FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN,
-	network *restrictednet.Client, logger wireguard.Logger,
+	logger wireguard.Logger,
 ) (connection models.WireguardConnection, err error) {
-	return p.wireguard.fetch(ctx, vpnSettings, network, logger)
+	return p.wireguard.fetch(ctx, vpnSettings, p.restrictedNet, logger)
 }
 
 func (f *wireguardFetcher) fetch(ctx context.Context,

@@ -16,7 +16,6 @@ import (
 
 	settings "github.com/qdm12/gluetun/internal/configuration/settings"
 	models "github.com/qdm12/gluetun/internal/models"
-	restrictednet "github.com/qdm12/gluetun/internal/restrictednet"
 	wireguard "github.com/qdm12/gluetun/internal/wireguard"
 	gomock "go.uber.org/mock/gomock"
 )
@@ -127,16 +126,16 @@ func (m *MockWireguardFetcher) EXPECT() *MockWireguardFetcherMockRecorder {
 }
 
 // FetchWireguardConnection mocks base method.
-func (m *MockWireguardFetcher) FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN, restrictedNet *restrictednet.Client, logger wireguard.Logger) (models.WireguardConnection, error) {
+func (m *MockWireguardFetcher) FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN, logger wireguard.Logger) (models.WireguardConnection, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "FetchWireguardConnection", ctx, vpnSettings, restrictedNet, logger)
+	ret := m.ctrl.Call(m, "FetchWireguardConnection", ctx, vpnSettings, logger)
 	ret0, _ := ret[0].(models.WireguardConnection)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // FetchWireguardConnection indicates an expected call of FetchWireguardConnection.
-func (mr *MockWireguardFetcherMockRecorder) FetchWireguardConnection(ctx, vpnSettings, restrictedNet, logger any) *gomock.Call {
+func (mr *MockWireguardFetcherMockRecorder) FetchWireguardConnection(ctx, vpnSettings, logger any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FetchWireguardConnection", reflect.TypeOf((*MockWireguardFetcher)(nil).FetchWireguardConnection), ctx, vpnSettings, restrictedNet, logger)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FetchWireguardConnection", reflect.TypeOf((*MockWireguardFetcher)(nil).FetchWireguardConnection), ctx, vpnSettings, logger)
 }

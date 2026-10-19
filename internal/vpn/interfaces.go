@@ -13,7 +13,6 @@ import (
 	portforward "github.com/qdm12/gluetun/internal/portforward"
 	"github.com/qdm12/gluetun/internal/provider"
 	"github.com/qdm12/gluetun/internal/provider/utils"
-	"github.com/qdm12/gluetun/internal/restrictednet"
 	"github.com/qdm12/gluetun/internal/wireguard"
 )
 
@@ -52,9 +51,8 @@ type Provider interface {
 // WireguardFetcher is implemented by providers generating
 // Wireguard configurations at runtime through their API.
 type WireguardFetcher interface {
-	FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN,
-		restrictedNet *restrictednet.Client, logger wireguard.Logger,
-	) (connection models.WireguardConnection, err error)
+	FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN, logger wireguard.Logger) (
+		connection models.WireguardConnection, err error)
 }
 
 type PortForwarder interface {
