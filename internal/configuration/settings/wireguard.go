@@ -35,11 +35,7 @@ type Wireguard struct {
 	// Interface is the name of the Wireguard interface
 	// to create. It cannot be the empty string in the
 	// internal state.
-	Interface string `json:"interface"`
-	// PersistentKeepaliveInterval is the interval between keepalive
-	// packets, 0 disabling them. It cannot be nil in the internal state,
-	// except for PureVPN where nil means to use the interval given by
-	// PureVPN.
+	Interface                   string         `json:"interface"`
 	PersistentKeepaliveInterval *time.Duration `json:"persistent_keep_alive_interval"`
 	// Maximum Transmission Unit (MTU) of the Wireguard interface.
 	// It cannot be nil in the internal state, and defaults to
@@ -125,7 +121,7 @@ func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (
 		}
 	}
 
-	if w.PersistentKeepaliveInterval != nil && *w.PersistentKeepaliveInterval < 0 {
+	if *w.PersistentKeepaliveInterval < 0 {
 		return fmt.Errorf("persistent keep alive interval is negative: %s", *w.PersistentKeepaliveInterval)
 	}
 
@@ -211,10 +207,7 @@ func (w *Wireguard) setDefaults(vpnProvider string) {
 		netip.PrefixFrom(netip.IPv6Unspecified(), 0),
 	}
 	w.AllowedIPs = gosettings.DefaultSlice(w.AllowedIPs, defaultAllowedIPs)
-	if vpnProvider != providers.Purevpn {
-		// PureVPN gives a persistent keepalive interval used if the user does not set one.
-		w.PersistentKeepaliveInterval = gosettings.DefaultPointer(w.PersistentKeepaliveInterval, 0)
-	}
+	w.PersistentKeepaliveInterval = gosettings.DefaultPointer(w.PersistentKeepaliveInterval, 0)
 	w.Interface = gosettings.DefaultComparable(w.Interface, "wg0")
 	w.MTU = gosettings.DefaultPointer(w.MTU, 0)
 	w.Implementation = gosettings.DefaultComparable(w.Implementation, "auto")
@@ -248,7 +241,7 @@ func (w Wireguard) toLinesNode() (node *gotree.Node) {
 		allowedIPsNode.Append(allowedIP.String())
 	}
 
-	if w.PersistentKeepaliveInterval != nil && *w.PersistentKeepaliveInterval > 0 {
+	if *w.PersistentKeepaliveInterval > 0 {
 		node.Appendf("Persistent keepalive interval: %s", w.PersistentKeepaliveInterval)
 	}
 

@@ -3,7 +3,6 @@ package settings
 import (
 	"net/netip"
 	"testing"
-	"time"
 
 	"github.com/qdm12/gluetun/internal/constants/providers"
 	"github.com/qdm12/gosettings/reader"
@@ -245,32 +244,4 @@ func Test_PureVPN_read(t *testing.T) {
 		VPNUsername:    new("PureVPN0s123"),
 	}
 	assert.Equal(t, expected, settings)
-}
-
-func Test_Wireguard_setDefaults_persistentKeepaliveInterval(t *testing.T) {
-	t.Parallel()
-
-	testCases := map[string]struct {
-		provider  string
-		keepalive *time.Duration
-		expected  *time.Duration
-	}{
-		"purevpn_unset": {provider: providers.Purevpn},
-		"purevpn_zero":  {provider: providers.Purevpn, keepalive: new(time.Duration(0)), expected: new(time.Duration(0))},
-		"other_unset":   {provider: providers.Mullvad, expected: new(time.Duration(0))},
-		"other_set":     {provider: providers.Mullvad, keepalive: new(time.Minute), expected: new(time.Minute)},
-		"purevpn_set":   {provider: providers.Purevpn, keepalive: new(time.Minute), expected: new(time.Minute)},
-	}
-
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			wireguard := Wireguard{PersistentKeepaliveInterval: testCase.keepalive}
-			wireguard.setDefaults(testCase.provider)
-
-			assert.Equal(t, testCase.expected, wireguard.PersistentKeepaliveInterval)
-			assert.NotContains(t, wireguard.String(), "Persistent keepalive interval: 0s")
-		})
-	}
 }

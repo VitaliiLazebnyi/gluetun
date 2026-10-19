@@ -61,7 +61,7 @@ func setupWireguard(ctx context.Context, netlinker NetLinker,
 
 // fetchWireguardConnection fetches a Wireguard connection from the provider
 // and returns the connection and the Wireguard settings to use, with the
-// private key, interface addresses and, if not set by the user, persistent
+// private key, interface addresses and, if the user setting is 0, persistent
 // keepalive interval given by the provider.
 func fetchWireguardConnection(ctx context.Context, fetcher WireguardFetcher,
 	vpnSettings settings.VPN, ipv6Supported bool,
@@ -87,7 +87,7 @@ func fetchWireguardConnection(ctx context.Context, fetcher WireguardFetcher,
 	wireguardSettings = vpnSettings.Wireguard
 	wireguardSettings.PrivateKey = &fetched.PrivateKey
 	wireguardSettings.Addresses = fetched.Addresses
-	if wireguardSettings.PersistentKeepaliveInterval == nil {
+	if *wireguardSettings.PersistentKeepaliveInterval == 0 {
 		wireguardSettings.PersistentKeepaliveInterval = &fetched.PersistentKeepalive
 	}
 	return fetched.Connection, wireguardSettings, nil
@@ -136,9 +136,7 @@ func buildWireguardSettings(connection models.Connection,
 		settings.AllowedIPs = append(settings.AllowedIPs, allowedIP)
 	}
 
-	if userSettings.PersistentKeepaliveInterval != nil { // nil for PureVPN if unset
-		settings.PersistentKeepaliveInterval = *userSettings.PersistentKeepaliveInterval
-	}
+	settings.PersistentKeepaliveInterval = *userSettings.PersistentKeepaliveInterval
 	gso := *userSettings.GSO
 	settings.GSO = &gso
 
