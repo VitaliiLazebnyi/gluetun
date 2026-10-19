@@ -89,14 +89,6 @@ func newHTTPSClient(destinationTLSName string, dial dialFunc) *http.Client {
 	}
 }
 
-// ErrDialedMoreThanOnce is returned by an HTTP client returned by [Client.OpenHTTPS]
-// when its single connection is no longer usable and its transport dials again,
-// for example after the server closed the connection.
-// The transport only dials again before sending the request, or to retry
-// a request it considers safe to retry, so a request failing with this
-// error can be sent again on another connection.
-var ErrDialedMoreThanOnce = errors.New("dial function called more than once")
-
 func makeDial(connection net.Conn, tlsName string) dialFunc {
 	_, destinationPort, err := net.SplitHostPort(connection.RemoteAddr().String())
 	if err != nil {
@@ -106,7 +98,7 @@ func makeDial(connection net.Conn, tlsName string) dialFunc {
 	used := false
 	return func(_ context.Context, network, address string) (net.Conn, error) {
 		if used {
-			return nil, ErrDialedMoreThanOnce
+			return nil, errors.New("dial function called more than once")
 		}
 		used = true
 		switch network {
