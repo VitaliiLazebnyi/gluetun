@@ -13,6 +13,7 @@ import (
 	portforward "github.com/qdm12/gluetun/internal/portforward"
 	"github.com/qdm12/gluetun/internal/provider"
 	"github.com/qdm12/gluetun/internal/provider/utils"
+	"github.com/qdm12/gluetun/internal/wireguard"
 )
 
 type Firewall interface {
@@ -45,6 +46,13 @@ type Provider interface {
 	GetConnection(selection settings.ServerSelection, ipv6Supported bool) (connection models.Connection, err error)
 	OpenVPNConfig(connection models.Connection, settings settings.OpenVPN, ipv6Supported bool) (lines []string)
 	Name() string
+}
+
+// WireguardFetcher is implemented by providers generating
+// Wireguard configurations at runtime through their API.
+type WireguardFetcher interface {
+	FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN, logger wireguard.Logger) (
+		connection models.WireguardConnection, err error)
 }
 
 type PortForwarder interface {

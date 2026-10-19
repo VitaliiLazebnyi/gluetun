@@ -1,5 +1,7 @@
 package constants
 
+import "strings"
+
 func CountryCodes() map[string]string {
 	return map[string]string{
 		"af":  "Afghanistan",
@@ -254,4 +256,20 @@ func CountryCodes() map[string]string {
 		"zm":  "Zambia",
 		"zw":  "Zimbabwe",
 	}
+}
+
+// CountryNameToCode returns the lowercase ISO 3166-1 alpha-2 code
+// of the country name given, matched case insensitively.
+// It returns false if the country name is not known.
+func CountryNameToCode(name string) (code string, ok bool) {
+	for code, countryName := range CountryCodes() {
+		const isoCodeLength = 2
+		switch {
+		case len(code) != isoCodeLength, code == "uk": // "uk" is a non ISO alias of "gb"
+			continue
+		case strings.EqualFold(countryName, name):
+			return code, true
+		}
+	}
+	return "", false
 }

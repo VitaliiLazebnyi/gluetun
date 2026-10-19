@@ -2,8 +2,10 @@ package vpn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 
 	"github.com/qdm12/gluetun/internal/configuration/settings"
 	"github.com/qdm12/gluetun/internal/models"
@@ -21,9 +23,21 @@ func setupWireguard(ctx context.Context, netlinker NetLinker,
 	wireguarder *wireguard.Wireguard, connection models.Connection, err error,
 ) {
 	ipv6Internet := ipv6SupportLevel == netlink.IPv6Internet
-	connection, err = providerConf.GetConnection(settings.Provider.ServerSelection, ipv6Internet)
-	if err != nil {
-		return nil, models.Connection{}, fmt.Errorf("finding a VPN server: %w", err)
+	fetcher, ok := providerConf.(WireguardFetcher)
+	if ok {
+		// The Wireguard configuration is generated at runtime by the
+		// provider, notably PureVPN, so it is fetched on each connection
+		// attempt, which also takes care of logging in again if needed.
+		connection, settings.Wireguard, err = fetchWireguardConnection(ctx, fetcher,
+			settings, ipv6SupportLevel.IsSupported(), logger)
+		if err != nil {
+			return nil, models.Connection{}, fmt.Errorf("fetching Wireguard connection: %w", err)
+		}
+	} else {
+		connection, err = providerConf.GetConnection(settings.Provider.ServerSelection, ipv6Internet)
+		if err != nil {
+			return nil, models.Connection{}, fmt.Errorf("finding a VPN server: %w", err)
+		}
 	}
 
 	wireguardSettings := buildWireguardSettings(connection, settings.Wireguard, ipv6SupportLevel.IsSupported())
@@ -43,6 +57,40 @@ func setupWireguard(ctx context.Context, netlinker NetLinker,
 	}
 
 	return wireguarder, connection, nil
+}
+
+// fetchWireguardConnection fetches a Wireguard connection from the provider
+// and returns the connection and the Wireguard settings to use, with the
+// private key, interface addresses and, if the user setting is 0, persistent
+// keepalive interval given by the provider.
+func fetchWireguardConnection(ctx context.Context, fetcher WireguardFetcher,
+	vpnSettings settings.VPN, ipv6Supported bool,
+	logger wireguard.Logger,
+) (connection models.Connection, wireguardSettings settings.Wireguard, err error) {
+	fetched, err := fetcher.FetchWireguardConnection(ctx, vpnSettings, logger)
+	if err != nil {
+		return models.Connection{}, settings.Wireguard{}, err
+	}
+
+	hasIPv4 := slices.ContainsFunc(fetched.Addresses, func(address netip.Prefix) bool {
+		return address.Addr().Is4()
+	})
+	switch {
+	case len(fetched.Addresses) == 0:
+		return models.Connection{}, settings.Wireguard{}, errors.New("no interface address assigned by the provider")
+	case !hasIPv4 && !ipv6Supported:
+		return models.Connection{}, settings.Wireguard{}, fmt.Errorf(
+			"no IPv4 interface address assigned by the provider in %v and IPv6 is not supported",
+			fetched.Addresses)
+	}
+
+	wireguardSettings = vpnSettings.Wireguard
+	wireguardSettings.PrivateKey = &fetched.PrivateKey
+	wireguardSettings.Addresses = fetched.Addresses
+	if *wireguardSettings.PersistentKeepaliveInterval == 0 {
+		wireguardSettings.PersistentKeepaliveInterval = &fetched.PersistentKeepalive
+	}
+	return fetched.Connection, wireguardSettings, nil
 }
 
 func buildWireguardSettings(connection models.Connection,
