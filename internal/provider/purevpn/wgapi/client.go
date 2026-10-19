@@ -15,12 +15,6 @@ import (
 	"time"
 )
 
-// defaultAuthURL is the PureVPN FusionAuth server base URL.
-const defaultAuthURL = "https://auth.purevpn.com"
-
-// defaultAppURL is the PureVPN member area base URL.
-const defaultAppURL = "https://my.purevpn.com"
-
 // clientID is the FusionAuth client identifier of the
 // PureVPN member area application.
 const clientID = "ed1ee674-0a34-4265-b4a1-141b721036eb"
@@ -80,15 +74,18 @@ type Client struct {
 }
 
 // New creates a new client using a copy of the HTTP client given,
-// which refuses redirects to hosts other than the auth and app hosts.
+// which refuses redirects to hosts other than the auth and app hosts,
+// and replaces the check redirect function of the HTTP client given.
 // authURL and appURL can be left empty to use the defaults.
 func New(httpClient *http.Client, authURL, appURL string,
 	credentials Credentials, session Session,
 ) (client *Client, err error) {
 	if authURL == "" {
+		const defaultAuthURL = "https://auth.purevpn.com"
 		authURL = defaultAuthURL
 	}
 	if appURL == "" {
+		const defaultAppURL = "https://my.purevpn.com"
 		appURL = defaultAppURL
 	}
 	client = &Client{
@@ -114,9 +111,7 @@ func New(httpClient *http.Client, authURL, appURL string,
 			// and can be blocked by a Cloudflare challenge.
 			return http.ErrUseLastResponse
 		case err != nil:
-			return fmt.Errorf("redirect: %w", err)
-		case httpClient.CheckRedirect != nil:
-			return httpClient.CheckRedirect(request, via)
+			return fmt.Errorf("following redirect: %w", err)
 		}
 		const maxRedirects = 10
 		if len(via) >= maxRedirects {

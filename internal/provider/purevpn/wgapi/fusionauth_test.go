@@ -242,27 +242,19 @@ func Test_Client_redirects(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
-		redirectTo    func(otherURL string) string
-		checkRedirect func(request *http.Request, via []*http.Request) error
-		errWrapped    error
-		errMessage    string
-		otherRequests uint
+		redirectTo func(otherURL string) string
+		errWrapped error
+		errMessage string
 	}{
 		"other_host": {
 			redirectTo: func(otherURL string) string { return otherURL + "/steal" },
 			errWrapped: errHostNotAllowed,
-			errMessage: "redirect: host not allowed: ",
+			errMessage: "following redirect: host not allowed: ",
 		},
 		"redirect_loop": {
 			redirectTo: func(string) string { return "/loop" },
 			errWrapped: errUnexpectedResponse,
 			errMessage: "stopped after 10 redirects",
-		},
-		"caller_check_redirect": {
-			redirectTo: func(string) string { return "/loop" },
-			checkRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
 		},
 	}
 
@@ -282,23 +274,17 @@ func Test_Client_redirects(t *testing.T) {
 				http.Redirect(writer, request, testCase.redirectTo(otherServer.URL), http.StatusTemporaryRedirect)
 			}))
 			t.Cleanup(server.Close)
-			httpClient := &http.Client{Transport: &http.Transport{}, CheckRedirect: testCase.checkRedirect}
+			httpClient := &http.Client{Transport: &http.Transport{}}
 			client, err := New(httpClient, server.URL, server.URL, Credentials{}, Session{})
 			require.NoError(t, err)
 
 			_, err = client.doAuthRequest(t.Context(), http.MethodPost, server.URL+"/oauth2/authorize",
 				url.Values{"password": {"secret"}})
-			if testCase.errWrapped != nil {
-				assert.ErrorIs(t, err, testCase.errWrapped)
-				assert.ErrorContains(t, err, testCase.errMessage)
-			} else {
-				assert.NoError(t, err)
-			}
+			assert.ErrorIs(t, err, testCase.errWrapped)
+			assert.ErrorContains(t, err, testCase.errMessage)
 
 			err = client.apiRequest(t.Context(), "token", "/v2/api/subscription", nil, nil)
-			if testCase.errWrapped != nil {
-				assert.ErrorIs(t, err, testCase.errWrapped)
-			}
+			assert.ErrorIs(t, err, testCase.errWrapped)
 
 			mutex.Lock()
 			assert.Zero(t, otherRequests)

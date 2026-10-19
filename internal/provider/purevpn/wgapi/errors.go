@@ -49,4 +49,13 @@ var (
 	// errUnexpectedResponse is returned when a response does not have
 	// the expected format, usually because PureVPN changed its website.
 	errUnexpectedResponse = errors.New("unexpected response from PureVPN")
+	// errAddressMissing is returned when the Wireguard configuration
+	// has no interface address.
+	errAddressMissing = errors.New("interface address is missing")
+	// errPublicKeyMissing is returned when the Wireguard configuration
+	// has no peer public key.
+	errPublicKeyMissing = errors.New("peer public key is missing")
+	// errEndpointMissing is returned when the Wireguard configuration
+	// has no peer endpoint.
+	errEndpointMissing = errors.New("peer endpoint is missing")
 )

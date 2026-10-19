@@ -1,7 +1,6 @@
 package wgapi
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -45,12 +44,6 @@ func (c Config) EndpointIP() (ip netip.Addr, ok bool) {
 	}
 	return ip.Unmap(), true
 }
-
-var (
-	errAddressMissing   = errors.New("interface address is missing")
-	errPublicKeyMissing = errors.New("peer public key is missing")
-	errEndpointMissing  = errors.New("peer endpoint is missing")
-)
 
 // parseConfig parses a wg-quick style Wireguard configuration.
 func parseConfig(content string) (config Config, err error) {

@@ -886,8 +886,8 @@ func Test_New(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, defaultAuthURL, client.authURL.String())
-			assert.Equal(t, defaultAppURL, client.appURL.String())
+			assert.Equal(t, "https://auth.purevpn.com", client.authURL.String())
+			assert.Equal(t, "https://my.purevpn.com", client.appURL.String())
 		})
 	}
 }
@@ -1095,7 +1095,7 @@ func Test_Client_readBodyError(t *testing.T) {
 	err = client.apiRequest(context.Background(), "token", "/v2/api/test", nil, nil)
 	assert.ErrorContains(t, err, "reading response body: test read error")
 
-	page, err := client.doAuthRequest(context.Background(), http.MethodGet, defaultAuthURL, nil)
+	page, err := client.doAuthRequest(context.Background(), http.MethodGet, "https://auth.purevpn.com", nil)
 	assert.ErrorContains(t, err, "reading response body: test read error")
 	assert.Nil(t, page)
 }
