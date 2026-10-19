@@ -11,8 +11,6 @@ type Provider struct {
 	storage    common.Storage
 	connPicker *utils.ConnectionPicker
 	wireguard  *wireguardFetcher
-	// restrictedNet is used to reach PureVPN before the VPN is up.
-	restrictedNet RestrictedNetwork
 	common.Fetcher
 }
 
@@ -21,11 +19,10 @@ func New(storage common.Storage, ipFetcher common.IPFetcher, unzipper common.Unz
 	restrictedNet RestrictedNetwork,
 ) *Provider {
 	return &Provider{
-		storage:       storage,
-		connPicker:    utils.NewConnectionPicker(),
-		wireguard:     newWireguardFetcher(),
-		restrictedNet: restrictedNet,
-		Fetcher:       updater.New(ipFetcher, unzipper, updaterWarner, parallelResolver),
+		storage:    storage,
+		connPicker: utils.NewConnectionPicker(),
+		wireguard:  newWireguardFetcher(restrictedNet),
+		Fetcher:    updater.New(ipFetcher, unzipper, updaterWarner, parallelResolver),
 	}
 }
 

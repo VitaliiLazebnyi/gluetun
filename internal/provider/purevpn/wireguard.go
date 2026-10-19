@@ -38,6 +38,8 @@ type wireguardState struct {
 }
 
 type wireguardFetcher struct {
+	// network is used to reach PureVPN before the VPN is up.
+	network   RestrictedNetwork
 	statePath string
 	// authURL and appURL are the PureVPN websites base URLs,
 	// and are left empty to use the default ones.
@@ -48,8 +50,9 @@ type wireguardFetcher struct {
 	stateLoaded bool
 }
 
-func newWireguardFetcher() *wireguardFetcher {
+func newWireguardFetcher(network RestrictedNetwork) *wireguardFetcher {
 	return &wireguardFetcher{
+		network:   network,
 		statePath: "/gluetun/purevpn-wireguard.json",
 	}
 }
@@ -61,11 +64,11 @@ func newWireguardFetcher() *wireguardFetcher {
 func (p *Provider) FetchWireguardConnection(ctx context.Context, vpnSettings settings.VPN,
 	logger wireguard.Logger,
 ) (connection models.WireguardConnection, err error) {
-	return p.wireguard.fetch(ctx, vpnSettings, p.restrictedNet, logger)
+	return p.wireguard.fetch(ctx, vpnSettings, logger)
 }
 
 func (f *wireguardFetcher) fetch(ctx context.Context,
-	vpnSettings settings.VPN, network RestrictedNetwork, logger Logger,
+	vpnSettings settings.VPN, logger Logger,
 ) (connection models.WireguardConnection, err error) {
 	purevpnSettings := vpnSettings.PureVPN
 	// The settings validation ensures there is exactly one known country.
@@ -86,7 +89,7 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	}
 	f.applyAccount(*purevpnSettings.Username, *purevpnSettings.SessionToken, logger)
 
-	transport := &restrictedTransport{network: network}
+	transport := &restrictedTransport{network: f.network}
 	defer func() {
 		// Failing to remove a firewall rule is not fatal, for example
 		// if the firewall got disabled during the fetch, removing all rules.
@@ -125,7 +128,7 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 
 	endpointIP, ok := config.EndpointIP()
 	if !ok {
-		ips, err := network.ResolveName(ctx, config.EndpointHost)
+		ips, err := f.network.ResolveName(ctx, config.EndpointHost)
 		switch {
 		case err != nil:
 			return models.WireguardConnection{}, fmt.Errorf("resolving Wireguard endpoint: %w", err)

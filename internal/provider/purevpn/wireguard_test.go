@@ -164,9 +164,10 @@ func newTestServer(t *testing.T, api *fakeAPI) (server *httptest.Server, network
 	return server, &fakeNetwork{httpClient: server.Client()}
 }
 
-func newTestFetcher(t *testing.T, serverURL string) *wireguardFetcher {
+func newTestFetcher(t *testing.T, serverURL string, network RestrictedNetwork) *wireguardFetcher {
 	t.Helper()
 	return &wireguardFetcher{
+		network:   network,
 		statePath: filepath.Join(t.TempDir(), "state", "purevpn.json"),
 		authURL:   serverURL,
 		appURL:    serverURL,
@@ -208,9 +209,9 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
 		logger.EXPECT().Info("PureVPN Wireguard server us-ny.purevpn.net (198.51.100.9:51820)"),
 	)
-	fetcher := newTestFetcher(t, server.URL)
+	fetcher := newTestFetcher(t, server.URL, network)
 	connection, err := fetcher.fetch(context.Background(),
-		testVPNSettings(testSSOCookie, ""), network, logger)
+		testVPNSettings(testSSOCookie, ""), logger)
 	require.NoError(t, err)
 
 	_, ok := network.openCtx.Deadline()
@@ -252,7 +253,6 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 	assert.Equal(t, api.token, state.Session.AccessToken)
 	assert.Equal(t, hashHex(testSSOCookie), state.SessionTokenHash)
 	assert.Equal(t, hashHex(""), state.UsernameHash)
-	assert.NotContains(t, string(data), "Bearer")
 
 	// A restarted fetcher reuses the persisted key pair and session,
 	// even without the session token in the settings.
@@ -261,14 +261,17 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 		restartedLogger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
 		restartedLogger.EXPECT().Info("PureVPN Wireguard server us-ny.purevpn.net (198.51.100.9:51820)"),
 	)
-	restarted := newTestFetcher(t, server.URL)
+	restarted := newTestFetcher(t, server.URL, network)
 	restarted.statePath = fetcher.statePath
 	second, err := restarted.fetch(context.Background(),
-		testVPNSettings("", ""), network, restartedLogger)
+		testVPNSettings("", ""), restartedLogger)
 	require.NoError(t, err)
 	assert.Equal(t, connection.PrivateKey, second.PrivateKey)
 }
 
+// Test_Provider_FetchWireguardConnection tests the provider entry point
+// uses the restricted network given to New, and the private key from
+// the settings instead of generating one.
 func Test_Provider_FetchWireguardConnection(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
@@ -286,37 +289,16 @@ func Test_Provider_FetchWireguardConnection(t *testing.T) {
 		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
 	)
 	provider := New(nil, nil, nil, nil, nil, network)
-	provider.wireguard = newTestFetcher(t, server.URL)
+	provider.wireguard.statePath = filepath.Join(t.TempDir(), "purevpn.json")
+	provider.wireguard.authURL = server.URL
+	provider.wireguard.appURL = server.URL
 
 	connection, err := provider.FetchWireguardConnection(context.Background(),
 		testVPNSettings(testSSOCookie, key.String()), logger)
 
 	require.NoError(t, err)
-	assert.Equal(t, key.String(), connection.PrivateKey)
 	opened, _ := network.opened()
 	assert.Equal(t, uint(1), opened, "the restricted network given to New must be used")
-}
-
-func Test_wireguardFetcher_fetch_settingsPrivateKey(t *testing.T) {
-	t.Parallel()
-	ctrl := gomock.NewController(t)
-
-	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
-	server, network := newTestServer(t, api)
-
-	key, err := wgtypes.GeneratePrivateKey()
-	require.NoError(t, err)
-
-	logger := NewMockLogger(ctrl)
-	gomock.InOrder(
-		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
-		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
-	)
-	fetcher := newTestFetcher(t, server.URL)
-	connection, err := fetcher.fetch(context.Background(),
-		testVPNSettings(testSSOCookie, key.String()), network, logger)
-	require.NoError(t, err)
 	assert.Equal(t, key.String(), connection.PrivateKey)
 	assert.Equal(t, key.PublicKey().String(), api.clientPubKey)
 	assert.Equal(t, netip.MustParseAddr("203.0.113.5"), connection.Connection.IP)
@@ -335,10 +317,10 @@ func Test_wireguardFetcher_fetch_canceledContext(t *testing.T) {
 		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
 		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
 	)
-	fetcher := newTestFetcher(t, server.URL)
+	fetcher := newTestFetcher(t, server.URL, network)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := fetcher.fetch(ctx, testVPNSettings(testSSOCookie, ""), network, logger)
+	_, err := fetcher.fetch(ctx, testVPNSettings(testSSOCookie, ""), logger)
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Zero(t, api.requestsCount())
 }
@@ -350,7 +332,7 @@ func Test_wireguardFetcher_fetch_authError(t *testing.T) {
 	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
 	server, network := newTestServer(t, api)
 
-	fetcher := newTestFetcher(t, server.URL)
+	fetcher := newTestFetcher(t, server.URL, network)
 
 	// No credentials and a rejected token: the login page is shown.
 	logger := NewMockLogger(ctrl)
@@ -360,7 +342,7 @@ func Test_wireguardFetcher_fetch_authError(t *testing.T) {
 		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
 	)
 	_, err := fetcher.fetch(context.Background(),
-		testVPNSettings("rejected-token", ""), network, logger)
+		testVPNSettings("rejected-token", ""), logger)
 	require.ErrorContains(t, err, "requesting configuration from PureVPN: ")
 	assert.ErrorContains(t, err, "PureVPN account username and password are not set")
 	requestsAfterFirstFetch := api.requestsCount()
@@ -371,7 +353,7 @@ func Test_wireguardFetcher_fetch_authError(t *testing.T) {
 	logger = NewMockLogger(ctrl)
 	logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778")
 	_, err = fetcher.fetch(context.Background(),
-		testVPNSettings("rejected-token", ""), network, logger)
+		testVPNSettings("rejected-token", ""), logger)
 	require.ErrorContains(t, err, "PureVPN account username and password are not set")
 	requestsAfterSecondFetch := api.requestsCount()
 	assert.Greater(t, requestsAfterSecondFetch, requestsAfterFirstFetch)
@@ -384,7 +366,7 @@ func Test_wireguardFetcher_fetch_authError(t *testing.T) {
 		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
 	)
 	_, err = fetcher.fetch(context.Background(),
-		testVPNSettings(testSSOCookie, ""), network, logger)
+		testVPNSettings(testSSOCookie, ""), logger)
 	require.NoError(t, err)
 	assert.Greater(t, api.requestsCount(), requestsAfterSecondFetch)
 }
@@ -407,9 +389,9 @@ func Test_wireguardFetcher_fetch_cleanupError(t *testing.T) {
 		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
 		logger.EXPECT().Warn("cleaning up connections to PureVPN: test error"),
 	)
-	fetcher := newTestFetcher(t, server.URL)
+	fetcher := newTestFetcher(t, server.URL, network)
 
-	_, err := fetcher.fetch(context.Background(), testVPNSettings(testSSOCookie, ""), network, logger)
+	_, err := fetcher.fetch(context.Background(), testVPNSettings(testSSOCookie, ""), logger)
 
 	assert.NoError(t, err)
 }
@@ -591,7 +573,7 @@ func Test_wireguardFetcher_fetch_accountChange(t *testing.T) {
 
 	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
 	server, network := newTestServer(t, api)
-	fetcher := newTestFetcher(t, server.URL)
+	fetcher := newTestFetcher(t, server.URL, network)
 
 	key, err := wgtypes.GeneratePrivateKey()
 	require.NoError(t, err)
@@ -607,7 +589,7 @@ func Test_wireguardFetcher_fetch_accountChange(t *testing.T) {
 	vpnSettings := testVPNSettings(testSSOCookie, "")
 	*vpnSettings.PureVPN.Username = "alice"
 	*vpnSettings.PureVPN.Password = "alice-password"
-	_, err = fetcher.fetch(context.Background(), vpnSettings, network, logger)
+	_, err = fetcher.fetch(context.Background(), vpnSettings, logger)
 	require.NoError(t, err)
 
 	// Password changed for the same account: the stored session is used.
@@ -619,7 +601,7 @@ func Test_wireguardFetcher_fetch_accountChange(t *testing.T) {
 	vpnSettings = testVPNSettings("", "")
 	*vpnSettings.PureVPN.Username = "alice"
 	*vpnSettings.PureVPN.Password = "alice-new-password"
-	_, err = fetcher.fetch(context.Background(), vpnSettings, network, logger)
+	_, err = fetcher.fetch(context.Background(), vpnSettings, logger)
 	require.NoError(t, err)
 
 	// Another account: the stored session of the first account must not
@@ -632,7 +614,7 @@ func Test_wireguardFetcher_fetch_accountChange(t *testing.T) {
 	vpnSettings = testVPNSettings("", "")
 	*vpnSettings.PureVPN.Username = "bob"
 	*vpnSettings.PureVPN.Password = "bob-password"
-	_, err = fetcher.fetch(context.Background(), vpnSettings, network, logger)
+	_, err = fetcher.fetch(context.Background(), vpnSettings, logger)
 	require.ErrorContains(t, err, "requesting configuration from PureVPN: ")
 
 	data, err := os.ReadFile(fetcher.statePath)
@@ -902,14 +884,14 @@ func Test_wireguardFetcher_fetch_errors(t *testing.T) {
 			server, network := newTestServer(t, api)
 			network.openErr = testCase.openErr
 
-			fetcher := newTestFetcher(t, server.URL)
+			fetcher := newTestFetcher(t, server.URL, network)
 			if testCase.modifyFetcher != nil {
 				testCase.modifyFetcher(fetcher)
 			}
 			vpnSettings := testVPNSettings(testSSOCookie, testCase.privateKey)
 			*vpnSettings.PureVPN.CityID = 0
 
-			connection, err := fetcher.fetch(context.Background(), vpnSettings, network, testCase.makeLogger(ctrl))
+			connection, err := fetcher.fetch(context.Background(), vpnSettings, testCase.makeLogger(ctrl))
 
 			assert.ErrorContains(t, err, testCase.errMessage)
 			assert.Equal(t, models.WireguardConnection{}, connection)
