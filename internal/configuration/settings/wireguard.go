@@ -60,36 +60,38 @@ var regexpInterfaceName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 // Validate validates Wireguard settings.
 // It should only be ran if the VPN type chosen is Wireguard or AmneziaWg.
 func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (err error) {
+	// PureVPN Wireguard configurations are fetched at runtime,
+	// with a private key generated if not set, and the interface
+	// addresses assigned by PureVPN.
+	purevpn := vpnProvider == providers.Purevpn
+
 	// Validate PrivateKey
-	if *w.PrivateKey == "" {
+	switch {
+	case *w.PrivateKey == "" && !purevpn:
 		return errors.New("private key is not set")
-	}
-	_, err = wgtypes.ParseKey(*w.PrivateKey)
-	if err != nil {
-		err = fmt.Errorf("private key is not valid: %w", err)
-		if vpnProvider == providers.Nordvpn &&
-			err.Error() == "wgtypes: incorrect key size: 48" {
-			err = fmt.Errorf("%w - you might be using your access token instead of the Wireguard private key", err)
+	case *w.PrivateKey != "":
+		_, err = wgtypes.ParseKey(*w.PrivateKey)
+		if err != nil {
+			err = fmt.Errorf("private key is not valid: %w", err)
+			if vpnProvider == providers.Nordvpn &&
+				err.Error() == "wgtypes: incorrect key size: 48" {
+				err = fmt.Errorf("%w - you might be using your access token instead of the Wireguard private key", err)
+			}
+			return err
 		}
+	}
+
+	err = validatePreSharedKey(vpnProvider, *w.PreSharedKey)
+	if err != nil {
 		return err
 	}
 
-	if vpnProvider == providers.Airvpn {
-		if *w.PreSharedKey == "" {
-			return errors.New("pre-shared key is not set")
-		}
-	}
-
-	// Validate PreSharedKey
-	if *w.PreSharedKey != "" { // Note: this is optional
-		_, err = wgtypes.ParseKey(*w.PreSharedKey)
-		if err != nil {
-			return fmt.Errorf("pre-shared key is not valid: %w", err)
-		}
-	}
-
 	// Validate Addresses
-	if len(w.Addresses) == 0 {
+	switch {
+	case purevpn && len(w.Addresses) > 0:
+		return fmt.Errorf("interface addresses cannot be set for PureVPN, "+
+			"since they are assigned by PureVPN: %v", w.Addresses)
+	case len(w.Addresses) == 0 && !purevpn:
 		return errors.New("interface address is not set")
 	}
 
@@ -102,7 +104,7 @@ func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (
 			hasIPv4 = true
 		}
 	}
-	if !hasIPv4 && !ipv6Supported {
+	if !hasIPv4 && !ipv6Supported && !purevpn { // PureVPN addresses are checked at runtime
 		return fmt.Errorf("no IPv4 interface addresses in %v but IPv6 is not supported",
 			w.Addresses)
 	}
@@ -135,6 +137,23 @@ func (w Wireguard) validate(vpnProvider string, ipv6Supported, amneziawg bool) (
 		}
 	}
 
+	return nil
+}
+
+func validatePreSharedKey(vpnProvider, preSharedKey string) error {
+	switch {
+	case vpnProvider == providers.Airvpn && preSharedKey == "":
+		return errors.New("pre-shared key is not set")
+	case vpnProvider == providers.Purevpn && preSharedKey != "":
+		return errors.New("pre-shared key cannot be set for PureVPN, " +
+			"since PureVPN Wireguard servers do not use one")
+	case preSharedKey == "": // Note: this is optional
+		return nil
+	}
+	_, err := wgtypes.ParseKey(preSharedKey)
+	if err != nil {
+		return fmt.Errorf("pre-shared key is not valid: %w", err)
+	}
 	return nil
 }
 
@@ -212,9 +231,13 @@ func (w Wireguard) toLinesNode() (node *gotree.Node) {
 		node.Appendf("Pre-shared key: %s", s)
 	}
 
-	addressesNode := node.Appendf("Interface addresses:")
-	for _, address := range w.Addresses {
-		addressesNode.Append(address.String())
+	// Interface addresses are not set with providers such as PureVPN,
+	// where they are assigned at runtime.
+	if len(w.Addresses) > 0 {
+		addressesNode := node.Appendf("Interface addresses:")
+		for _, address := range w.Addresses {
+			addressesNode.Append(address.String())
+		}
 	}
 
 	allowedIPsNode := node.Appendf("Allowed IPs:")
