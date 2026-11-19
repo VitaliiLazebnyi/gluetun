@@ -39,6 +39,13 @@ func Test_PureVPN_validate(t *testing.T) {
 			settings:   PureVPN{Password: new("pass")},
 			errMessage: "account username is not set",
 		},
+		"padded_TOTP_secret": {
+			settings: PureVPN{SessionToken: new("token"), TOTPSecret: new("JBSWY3DPEHPK3PX=")},
+		},
+		"invalid_TOTP_secret_length": {
+			settings:   PureVPN{SessionToken: new("token"), TOTPSecret: new("JBSWY3DPEHPK3PXPA")},
+			errMessage: "TOTP secret is not valid base32",
+		},
 		"invalid_TOTP_secret": {
 			settings:   PureVPN{SessionToken: new("token"), TOTPSecret: new("not-base32!")},
 			errMessage: "TOTP secret is not valid base32: illegal base32 data at input byte 3",

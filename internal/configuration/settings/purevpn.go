@@ -59,8 +59,15 @@ func (p PureVPN) validate() (err error) {
 	}
 
 	if *p.TOTPSecret != "" {
-		secret := strings.ToUpper(strings.ReplaceAll(*p.TOTPSecret, " ", ""))
-		_, err = base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.TrimRight(secret, "="))
+		// The secret is decoded the same way the TOTP library does at login:
+		// its padding is removed, then it is padded to a multiple of 8.
+		secret := strings.ToUpper(strings.TrimRight(strings.ReplaceAll(*p.TOTPSecret, " ", ""), "="))
+		const base32BlockLength = 8
+		remainder := len(secret) % base32BlockLength
+		if remainder != 0 {
+			secret += strings.Repeat("=", base32BlockLength-remainder)
+		}
+		_, err = base32.StdEncoding.DecodeString(secret)
 		if err != nil {
 			return fmt.Errorf("TOTP secret is not valid base32: %w", err)
 		}
