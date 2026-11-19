@@ -120,3 +120,92 @@ func Test_PureVPN_read(t *testing.T) {
 	}
 	assert.Equal(t, expected, settings)
 }
+
+func Test_PureVPN_copy(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		settings PureVPN
+	}{
+		"empty_settings": {},
+		"all_fields_set": {
+			settings: PureVPN{
+				Username:       new("user@example.com"),
+				Password:       new("password"),
+				TOTPSecret:     new("JBSWY3DPEHPK3PXP"),
+				SessionToken:   new("token"),
+				CityID:         new(uint32(1234)),
+				SubscriptionID: new("sub-1"),
+				VPNUsername:    new("purevpn0s123"),
+			},
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			copied := testCase.settings.copy()
+
+			assert.Equal(t, testCase.settings, copied)
+			if testCase.settings.Password != nil {
+				assert.NotSame(t, testCase.settings.Password, copied.Password)
+			}
+		})
+	}
+}
+
+func Test_PureVPN_overrideWith(t *testing.T) {
+	t.Parallel()
+
+	filled := PureVPN{
+		Username:       new("user@example.com"),
+		Password:       new("password"),
+		TOTPSecret:     new("JBSWY3DPEHPK3PXP"),
+		SessionToken:   new("token"),
+		CityID:         new(uint32(1234)),
+		SubscriptionID: new("sub-1"),
+		VPNUsername:    new("purevpn0s123"),
+	}
+	other := PureVPN{
+		Username:       new("other@example.com"),
+		Password:       new("other-password"),
+		TOTPSecret:     new(""),
+		SessionToken:   new("other-token"),
+		CityID:         new(uint32(0)),
+		SubscriptionID: new("sub-2"),
+		VPNUsername:    new(""),
+	}
+
+	testCases := map[string]struct {
+		settings PureVPN
+		other    PureVPN
+		expected PureVPN
+	}{
+		"override_empty_with_empty": {},
+		"override_empty_with_filled": {
+			other:    filled,
+			expected: filled,
+		},
+		"override_filled_with_empty": {
+			settings: filled,
+			expected: filled,
+		},
+		"override_filled_with_filled": {
+			settings: filled,
+			other:    other,
+			expected: other,
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			settings := testCase.settings.copy()
+			settings.overrideWith(testCase.other)
+
+			assert.Equal(t, testCase.expected, settings)
+		})
+	}
+}
