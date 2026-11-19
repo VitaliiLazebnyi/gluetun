@@ -327,7 +327,8 @@ func checkTransportTestRequest(t *testing.T, serverPort string, network *fakeNet
 		host = net.JoinHostPort(testRequest.host, serverPort)
 	}
 	requestURL := url.URL{Scheme: scheme, Host: host, Path: testRequest.path}
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, requestURL.String(), nil)
+	requestBody := &closeRecordingBody{}
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, requestURL.String(), requestBody)
 	require.NoError(t, err)
 
 	_, cleanupsBefore := network.opened()
@@ -342,6 +343,7 @@ func checkTransportTestRequest(t *testing.T, serverPort string, network *fakeNet
 			assert.ErrorIs(t, err, testRequest.errWrapped)
 		}
 		assert.ErrorContains(t, err, testRequest.errMessage)
+		assert.True(t, requestBody.closed.Load(), "the request body must be closed on error")
 		for i, cleanup := range newCleanups {
 			openIndex := uint(len(cleanupsBefore) + i)
 			if network.openErrs[openIndex] != nil {
@@ -380,4 +382,18 @@ func checkTransportTestRequest(t *testing.T, serverPort string, network *fakeNet
 	_, cleanups = network.opened()
 	assert.Equal(t, uint(1), cleanups[len(cleanupsBefore)+last],
 		"the connection must be cleaned up once the body is closed")
+}
+
+// closeRecordingBody is an empty request body recording if it is closed.
+type closeRecordingBody struct {
+	closed atomic.Bool
+}
+
+func (b *closeRecordingBody) Read([]byte) (readLength int, err error) {
+	return 0, io.EOF
+}
+
+func (b *closeRecordingBody) Close() error {
+	b.closed.Store(true)
+	return nil
 }

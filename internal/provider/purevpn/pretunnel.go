@@ -25,6 +25,7 @@ type restrictedTransport struct {
 
 func (t *restrictedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	if request.URL.Scheme != "https" {
+		closeRequestBody(request)
 		return nil, fmt.Errorf("URL scheme %q is not https", request.URL.Scheme)
 	}
 	port := request.URL.Port()
@@ -34,6 +35,7 @@ func (t *restrictedTransport) RoundTrip(request *http.Request) (*http.Response, 
 	hostname := net.JoinHostPort(request.URL.Hostname(), port)
 	httpClient, cleanup, err := t.network.OpenHTTPSByHostname(request.Context(), hostname)
 	if err != nil {
+		closeRequestBody(request)
 		return nil, fmt.Errorf("opening restricted HTTPS connection: %w", err)
 	}
 	cleanupOnce := sync.OnceValue(cleanup)
@@ -49,6 +51,14 @@ func (t *restrictedTransport) RoundTrip(request *http.Request) (*http.Response, 
 	}
 	response.Body = &cleanupBody{body: response.Body, cleanup: cleanupOnce}
 	return response, nil
+}
+
+// closeRequestBody closes the request body, if any, since an
+// [http.RoundTripper] must always close it, including on errors.
+func closeRequestBody(request *http.Request) {
+	if request.Body != nil {
+		_ = request.Body.Close()
+	}
 }
 
 // cleanup closes all the connections opened and removes their firewall rules,
@@ -70,8 +80,8 @@ type cleanupBody struct {
 	cleanup func() error
 }
 
-func (b *cleanupBody) Read(p []byte) (n int, err error) {
-	return b.body.Read(p)
+func (b *cleanupBody) Read(buffer []byte) (readLength int, err error) {
+	return b.body.Read(buffer)
 }
 
 func (b *cleanupBody) Close() error {
