@@ -10,7 +10,7 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
-func Test_VPN_Validate_purevpn(t *testing.T) {
+func Test_VPN_Validate(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
@@ -44,7 +44,7 @@ func Test_VPN_Validate_purevpn(t *testing.T) {
 			if testCase.usesFilterChoices {
 				filterChoices := models.FilterChoices{Countries: []string{"Germany"}}
 				filterChoicesGetter.EXPECT().GetFilterChoices(providers.Purevpn).
-					Return(filterChoices).Times(1)
+					Return(filterChoices)
 			}
 			warner := NewMockWarner(ctrl)
 

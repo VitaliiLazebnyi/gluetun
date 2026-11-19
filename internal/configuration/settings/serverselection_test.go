@@ -71,7 +71,7 @@ func Test_ServerSelection_validate_mode(t *testing.T) {
 			filterChoicesGetter := NewMockFilterChoicesGetter(ctrl)
 			if testCase.errMessage == "" {
 				filterChoicesGetter.EXPECT().GetFilterChoices(providers.Mullvad).
-					Return(models.FilterChoices{}).Times(1)
+					Return(models.FilterChoices{})
 			}
 			warner := NewMockWarner(ctrl)
 
@@ -132,7 +132,7 @@ func Test_validateFeatureFilters(t *testing.T) {
 	}
 }
 
-func Test_ServerSelection_validate_pureVPNWireguard(t *testing.T) {
+func Test_ServerSelection_validate(t *testing.T) {
 	t.Parallel()
 
 	filterChoices := models.FilterChoices{
@@ -260,11 +260,11 @@ func Test_ServerSelection_validate_pureVPNWireguard(t *testing.T) {
 			filterChoicesGetter := NewMockFilterChoicesGetter(ctrl)
 			if testCase.usesFilterChoices {
 				filterChoicesGetter.EXPECT().GetFilterChoices(testCase.provider).
-					Return(filterChoices).Times(1)
+					Return(filterChoices)
 			}
 			warner := NewMockWarner(ctrl)
 			if testCase.warning != "" {
-				warner.EXPECT().Warn(testCase.warning).Times(1)
+				warner.EXPECT().Warn(testCase.warning)
 			}
 
 			serverSelection := testCase.selection

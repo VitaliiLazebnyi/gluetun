@@ -132,7 +132,7 @@ func Test_fetchWireguardConnection(t *testing.T) {
 					Interface:                   "wg0",
 				},
 			}
-			ctx := context.Background()
+			ctx := t.Context()
 			logger := NewMockLogger(ctrl)
 			fetcher := NewMockWireguardFetcher(ctrl)
 			fetcher.EXPECT().FetchWireguardConnection(ctx, vpnSettings, logger).
@@ -223,7 +223,7 @@ func Test_setupWireguard(t *testing.T) {
 						Connection: serverConnection,
 						PrivateKey: privateKey,
 						Addresses:  []netip.Prefix{netip.MustParsePrefix("172.21.7.9/32")},
-					}, nil).Times(1)
+					}, nil)
 				return fetcherProvider{MockWireguardFetcher: fetcher}
 			},
 			connectionFound: true,
@@ -235,7 +235,7 @@ func Test_setupWireguard(t *testing.T) {
 			) provider.Provider {
 				fetcher := NewMockWireguardFetcher(ctrl)
 				fetcher.EXPECT().FetchWireguardConnection(ctx, fetcherSettings, logger).
-					Return(models.WireguardConnection{}, errTest).Times(1)
+					Return(models.WireguardConnection{}, errTest)
 				return fetcherProvider{MockWireguardFetcher: fetcher}
 			},
 			errMessage: "fetching Wireguard connection: test error",
@@ -247,7 +247,7 @@ func Test_setupWireguard(t *testing.T) {
 			) provider.Provider {
 				serversDataProvider := NewMockProvider(ctrl)
 				serversDataProvider.EXPECT().GetConnection(connectionSettings.Provider.ServerSelection, false).
-					Return(serverConnection, nil).Times(1)
+					Return(serverConnection, nil)
 				return serversDataProvider
 			},
 			connectionFound: true,
@@ -259,7 +259,7 @@ func Test_setupWireguard(t *testing.T) {
 			) provider.Provider {
 				serversDataProvider := NewMockProvider(ctrl)
 				serversDataProvider.EXPECT().GetConnection(connectionSettings.Provider.ServerSelection, false).
-					Return(models.Connection{}, errTest).Times(1)
+					Return(models.Connection{}, errTest)
 				return serversDataProvider
 			},
 			errMessage: "finding a VPN server: test error",
@@ -271,7 +271,7 @@ func Test_setupWireguard(t *testing.T) {
 			) provider.Provider {
 				serversDataProvider := NewMockProvider(ctrl)
 				serversDataProvider.EXPECT().GetConnection(connectionSettings.Provider.ServerSelection, false).
-					Return(serverConnection, nil).Times(1)
+					Return(serverConnection, nil)
 				return serversDataProvider
 			},
 			connectionFound: true,
@@ -285,16 +285,16 @@ func Test_setupWireguard(t *testing.T) {
 			t.Parallel()
 			ctrl := gomock.NewController(t)
 
-			ctx := context.Background()
+			ctx := t.Context()
 			firewall := NewMockFirewall(ctrl)
 			logger := NewMockLogger(ctrl)
 			vpnProvider := testCase.buildProvider(ctrl, ctx, logger)
 			if testCase.connectionFound {
-				logger.EXPECT().Debug("Wireguard server public key: " + publicKey).Times(1)
-				logger.EXPECT().Debug("Wireguard client private key: Y0Q...w8=").Times(1)
-				logger.EXPECT().Debug("Wireguard pre-shared key: [not set]").Times(1)
+				logger.EXPECT().Debug("Wireguard server public key: " + publicKey)
+				logger.EXPECT().Debug("Wireguard client private key: Y0Q...w8=")
+				logger.EXPECT().Debug("Wireguard pre-shared key: [not set]")
 				firewall.EXPECT().SetVPNConnection(ctx, serverConnection, "wg0").
-					Return(testCase.firewallErr).Times(1)
+					Return(testCase.firewallErr)
 			}
 
 			wireguarder, connection, err := setupWireguard(ctx, nil, firewall,

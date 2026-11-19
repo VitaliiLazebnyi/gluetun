@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func Test_WireguardSelection_validate_purevpn(t *testing.T) {
+func Test_WireguardSelection_validate(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
