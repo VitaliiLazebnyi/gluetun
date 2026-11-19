@@ -31,6 +31,14 @@ func Test_PureVPN_validate(t *testing.T) {
 			settings:   PureVPN{Password: new("pass"), SessionToken: new("token")},
 			errMessage: "account username is not set",
 		},
+		"password_missing_without_session_token": {
+			settings:   PureVPN{Username: new("user@example.com")},
+			errMessage: "account password is not set",
+		},
+		"username_missing_without_session_token": {
+			settings:   PureVPN{Password: new("pass")},
+			errMessage: "account username is not set",
+		},
 		"invalid_TOTP_secret": {
 			settings:   PureVPN{SessionToken: new("token"), TOTPSecret: new("not-base32!")},
 			errMessage: "TOTP secret is not valid base32: illegal base32 data at input byte 3",

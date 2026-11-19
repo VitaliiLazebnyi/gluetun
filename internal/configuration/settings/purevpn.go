@@ -49,14 +49,13 @@ type PureVPN struct {
 }
 
 func (p PureVPN) validate() (err error) {
-	hasCredentials := *p.Username != "" && *p.Password != ""
 	switch {
-	case !hasCredentials && *p.SessionToken == "":
-		return errors.New("account username and password, or session token, are not set")
 	case *p.Username != "" && *p.Password == "":
 		return errors.New("account password is not set")
 	case *p.Username == "" && *p.Password != "":
 		return errors.New("account username is not set")
+	case *p.Username == "" && *p.SessionToken == "":
+		return errors.New("account username and password, or session token, are not set")
 	}
 
 	if *p.TOTPSecret != "" {
