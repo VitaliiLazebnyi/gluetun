@@ -155,6 +155,14 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
+	// Cloudflare is more likely to block requests not looking like browser ones.
+	assert.True(f.t, strings.HasPrefix(request.Header.Get("User-Agent"), "Mozilla/5.0 "))
+	assert.Equal(f.t, "en-US,en;q=0.9", request.Header.Get("Accept-Language"))
+	baseURL := "http://" + request.Host
+	if request.Method == http.MethodPost {
+		assert.Equal(f.t, baseURL, request.Header.Get("Origin"))
+	}
+
 	if f.cloudflare {
 		writeCloudflareBlock(writer)
 		return
@@ -171,7 +179,6 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 
-	baseURL := "http://" + request.Host
 	switch request.Method + " " + request.URL.Path {
 	case "GET /oauth2/authorize":
 		f.serveAuthorizePage(writer, request, baseURL)
@@ -179,7 +186,7 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		if !f.parseForm(writer, request) {
 			return
 		}
-		assert.Equal(f.t, clientID, request.PostForm.Get("client_id"))
+		f.checkLoginForm(request, baseURL)
 		f.counters.passwordLogins++
 		switch {
 		case f.captcha:
@@ -214,7 +221,30 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	}
 }
 
+// checkLoginForm checks the login form submission, whose hidden inputs
+// are set to their default values if the login page has none.
+func (f *fakePureVPN) checkLoginForm(request *http.Request, baseURL string) {
+	assert.Equal(f.t, baseURL+"/oauth2/authorize", request.Header.Get("Referer"))
+	expected := map[string]string{
+		"client_id":            clientID,
+		"tenantId":             "9707f41e-21a4-bbc5-dcbc-fdf6b61cc68f",
+		"response_type":        "code",
+		"redirect_uri":         baseURL + "/v2/api/fusionauth/login",
+		"timezone":             "UTC",
+		"metaData.device.name": "Gluetun",
+		"metaData.device.type": "BROWSER",
+		"showPasswordField":    "true",
+	}
+	for key, value := range expected {
+		assert.Equal(f.t, value, request.PostForm.Get(key), key)
+	}
+}
+
 func (f *fakePureVPN) serveAuthorizePage(writer http.ResponseWriter, request *http.Request, baseURL string) {
+	query := request.URL.Query()
+	assert.Equal(f.t, clientID, query.Get("client_id"))
+	assert.Equal(f.t, "code", query.Get("response_type"))
+	assert.Equal(f.t, baseURL+"/v2/api/fusionauth/login", query.Get("redirect_uri"))
 	cookie, err := request.Cookie("fusionauth.sso")
 	switch {
 	case err != nil, f.ssoDisabled:
@@ -244,11 +274,11 @@ func writeCloudflareBlock(writer http.ResponseWriter) {
 	fmt.Fprint(writer, "<html><title>Just a moment...</title></html>")
 }
 
+// writeCloudflareChallenge writes the Cloudflare block page with the
+// challenge header, which is detected before the page content.
 func writeCloudflareChallenge(writer http.ResponseWriter) {
-	writer.Header().Set("Server", "cloudflare")
 	writer.Header().Set("Cf-Mitigated", "challenge")
-	writer.WriteHeader(http.StatusForbidden)
-	fmt.Fprint(writer, "<html><title>Just a moment...</title></html>")
+	writeCloudflareBlock(writer)
 }
 
 func (f *fakePureVPN) writeTwoFactorPage(writer http.ResponseWriter, errorHTML string) {
@@ -265,6 +295,7 @@ func (f *fakePureVPN) serveTwoFactorCode(writer http.ResponseWriter, request *ht
 		writeCloudflareBlock(writer)
 		return
 	}
+	assert.Equal(f.t, "http://"+request.Host+"/oauth2/two-factor", request.Header.Get("Referer"))
 	assert.Equal(f.t, "tf-1", request.PostForm.Get("twoFactorId"))
 	assert.Equal(f.t, "true", request.PostForm.Get("trustComputer"))
 	valid, err := totp.ValidateCustom(request.PostForm.Get("code"), testTOTPSecret, f.totpTime, totp.ValidateOpts{
@@ -283,6 +314,9 @@ func (f *fakePureVPN) serveTwoFactorCode(writer http.ResponseWriter, request *ht
 }
 
 func (f *fakePureVPN) serveAPI(writer http.ResponseWriter, request *http.Request) {
+	baseURL := "http://" + request.Host
+	assert.Equal(f.t, baseURL, request.Header.Get("Origin"))
+	assert.Equal(f.t, baseURL+"/v2/dashboard/manual-config", request.Header.Get("Referer"))
 	token := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
 	if f.rejectTokens || token == f.rejectToken || !f.validTokens[token] {
 		f.rejectToken = ""
@@ -327,6 +361,8 @@ func (f *fakePureVPN) serveAPI(writer http.ResponseWriter, request *http.Request
 		}
 		assert.Equal(f.t, testSubsID, request.PostForm.Get("sSubsId"))
 		assert.Equal(f.t, testClientKey, request.PostForm.Get("sClientPublicKey"))
+		assert.Equal(f.t, "linux", request.PostForm.Get("sDeviceType"))
+		assert.Equal(f.t, "1", request.PostForm.Get("natServer"))
 		server := map[string]string{
 			"protocol_ip": "203.0.113.7",
 			"wireguard_configuration": "[Interface]\nPrivateKey={clientPrivateKey}\n" +
@@ -415,14 +451,22 @@ func Test_Client_FetchConfig(t *testing.T) {
 		authCookies map[string]string
 		counters    fakeCounters
 
-		// cancelAfterTwoFactorCode cancels the context once the
-		// response to the first two-factor code submission is read,
-		// and the wait for the next two-factor code never ends.
-		cancelAfterTwoFactorCode bool
+		// cancelDuringCodeWait cancels the context once the wait for
+		// the next two-factor code starts, and this wait never ends.
+		cancelDuringCodeWait bool
 		// codeWaits is the number of waits for the next two-factor code.
 		codeWaits uint
 	}{
 		"password_login": {
+			credentials: credentials,
+			authCookies: ssoCookies,
+			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
+		},
+		"login_page_without_hidden_inputs": {
+			setup: func(fake *fakePureVPN) {
+				fake.pages = map[string]string{"GET /oauth2/authorize": `<form action="/oauth2/authorize" method="post">` +
+					`<input name="loginId"><input name="password"></form>`}
+			},
 			credentials: credentials,
 			authCookies: ssoCookies,
 			counters:    fakeCounters{authorizePages: 1, passwordLogins: 1, tokens: 1},
@@ -490,12 +534,12 @@ func Test_Client_FetchConfig(t *testing.T) {
 				fake.twoFactor = true
 				fake.rejectCodes = 1
 			},
-			credentials:              credentialsWithTOTP,
-			cancelAfterTwoFactorCode: true,
-			errWrapped:               context.Canceled,
-			errMessage:               "waiting for the next two-factor code",
-			counters:                 fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1},
-			codeWaits:                1,
+			credentials:          credentialsWithTOTP,
+			cancelDuringCodeWait: true,
+			errWrapped:           context.Canceled,
+			errMessage:           "waiting for the next two-factor code",
+			counters:             fakeCounters{authorizePages: 1, passwordLogins: 1, twoFactorLogins: 1},
+			codeWaits:            1,
 		},
 		"two_factor_invalid_secret": {
 			setup: func(fake *fakePureVPN) { fake.twoFactor = true },
@@ -796,23 +840,24 @@ func Test_Client_FetchConfig(t *testing.T) {
 			// start of the next TOTP time step.
 			const timeStepSeconds = 30
 			nextTimeStep := time.Unix((now.Unix()/timeStepSeconds+1)*timeStepSeconds, 0)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
 			timerExpired := make(chan time.Time)
+			onWaitStart := cancel
+			if !testCase.cancelDuringCodeWait {
+				close(timerExpired)
+				onWaitStart = func() {}
+			}
 			codeWaits := uint(0)
+			timerStopped := false
 			client.newTimer = func(duration time.Duration) (expired <-chan time.Time, stop func() bool) {
 				codeWaits++
 				assert.Equal(t, nextTimeStep.Sub(now), duration)
-				return timerExpired, func() bool { return true }
-			}
-			ctx := t.Context()
-			if !testCase.cancelAfterTwoFactorCode {
-				close(timerExpired)
-			} else {
-				// Cancel the context once the rejected code response
-				// is read, while the timer never expires.
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithCancel(ctx)
-				defer cancel()
-				client.httpClient.Transport = cancelAfterTwoFactorResponse(client.httpClient.Transport, cancel)
+				onWaitStart()
+				return timerExpired, func() bool {
+					timerStopped = true
+					return true
+				}
 			}
 			request := newTestRequest()
 			if testCase.request != nil {
@@ -828,7 +873,13 @@ func Test_Client_FetchConfig(t *testing.T) {
 			}
 			assert.Equal(t, testCase.counters, fake.getCounters())
 			assert.Equal(t, testCase.codeWaits, codeWaits)
+			assert.Equal(t, testCase.cancelDuringCodeWait, timerStopped, "the canceled wait must stop its timer")
 			session := client.Session()
+			if testCase.counters.tokens == 0 {
+				// Without a new access token, a stored access token
+				// which was rejected must not be kept.
+				assert.Empty(t, session.AccessToken)
+			}
 			// Auth cookies are saved even if the login fails.
 			assert.Equal(t, testCase.authCookies, session.AuthCookies)
 			if err != nil {
@@ -923,33 +974,6 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 	return f(request)
 }
 
-// cancelAfterTwoFactorResponse returns a round tripper using the transport
-// given, and canceling once a two-factor code response body is closed.
-func cancelAfterTwoFactorResponse(transport http.RoundTripper, cancel context.CancelFunc) roundTripFunc {
-	return func(request *http.Request) (*http.Response, error) {
-		response, err := transport.RoundTrip(request)
-		if err == nil && request.URL.Path == "/oauth2/two-factor" {
-			response.Body = &cancelOnClose{body: response.Body, cancel: cancel}
-		}
-		return response, err
-	}
-}
-
-// cancelOnClose cancels a context when the response body is closed.
-type cancelOnClose struct {
-	body   io.ReadCloser
-	cancel context.CancelFunc
-}
-
-func (c *cancelOnClose) Read(buffer []byte) (n int, err error) {
-	return c.body.Read(buffer)
-}
-
-func (c *cancelOnClose) Close() error {
-	c.cancel()
-	return c.body.Close()
-}
-
 func Test_New(t *testing.T) {
 	t.Parallel()
 
@@ -987,15 +1011,19 @@ func Test_New(t *testing.T) {
 	t.Run("redirects_refused", func(t *testing.T) {
 		t.Parallel()
 		testCases := map[string]struct {
-			redirectTo func(otherURL string) string
+			redirectTo func(otherURL, serverHost string) string
 			errMessage string
 		}{
 			"other_host": {
-				redirectTo: func(otherURL string) string { return otherURL + "/steal" },
+				redirectTo: func(otherURL, _ string) string { return otherURL + "/steal" },
+				errMessage: "following redirect: host not allowed: ",
+			},
+			"other_scheme": {
+				redirectTo: func(_, serverHost string) string { return "https://" + serverHost + "/steal" },
 				errMessage: "following redirect: host not allowed: ",
 			},
 			"redirect_loop": {
-				redirectTo: func(string) string { return "/loop" },
+				redirectTo: func(string, string) string { return "/loop" },
 				errMessage: "unexpected response from PureVPN: stopped after 10 redirects",
 			},
 		}
@@ -1013,7 +1041,8 @@ func Test_New(t *testing.T) {
 				t.Cleanup(otherServer.Close)
 				server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 					// 307 would replay the request body with the credentials.
-					http.Redirect(writer, request, testCase.redirectTo(otherServer.URL), http.StatusTemporaryRedirect)
+					redirectURL := testCase.redirectTo(otherServer.URL, request.Host)
+					http.Redirect(writer, request, redirectURL, http.StatusTemporaryRedirect)
 				}))
 				t.Cleanup(server.Close)
 				httpClient := &http.Client{Transport: &http.Transport{}}
@@ -1168,6 +1197,26 @@ func Test_Client_apiRequest(t *testing.T) {
 			body:       `<html><div id="cf-error-details">Error</div></html>`,
 			errWrapped: errBlocked,
 			errMessage: "Cloudflare returned 503 Service Unavailable",
+		},
+		"cloudflare_rate_limit_challenge": {
+			status:     http.StatusTooManyRequests,
+			headers:    map[string]string{"Server": "cloudflare", "Content-Type": "text/html"},
+			body:       `<html><div id="cf-chl-widget"></div></html>`,
+			errWrapped: errBlocked,
+			errMessage: "Cloudflare returned 429 Too Many Requests",
+		},
+		"cloudflare_attention_required": {
+			status:     http.StatusServiceUnavailable,
+			headers:    map[string]string{"Server": "cloudflare", "Content-Type": "text/html"},
+			body:       "<html><title>Attention Required! | Cloudflare</title></html>",
+			errWrapped: errBlocked,
+			errMessage: "Cloudflare returned 503 Service Unavailable",
+		},
+		"block_marker_without_cloudflare_server": {
+			status:     http.StatusServiceUnavailable,
+			headers:    map[string]string{"Content-Type": "text/html"},
+			body:       "<html><title>Just a moment...</title></html>",
+			errMessage: "PureVPN API error: API returned 503 Service Unavailable: <html>",
 		},
 		"server_error": {
 			status:     http.StatusInternalServerError,

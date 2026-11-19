@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pquerna/otp/totp"
 	"github.com/qdm12/gluetun/internal/configuration/settings"
 	"github.com/qdm12/gluetun/internal/constants"
 	"github.com/qdm12/gluetun/internal/models"
@@ -34,15 +36,24 @@ const testJWT = "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDB9.sig"
 // accepted by the fake API.
 const testSSOCookie = "sso-cookie-value"
 
-// fakeAPI serves the single sign-on login and the member area API
-// endpoints, accepting only the testSSOCookie single sign-on cookie
-// and the access token given, and records the client public keys.
+// fakeAPI serves the login and the member area API endpoints, accepting
+// the testSSOCookie single sign-on cookie, or any password login followed
+// by any two-factor code, and the access token given. It records the forms
+// received to log in and to request a Wireguard server.
 type fakeAPI struct {
-	token        string
-	endpoint     string
-	mutex        sync.Mutex
-	clientPubKey string
-	requests     uint
+	token         string
+	endpoint      string
+	mutex         sync.Mutex
+	loginForm     url.Values
+	twoFactorForm url.Values
+	serverForm    url.Values
+	requests      uint
+}
+
+func (f *fakeAPI) receivedForms() (loginForm, twoFactorForm, serverForm url.Values) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	return f.loginForm, f.twoFactorForm, f.serverForm
 }
 
 func (f *fakeAPI) requestsCount() uint {
@@ -55,6 +66,19 @@ func (f *fakeAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	f.mutex.Lock()
 	f.requests++
 	f.mutex.Unlock()
+	switch request.Method + " " + request.URL.Path {
+	case "POST /oauth2/authorize":
+		f.recordForm(writer, request, &f.loginForm)
+		page := `<form action="/oauth2/two-factor" method="post">` +
+			`<input name="twoFactorId" value="tf"><input name="code"></form>`
+		_, _ = writer.Write([]byte(page))
+		return
+	case "POST /oauth2/two-factor":
+		f.recordForm(writer, request, &f.twoFactorForm)
+		http.SetCookie(writer, &http.Cookie{Name: "fa_token", Value: f.token, Path: "/"}) //nolint:gosec // test
+		_, _ = writer.Write([]byte("<html>dashboard</html>"))
+		return
+	}
 	if request.URL.Path == "/oauth2/authorize" {
 		cookie, err := request.Cookie("fusionauth.sso")
 		if err == nil && cookie.Value == testSSOCookie {
@@ -77,12 +101,13 @@ func (f *fakeAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	var body string
 	switch request.URL.Path {
 	case "/v2/api/subscription":
-		body = `[{"id":"s1","state":"active","vpnusernames":["purevpn0s1"]}]`
+		body = `[{"id":"s1","state":"active","vpnusernames":["purevpn0s1"]},` +
+			`{"id":"s2","state":"active","vpnusernames":["purevpn0s2","purevpn0s1"]}]`
 	case "/v2/api/wireguard/get-encrypt-password":
 		body = `{"encrypPass":"x"}`
 	case "/v2/api/wireguard/get-wg-server":
 		f.mutex.Lock()
-		f.clientPubKey = request.PostForm.Get("sClientPublicKey")
+		f.serverForm = request.PostForm
 		f.mutex.Unlock()
 		config := "[Interface]\nAddress=172.21.7.9\n[Peer]\nPublicKey=" + testServerPublicKey +
 			"\nEndpoint=" + f.endpoint + "\nPersistentKeepalive=21\n"
@@ -96,6 +121,14 @@ func (f *fakeAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	_, _ = writer.Write([]byte(`{"status":true,"body":` + body + `}`))
+}
+
+func (f *fakeAPI) recordForm(writer http.ResponseWriter, request *http.Request, form *url.Values) {
+	request.Body = http.MaxBytesReader(writer, request.Body, 1<<20)
+	_ = request.ParseForm()
+	f.mutex.Lock()
+	*form = request.PostForm
+	f.mutex.Unlock()
 }
 
 // newTestServer returns a test HTTPS server for the API given,
@@ -171,7 +204,8 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 
 		key, err := wgtypes.ParseKey(connection.PrivateKey)
 		require.NoError(t, err)
-		assert.Equal(t, key.PublicKey().String(), api.clientPubKey,
+		_, _, serverForm := api.receivedForms()
+		assert.Equal(t, key.PublicKey().String(), serverForm.Get("sClientPublicKey"),
 			"the generated key public key must be sent to PureVPN")
 		assert.Equal(t, models.WireguardConnection{
 			Connection: models.Connection{
@@ -214,6 +248,50 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 			testVPNSettings("", ""), restartedLogger)
 		require.NoError(t, err)
 		assert.Equal(t, connection.PrivateKey, second.PrivateKey)
+	})
+
+	t.Run("every_setting_sent", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+
+		api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
+		server, network := newTestServer(t, api)
+
+		key, err := wgtypes.GeneratePrivateKey()
+		require.NoError(t, err)
+		logger := NewMockLogger(ctrl)
+		gomock.InOrder(
+			logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country CA city ID 1234"),
+			logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
+		)
+		fetcher := newTestFetcher(t, server.URL, network)
+		const totpSecret = "JBSWY3DPEHPK3PXP" //nolint:gosec // test value
+		vpnSettings := testVPNSettings("", key.String())
+		vpnSettings.Provider.ServerSelection.Countries = []string{"Canada"}
+		vpnSettings.PureVPN = settings.PureVPN{
+			Username:       new("alice@example.com"),
+			Password:       new("alice-password"),
+			TOTPSecret:     new(totpSecret),
+			SessionToken:   new(""),
+			CityID:         new(uint32(1234)),
+			SubscriptionID: new("s2"),
+			// Also a VPN username of the first subscription.
+			VPNUsername: new("purevpn0s1"),
+		}
+
+		_, err = fetcher.fetch(t.Context(), vpnSettings, logger)
+
+		require.NoError(t, err)
+		loginForm, twoFactorForm, serverForm := api.receivedForms()
+		assert.Equal(t, "alice@example.com", loginForm.Get("loginId"))
+		assert.Equal(t, "alice-password", loginForm.Get("password"))
+		assert.True(t, totp.Validate(twoFactorForm.Get("code"), totpSecret),
+			"the two-factor code must be generated from the TOTP secret")
+		assert.Equal(t, "CA", serverForm.Get("sCountrySlug"))
+		assert.Equal(t, "1234", serverForm.Get("iCityId"))
+		assert.Equal(t, "s2", serverForm.Get("sSubsId"))
+		assert.Equal(t, "purevpn0s1", serverForm.Get("sUsername"))
+		assert.Equal(t, key.PublicKey().String(), serverForm.Get("sClientPublicKey"))
 	})
 
 	t.Run("canceled_context", func(t *testing.T) {
@@ -481,6 +559,16 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 
 				assert.ErrorContains(t, err, testCase.errMessage)
 				assert.Equal(t, models.WireguardConnection{}, connection)
+				if testCase.privateKey == "" {
+					// The generated key pair is persisted even if the fetch fails,
+					// so a failing login does not change the key pair on restart.
+					data, err := os.ReadFile(fetcher.statePath)
+					require.NoError(t, err)
+					var state wireguardState
+					require.NoError(t, json.Unmarshal(data, &state))
+					_, err = wgtypes.ParseKey(state.PrivateKey)
+					assert.NoError(t, err)
+				}
 			})
 		}
 	})
@@ -517,7 +605,8 @@ func Test_Provider_FetchWireguardConnection(t *testing.T) {
 	hostnames, _ := network.opened()
 	assert.Len(t, hostnames, int(api.requestsCount()), "the restricted network given to New must be used")
 	assert.Equal(t, key.String(), connection.PrivateKey)
-	assert.Equal(t, key.PublicKey().String(), api.clientPubKey)
+	_, _, serverForm := api.receivedForms()
+	assert.Equal(t, key.PublicKey().String(), serverForm.Get("sClientPublicKey"))
 	assert.Equal(t, netip.MustParseAddr("203.0.113.5"), connection.Connection.IP)
 }
 
@@ -791,9 +880,11 @@ func Test_wireguardFetcher_loadState(t *testing.T) {
 			state:   wireguardState{PrivateKey: "key", Session: wgapi.Session{AccessToken: "token"}},
 		},
 		"corrupt_file": {
-			content: new(`{"private_key":"key",`),
+			// The private key is decoded before the error, and must be discarded.
+			content: new(`{"private_key":"key","session":5}`),
 			warning: func(string) string {
-				return "decoding PureVPN state file, ignoring it: unexpected end of JSON input"
+				return "decoding PureVPN state file, ignoring it: json: cannot unmarshal number " +
+					"into Go struct field wireguardState.session of type wgapi.Session"
 			},
 		},
 	}

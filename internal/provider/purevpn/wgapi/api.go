@@ -167,7 +167,7 @@ func isHTMLResponse(response *http.Response, body []byte) bool {
 func truncate(text string) string {
 	const maxRunes = 200
 	text = strings.TrimSpace(text)
-	runeCount := 0
+	runeCount := uint(0)
 	for index := range text {
 		if runeCount == maxRunes {
 			return text[:index] + "..."
