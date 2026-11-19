@@ -50,6 +50,7 @@ func (p *Provider) validate(vpnType string, filterChoicesGetter FilterChoicesGet
 			providers.Mullvad,
 			providers.Nordvpn,
 			providers.Protonvpn,
+			providers.Purevpn,
 			providers.Surfshark,
 			providers.Windscribe,
 		}

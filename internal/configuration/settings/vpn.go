@@ -3,6 +3,7 @@ package settings
 import (
 	"fmt"
 
+	"github.com/qdm12/gluetun/internal/constants/providers"
 	"github.com/qdm12/gluetun/internal/constants/vpn"
 	"github.com/qdm12/gosettings"
 	"github.com/qdm12/gosettings/reader"
@@ -19,7 +20,10 @@ type VPN struct {
 	AmneziaWg AmneziaWg `json:"amneziawg"`
 	OpenVPN   OpenVPN   `json:"openvpn"`
 	Wireguard Wireguard `json:"wireguard"`
-	PMTUD     PMTUD     `json:"pmtud"`
+	// PureVPN contains the PureVPN account settings, only used
+	// to fetch Wireguard configurations with the PureVPN provider.
+	PureVPN PureVPN `json:"purevpn"`
+	PMTUD   PMTUD   `json:"pmtud"`
 	// UpCommand is the command to use when the VPN connection is up.
 	// It can be the empty string to indicate not to run a command.
 	// It cannot be nil in the internal state.
@@ -62,6 +66,12 @@ func (v *VPN) Validate(filterChoicesGetter FilterChoicesGetter, ipv6Supported bo
 		if err != nil {
 			return fmt.Errorf("Wireguard settings: %w", err)
 		}
+		if v.Provider.Name == providers.Purevpn {
+			err = v.PureVPN.validate()
+			if err != nil {
+				return fmt.Errorf("PureVPN settings: %w", err)
+			}
+		}
 	}
 
 	err = v.PMTUD.validate()
@@ -79,6 +89,7 @@ func (v *VPN) Copy() (copied VPN) {
 		AmneziaWg:   v.AmneziaWg.copy(),
 		OpenVPN:     v.OpenVPN.copy(),
 		Wireguard:   v.Wireguard.copy(),
+		PureVPN:     v.PureVPN.copy(),
 		PMTUD:       v.PMTUD.copy(),
 		UpCommand:   gosettings.CopyPointer(v.UpCommand),
 		DownCommand: gosettings.CopyPointer(v.DownCommand),
@@ -91,6 +102,7 @@ func (v *VPN) OverrideWith(other VPN) {
 	v.AmneziaWg.overrideWith(other.AmneziaWg)
 	v.OpenVPN.overrideWith(other.OpenVPN)
 	v.Wireguard.overrideWith(other.Wireguard)
+	v.PureVPN.overrideWith(other.PureVPN)
 	v.PMTUD.overrideWith(other.PMTUD)
 	v.UpCommand = gosettings.OverrideWithPointer(v.UpCommand, other.UpCommand)
 	v.DownCommand = gosettings.OverrideWithPointer(v.DownCommand, other.DownCommand)
@@ -102,6 +114,7 @@ func (v *VPN) setDefaults() {
 	v.AmneziaWg.setDefaults(v.Provider.Name)
 	v.OpenVPN.setDefaults(v.Provider.Name)
 	v.Wireguard.setDefaults(v.Provider.Name)
+	v.PureVPN.setDefaults()
 	v.PMTUD.setDefaults()
 	v.UpCommand = gosettings.DefaultPointer(v.UpCommand, "")
 	v.DownCommand = gosettings.DefaultPointer(v.DownCommand, "")
@@ -123,6 +136,9 @@ func (v VPN) toLinesNode() (node *gotree.Node) {
 		node.AppendNode(v.OpenVPN.toLinesNode())
 	case vpn.Wireguard:
 		node.AppendNode(v.Wireguard.toLinesNode())
+		if v.Provider.Name == providers.Purevpn {
+			node.AppendNode(v.PureVPN.toLinesNode())
+		}
 	}
 	node.AppendNode(v.PMTUD.toLinesNode())
 
@@ -158,6 +174,11 @@ func (v *VPN) read(r *reader.Reader) (err error) {
 	err = v.Wireguard.read(r, amneziawg)
 	if err != nil {
 		return fmt.Errorf("wireguard: %w", err)
+	}
+
+	err = v.PureVPN.read(r)
+	if err != nil {
+		return fmt.Errorf("PureVPN: %w", err)
 	}
 
 	err = v.PMTUD.read(r)
