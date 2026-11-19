@@ -201,7 +201,7 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 			f.issueToken(writer, request)
 		}
 	case "POST /oauth2/two-factor":
-		f.serveTwoFactorCode(writer, request)
+		f.serveTwoFactorCode(writer, request, baseURL)
 	case "GET /v2/api/fusionauth/login":
 		if f.challengePath == request.URL.Path || request.URL.Query().Get("code") == "sso-challenged" {
 			writeCloudflareChallenge(writer)
@@ -217,7 +217,7 @@ func (f *fakePureVPN) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		}
 		fmt.Fprint(writer, "<html>dashboard</html>")
 	default:
-		f.serveAPI(writer, request)
+		f.serveAPI(writer, request, baseURL)
 	}
 }
 
@@ -285,7 +285,7 @@ func (f *fakePureVPN) writeTwoFactorPage(writer http.ResponseWriter, errorHTML s
 	fmt.Fprintf(writer, twoFactorPage, errorHTML, f.twoFactorPageExtra)
 }
 
-func (f *fakePureVPN) serveTwoFactorCode(writer http.ResponseWriter, request *http.Request) {
+func (f *fakePureVPN) serveTwoFactorCode(writer http.ResponseWriter, request *http.Request, baseURL string) {
 	if !f.parseForm(writer, request) {
 		return
 	}
@@ -295,7 +295,7 @@ func (f *fakePureVPN) serveTwoFactorCode(writer http.ResponseWriter, request *ht
 		writeCloudflareBlock(writer)
 		return
 	}
-	assert.Equal(f.t, "http://"+request.Host+"/oauth2/two-factor", request.Header.Get("Referer"))
+	assert.Equal(f.t, baseURL+"/oauth2/two-factor", request.Header.Get("Referer"))
 	assert.Equal(f.t, "tf-1", request.PostForm.Get("twoFactorId"))
 	assert.Equal(f.t, "true", request.PostForm.Get("trustComputer"))
 	valid, err := totp.ValidateCustom(request.PostForm.Get("code"), testTOTPSecret, f.totpTime, totp.ValidateOpts{
@@ -313,9 +313,7 @@ func (f *fakePureVPN) serveTwoFactorCode(writer http.ResponseWriter, request *ht
 	f.issueToken(writer, request)
 }
 
-func (f *fakePureVPN) serveAPI(writer http.ResponseWriter, request *http.Request) {
-	baseURL := "http://" + request.Host
-	assert.Equal(f.t, baseURL, request.Header.Get("Origin"))
+func (f *fakePureVPN) serveAPI(writer http.ResponseWriter, request *http.Request, baseURL string) {
 	assert.Equal(f.t, baseURL+"/v2/dashboard/manual-config", request.Header.Get("Referer"))
 	token := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
 	if f.rejectTokens || token == f.rejectToken || !f.validTokens[token] {
