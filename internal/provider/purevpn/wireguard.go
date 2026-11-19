@@ -71,8 +71,18 @@ func (f *wireguardFetcher) fetch(ctx context.Context,
 	vpnSettings settings.VPN, logger Logger,
 ) (connection models.WireguardConnection, err error) {
 	purevpnSettings := vpnSettings.PureVPN
-	// The settings validation ensures there is exactly one known country.
-	countryCode, _ := constants.CountryNameToCode(vpnSettings.Provider.ServerSelection.Countries[0])
+	// The settings validation checks the countries only if the server selection
+	// VPN type is Wireguard, which can differ from the VPN type after a control
+	// server update, so check them again here.
+	countries := vpnSettings.Provider.ServerSelection.Countries
+	if len(countries) != 1 {
+		return models.WireguardConnection{}, fmt.Errorf("exactly one country must be set with PureVPN Wireguard, but got %d",
+			len(countries))
+	}
+	countryCode, ok := constants.CountryNameToCode(countries[0])
+	if !ok {
+		return models.WireguardConnection{}, fmt.Errorf("country code not found for country %q", countries[0])
+	}
 	countryCode = strings.ToUpper(countryCode)
 
 	// Bound the whole fetch so it does not block the VPN loop for too long,

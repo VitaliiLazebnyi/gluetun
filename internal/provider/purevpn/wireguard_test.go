@@ -451,12 +451,28 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 		t.Parallel()
 		testCases := map[string]struct {
 			privateKey    string
+			countries     []string
 			endpoint      string
 			openErr       error
 			modifyFetcher func(fetcher *wireguardFetcher)
 			makeLogger    func(ctrl *gomock.Controller) *MockLogger
 			errMessage    string
 		}{
+			"no_country": {
+				countries:  []string{},
+				makeLogger: NewMockLogger,
+				errMessage: "exactly one country must be set with PureVPN Wireguard, but got 0",
+			},
+			"two_countries": {
+				countries:  []string{"United States", "Canada"},
+				makeLogger: NewMockLogger,
+				errMessage: "exactly one country must be set with PureVPN Wireguard, but got 2",
+			},
+			"unknown_country": {
+				countries:  []string{"Atlantis"},
+				makeLogger: NewMockLogger,
+				errMessage: `country code not found for country "Atlantis"`,
+			},
 			"invalid_settings_private_key": {
 				privateKey: "invalid",
 				makeLogger: NewMockLogger,
@@ -554,12 +570,15 @@ func Test_wireguardFetcher_fetch(t *testing.T) {
 				}
 				vpnSettings := testVPNSettings(testSSOCookie, testCase.privateKey)
 				*vpnSettings.PureVPN.CityID = 0
+				if testCase.countries != nil {
+					vpnSettings.Provider.ServerSelection.Countries = testCase.countries
+				}
 
 				connection, err := fetcher.fetch(t.Context(), vpnSettings, testCase.makeLogger(ctrl))
 
 				assert.ErrorContains(t, err, testCase.errMessage)
 				assert.Equal(t, models.WireguardConnection{}, connection)
-				if testCase.privateKey == "" {
+				if testCase.privateKey == "" && testCase.countries == nil {
 					// The generated key pair is persisted even if the fetch fails,
 					// so a failing login does not change the key pair on restart.
 					data, err := os.ReadFile(fetcher.statePath)
