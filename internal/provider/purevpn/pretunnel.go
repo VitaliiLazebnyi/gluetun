@@ -47,7 +47,7 @@ func (t *restrictedTransport) RoundTrip(request *http.Request) (*http.Response, 
 		_ = cleanupOnce() // the error is returned again by cleanup
 		return nil, err
 	}
-	response.Body = &cleanupBody{ReadCloser: response.Body, cleanup: cleanupOnce}
+	response.Body = &cleanupBody{body: response.Body, cleanup: cleanupOnce}
 	return response, nil
 }
 
@@ -66,10 +66,14 @@ func (t *restrictedTransport) cleanup() error {
 // cleanupBody closes the connection and removes its firewall rule
 // once the response body is closed.
 type cleanupBody struct {
-	io.ReadCloser
+	body    io.ReadCloser
 	cleanup func() error
 }
 
+func (b *cleanupBody) Read(p []byte) (n int, err error) {
+	return b.body.Read(p)
+}
+
 func (b *cleanupBody) Close() error {
-	return errors.Join(b.ReadCloser.Close(), b.cleanup())
+	return errors.Join(b.body.Close(), b.cleanup())
 }

@@ -141,7 +141,7 @@ type transportTestRequest struct {
 	errMessage string
 }
 
-func Test_restrictedTransport(t *testing.T) {
+func Test_restrictedTransport_RoundTrip(t *testing.T) {
 	t.Parallel()
 
 	testErr := errors.New("test error")
@@ -242,7 +242,7 @@ func Test_restrictedTransport(t *testing.T) {
 							http.Redirect(writer, request, redirectURL.String(), http.StatusFound)
 							return
 						}
-						_, _ = writer.Write([]byte(request.URL.Path)) //nolint:gosec
+						_, _ = writer.Write([]byte(request.URL.Path)) //nolint:gosec // test server
 					}))
 				server.EnableHTTP2 = protocol.serverHTTP2
 				server.StartTLS()

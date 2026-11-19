@@ -254,8 +254,7 @@ func (f *wireguardFetcher) loadState(logger Logger) {
 }
 
 func (f *wireguardFetcher) saveState(logger Logger) {
-	// The private key and session are persisted on purpose, in a 0600 file.
-	data, err := json.MarshalIndent(f.state, "", "  ") //nolint:gosec
+	data, err := json.MarshalIndent(f.state, "", "  ") //nolint:gosec // secrets persisted on purpose, in a 0600 file
 	if err != nil {
 		logger.Warn("encoding PureVPN state: " + err.Error())
 		return

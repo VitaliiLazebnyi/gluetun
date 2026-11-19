@@ -61,7 +61,7 @@ func (f *fakeAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		cookie, err := request.Cookie("fusionauth.sso")
 		if err == nil && cookie.Value == testSSOCookie {
 			// Logged in through the single sign-on session.
-			http.SetCookie(writer, &http.Cookie{Name: "fa_token", Value: f.token, Path: "/"}) //nolint:gosec
+			http.SetCookie(writer, &http.Cookie{Name: "fa_token", Value: f.token, Path: "/"}) //nolint:gosec // test
 			_, _ = writer.Write([]byte("<html>dashboard</html>"))
 			return
 		}
@@ -145,77 +145,350 @@ func testVPNSettings(sessionToken, privateKey string) settings.VPN {
 
 func Test_wireguardFetcher_fetch(t *testing.T) {
 	t.Parallel()
-	ctrl := gomock.NewController(t)
 
-	api := &fakeAPI{token: testJWT, endpoint: "us-ny.purevpn.net:51820"}
-	server, network := newTestServer(t, api)
+	t.Run("new_key_pair_and_restart", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
 
-	logger := NewMockLogger(ctrl)
-	gomock.InOrder(
-		logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
-		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
-		logger.EXPECT().Info("PureVPN Wireguard server us-ny.purevpn.net (198.51.100.9:51820)"),
-	)
-	fetcher := newTestFetcher(t, server.URL, network)
-	connection, err := fetcher.fetch(context.Background(),
-		testVPNSettings(testSSOCookie, ""), logger)
-	require.NoError(t, err)
+		api := &fakeAPI{token: testJWT, endpoint: "us-ny.purevpn.net:51820"}
+		server, network := newTestServer(t, api)
 
-	_, ok := network.openCtx.Deadline()
-	assert.True(t, ok, "requests must be bounded by a timeout")
-	hostnames, cleanups := network.opened()
-	requestsCount := int(api.requestsCount())
-	assert.Greater(t, requestsCount, 1)
-	assert.Equal(t, slices.Repeat([]string{strings.TrimPrefix(server.URL, "https://")}, requestsCount), hostnames,
-		"each request must open its own connection")
-	assert.Equal(t, slices.Repeat([]uint{1}, requestsCount), cleanups, "each connection must be cleaned up once")
+		logger := NewMockLogger(ctrl)
+		gomock.InOrder(
+			logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+			logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+			logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+			logger.EXPECT().Info("PureVPN Wireguard server us-ny.purevpn.net (198.51.100.9:51820)"),
+		)
+		fetcher := newTestFetcher(t, server.URL, network)
+		connection, err := fetcher.fetch(t.Context(),
+			testVPNSettings(testSSOCookie, ""), logger)
+		require.NoError(t, err)
 
-	key, err := wgtypes.ParseKey(connection.PrivateKey)
-	require.NoError(t, err)
-	assert.Equal(t, key.PublicKey().String(), api.clientPubKey,
-		"the generated key public key must be sent to PureVPN")
-	assert.Equal(t, models.WireguardConnection{
-		Connection: models.Connection{
-			Type:       "wireguard",
-			IP:         netip.MustParseAddr("198.51.100.9"),
-			Port:       51820,
-			Protocol:   constants.UDP,
-			Hostname:   "us-ny.purevpn.net",
-			ServerName: "us-ny.purevpn.net",
-			PubKey:     testServerPublicKey,
-		},
-		PrivateKey:          connection.PrivateKey,
-		Addresses:           []netip.Prefix{netip.MustParsePrefix("172.21.7.9/32")},
-		PersistentKeepalive: 21 * time.Second,
-	}, connection)
+		_, ok := network.openCtx.Deadline()
+		assert.True(t, ok, "requests must be bounded by a timeout")
+		hostnames, cleanups := network.opened()
+		requestsCount := int(api.requestsCount())
+		assert.Greater(t, requestsCount, 1)
+		assert.Equal(t, slices.Repeat([]string{strings.TrimPrefix(server.URL, "https://")}, requestsCount), hostnames,
+			"each request must open its own connection")
+		assert.Equal(t, slices.Repeat([]uint{1}, requestsCount), cleanups, "each connection must be cleaned up once")
 
-	// State is persisted with restrictive permissions.
-	info, err := os.Stat(fetcher.statePath)
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
-	data, err := os.ReadFile(fetcher.statePath)
-	require.NoError(t, err)
-	var state wireguardState
-	require.NoError(t, json.Unmarshal(data, &state))
-	assert.Equal(t, connection.PrivateKey, state.PrivateKey)
-	assert.Equal(t, api.token, state.Session.AccessToken)
-	assert.Equal(t, hashHex(testSSOCookie), state.SessionTokenHash)
-	assert.Equal(t, hashHex(""), state.UsernameHash)
+		key, err := wgtypes.ParseKey(connection.PrivateKey)
+		require.NoError(t, err)
+		assert.Equal(t, key.PublicKey().String(), api.clientPubKey,
+			"the generated key public key must be sent to PureVPN")
+		assert.Equal(t, models.WireguardConnection{
+			Connection: models.Connection{
+				Type:       "wireguard",
+				IP:         netip.MustParseAddr("198.51.100.9"),
+				Port:       51820,
+				Protocol:   constants.UDP,
+				Hostname:   "us-ny.purevpn.net",
+				ServerName: "us-ny.purevpn.net",
+				PubKey:     testServerPublicKey,
+			},
+			PrivateKey:          connection.PrivateKey,
+			Addresses:           []netip.Prefix{netip.MustParsePrefix("172.21.7.9/32")},
+			PersistentKeepalive: 21 * time.Second,
+		}, connection)
 
-	// A restarted fetcher reuses the persisted key pair and session,
-	// even without the session token in the settings.
-	restartedLogger := NewMockLogger(ctrl)
-	gomock.InOrder(
-		restartedLogger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
-		restartedLogger.EXPECT().Info("PureVPN Wireguard server us-ny.purevpn.net (198.51.100.9:51820)"),
-	)
-	restarted := newTestFetcher(t, server.URL, network)
-	restarted.statePath = fetcher.statePath
-	second, err := restarted.fetch(context.Background(),
-		testVPNSettings("", ""), restartedLogger)
-	require.NoError(t, err)
-	assert.Equal(t, connection.PrivateKey, second.PrivateKey)
+		// State is persisted with restrictive permissions.
+		info, err := os.Stat(fetcher.statePath)
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+		data, err := os.ReadFile(fetcher.statePath)
+		require.NoError(t, err)
+		var state wireguardState
+		require.NoError(t, json.Unmarshal(data, &state))
+		assert.Equal(t, connection.PrivateKey, state.PrivateKey)
+		assert.Equal(t, api.token, state.Session.AccessToken)
+		assert.Equal(t, hashHex(testSSOCookie), state.SessionTokenHash)
+		assert.Equal(t, hashHex(""), state.UsernameHash)
+
+		// A restarted fetcher reuses the persisted key pair and session,
+		// even without the session token in the settings.
+		restartedLogger := NewMockLogger(ctrl)
+		gomock.InOrder(
+			restartedLogger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+			restartedLogger.EXPECT().Info("PureVPN Wireguard server us-ny.purevpn.net (198.51.100.9:51820)"),
+		)
+		restarted := newTestFetcher(t, server.URL, network)
+		restarted.statePath = fetcher.statePath
+		second, err := restarted.fetch(t.Context(),
+			testVPNSettings("", ""), restartedLogger)
+		require.NoError(t, err)
+		assert.Equal(t, connection.PrivateKey, second.PrivateKey)
+	})
+
+	t.Run("canceled_context", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+
+		api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
+		server, network := newTestServer(t, api)
+
+		logger := NewMockLogger(ctrl)
+		gomock.InOrder(
+			logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+			logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+			logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+		)
+		fetcher := newTestFetcher(t, server.URL, network)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err := fetcher.fetch(ctx, testVPNSettings(testSSOCookie, ""), logger)
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Zero(t, api.requestsCount())
+	})
+
+	t.Run("auth_error", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+
+		api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
+		server, network := newTestServer(t, api)
+
+		fetcher := newTestFetcher(t, server.URL, network)
+
+		// No credentials and a rejected token: the login page is shown.
+		logger := NewMockLogger(ctrl)
+		gomock.InOrder(
+			logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+			logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+			logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+		)
+		_, err := fetcher.fetch(t.Context(),
+			testVPNSettings("rejected-token", ""), logger)
+		require.ErrorContains(t, err, "requesting configuration from PureVPN: ")
+		assert.ErrorContains(t, err, "PureVPN account username and password are not set")
+		requestsAfterFirstFetch := api.requestsCount()
+		require.NotZero(t, requestsAfterFirstFetch)
+
+		// Same settings: PureVPN is contacted again, the VPN loop
+		// taking care of waiting between connection attempts.
+		logger = NewMockLogger(ctrl)
+		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778")
+		_, err = fetcher.fetch(t.Context(),
+			testVPNSettings("rejected-token", ""), logger)
+		require.ErrorContains(t, err, "PureVPN account username and password are not set")
+		requestsAfterSecondFetch := api.requestsCount()
+		assert.Greater(t, requestsAfterSecondFetch, requestsAfterFirstFetch)
+
+		// Changed session token: it replaces the stored session.
+		logger = NewMockLogger(ctrl)
+		gomock.InOrder(
+			logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+			logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+			logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
+		)
+		_, err = fetcher.fetch(t.Context(),
+			testVPNSettings(testSSOCookie, ""), logger)
+		require.NoError(t, err)
+		assert.Greater(t, api.requestsCount(), requestsAfterSecondFetch)
+	})
+
+	t.Run("cleanup_error", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+
+		api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
+		server, network := newTestServer(t, api)
+		// For example the firewall got disabled during the fetch,
+		// so removing the firewall rule fails.
+		network.cleanupErrs = map[uint]error{0: errors.New("test error")}
+
+		logger := NewMockLogger(ctrl)
+		gomock.InOrder(
+			logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+			logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+			logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+			logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
+			logger.EXPECT().Warn("cleaning up connections to PureVPN: cleanup 0: test error"),
+		)
+		fetcher := newTestFetcher(t, server.URL, network)
+
+		_, err := fetcher.fetch(t.Context(), testVPNSettings(testSSOCookie, ""), logger)
+
+		assert.NoError(t, err)
+	})
+
+	t.Run("account_change", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+
+		api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
+		server, network := newTestServer(t, api)
+		fetcher := newTestFetcher(t, server.URL, network)
+
+		key, err := wgtypes.GeneratePrivateKey()
+		require.NoError(t, err)
+		fetcher.state.PrivateKey = key.String()
+
+		// Logged in for the first account through the session token.
+		logger := NewMockLogger(ctrl)
+		gomock.InOrder(
+			logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+			logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+			logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
+		)
+		vpnSettings := testVPNSettings(testSSOCookie, "")
+		*vpnSettings.PureVPN.Username = "alice"
+		*vpnSettings.PureVPN.Password = "alice-password"
+		_, err = fetcher.fetch(t.Context(), vpnSettings, logger)
+		require.NoError(t, err)
+
+		// Password changed for the same account: the stored session is used.
+		logger = NewMockLogger(ctrl)
+		gomock.InOrder(
+			logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+			logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
+		)
+		vpnSettings = testVPNSettings("", "")
+		*vpnSettings.PureVPN.Username = "alice"
+		*vpnSettings.PureVPN.Password = "alice-new-password"
+		_, err = fetcher.fetch(t.Context(), vpnSettings, logger)
+		require.NoError(t, err)
+
+		// Another account: the stored session of the first account must not
+		// be used, and the login with the new account credentials fails.
+		logger = NewMockLogger(ctrl)
+		gomock.InOrder(
+			logger.EXPECT().Info("discarding the stored PureVPN session since it is not for the configured account"),
+			logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
+		)
+		vpnSettings = testVPNSettings("", "")
+		*vpnSettings.PureVPN.Username = "bob"
+		*vpnSettings.PureVPN.Password = "bob-password"
+		_, err = fetcher.fetch(t.Context(), vpnSettings, logger)
+		require.ErrorContains(t, err, "requesting configuration from PureVPN: ")
+
+		data, err := os.ReadFile(fetcher.statePath)
+		require.NoError(t, err)
+		var state wireguardState
+		require.NoError(t, json.Unmarshal(data, &state))
+		assert.Equal(t, key.String(), state.PrivateKey, "the key pair must be kept")
+		assert.Equal(t, hashHex("bob"), state.UsernameHash)
+		assert.Empty(t, state.SessionTokenHash)
+		assert.NotEqual(t, testJWT, state.Session.AccessToken)
+		assert.NotContains(t, state.Session.AuthCookies, "fusionauth.sso")
+	})
+
+	t.Run("errors", func(t *testing.T) {
+		t.Parallel()
+		testCases := map[string]struct {
+			privateKey    string
+			endpoint      string
+			openErr       error
+			modifyFetcher func(fetcher *wireguardFetcher)
+			makeLogger    func(ctrl *gomock.Controller) *MockLogger
+			errMessage    string
+		}{
+			"invalid_settings_private_key": {
+				privateKey: "invalid",
+				makeLogger: NewMockLogger,
+				errMessage: "parsing Wireguard private key: wgtypes: failed to parse base64-encoded key: " +
+					"illegal base64 data at input byte 4",
+			},
+			"invalid_auth_url": {
+				modifyFetcher: func(fetcher *wireguardFetcher) {
+					fetcher.authURL = "://invalid"
+				},
+				makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+					logger := NewMockLogger(ctrl)
+					logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN")
+					logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie")
+					return logger
+				},
+				errMessage: `creating PureVPN client: parsing auth URL: parse "://invalid": missing protocol scheme`,
+			},
+			"open_https_error": {
+				openErr: errors.New("test error"),
+				makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+					logger := NewMockLogger(ctrl)
+					gomock.InOrder(
+						logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+						logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+						// City ID 0 lets PureVPN pick a city in the country.
+						logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
+					)
+					return logger
+				},
+				errMessage: "opening restricted HTTPS connection: test error",
+			},
+			"not_https_url": {
+				modifyFetcher: func(fetcher *wireguardFetcher) {
+					fetcher.appURL = "http://127.0.0.1:1"
+				},
+				makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+					logger := NewMockLogger(ctrl)
+					gomock.InOrder(
+						logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+						logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+						// City ID 0 lets PureVPN pick a city in the country.
+						logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
+					)
+					return logger
+				},
+				errMessage: `URL scheme "http" is not https`,
+			},
+			"endpoint_resolution_error": {
+				endpoint: "unknown.purevpn.net:51820",
+				makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+					logger := NewMockLogger(ctrl)
+					gomock.InOrder(
+						logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+						logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+						// City ID 0 lets PureVPN pick a city in the country.
+						logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
+					)
+					return logger
+				},
+				errMessage: "resolving Wireguard endpoint: unknown host unknown.purevpn.net",
+			},
+			"endpoint_without_address": {
+				endpoint: "empty.purevpn.net:51820",
+				makeLogger: func(ctrl *gomock.Controller) *MockLogger {
+					logger := NewMockLogger(ctrl)
+					gomock.InOrder(
+						logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
+						logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
+						// City ID 0 lets PureVPN pick a city in the country.
+						logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
+					)
+					return logger
+				},
+				errMessage: "no IP address found for Wireguard endpoint empty.purevpn.net",
+			},
+		}
+
+		for name, testCase := range testCases {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				ctrl := gomock.NewController(t)
+
+				endpoint := testCase.endpoint
+				if endpoint == "" {
+					endpoint = "us-ny.purevpn.net:51820"
+				}
+				api := &fakeAPI{token: testJWT, endpoint: endpoint}
+				server, network := newTestServer(t, api)
+				network.openErrs = map[uint]error{0: testCase.openErr}
+
+				fetcher := newTestFetcher(t, server.URL, network)
+				if testCase.modifyFetcher != nil {
+					testCase.modifyFetcher(fetcher)
+				}
+				vpnSettings := testVPNSettings(testSSOCookie, testCase.privateKey)
+				*vpnSettings.PureVPN.CityID = 0
+
+				connection, err := fetcher.fetch(t.Context(), vpnSettings, testCase.makeLogger(ctrl))
+
+				assert.ErrorContains(t, err, testCase.errMessage)
+				assert.Equal(t, models.WireguardConnection{}, connection)
+			})
+		}
+	})
 }
 
 // Test_Provider_FetchWireguardConnection tests the provider entry point
@@ -242,7 +515,7 @@ func Test_Provider_FetchWireguardConnection(t *testing.T) {
 	provider.wireguard.authURL = server.URL
 	provider.wireguard.appURL = server.URL
 
-	connection, err := provider.FetchWireguardConnection(context.Background(),
+	connection, err := provider.FetchWireguardConnection(t.Context(),
 		testVPNSettings(testSSOCookie, key.String()), logger)
 
 	require.NoError(t, err)
@@ -251,98 +524,6 @@ func Test_Provider_FetchWireguardConnection(t *testing.T) {
 	assert.Equal(t, key.String(), connection.PrivateKey)
 	assert.Equal(t, key.PublicKey().String(), api.clientPubKey)
 	assert.Equal(t, netip.MustParseAddr("203.0.113.5"), connection.Connection.IP)
-}
-
-func Test_wireguardFetcher_fetch_canceledContext(t *testing.T) {
-	t.Parallel()
-	ctrl := gomock.NewController(t)
-
-	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
-	server, network := newTestServer(t, api)
-
-	logger := NewMockLogger(ctrl)
-	gomock.InOrder(
-		logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
-		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
-	)
-	fetcher := newTestFetcher(t, server.URL, network)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := fetcher.fetch(ctx, testVPNSettings(testSSOCookie, ""), logger)
-	require.ErrorIs(t, err, context.Canceled)
-	assert.Zero(t, api.requestsCount())
-}
-
-func Test_wireguardFetcher_fetch_authError(t *testing.T) {
-	t.Parallel()
-	ctrl := gomock.NewController(t)
-
-	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
-	server, network := newTestServer(t, api)
-
-	fetcher := newTestFetcher(t, server.URL, network)
-
-	// No credentials and a rejected token: the login page is shown.
-	logger := NewMockLogger(ctrl)
-	gomock.InOrder(
-		logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
-		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
-	)
-	_, err := fetcher.fetch(context.Background(),
-		testVPNSettings("rejected-token", ""), logger)
-	require.ErrorContains(t, err, "requesting configuration from PureVPN: ")
-	assert.ErrorContains(t, err, "PureVPN account username and password are not set")
-	requestsAfterFirstFetch := api.requestsCount()
-	require.NotZero(t, requestsAfterFirstFetch)
-
-	// Same settings: PureVPN is contacted again, the VPN loop
-	// taking care of waiting between connection attempts.
-	logger = NewMockLogger(ctrl)
-	logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778")
-	_, err = fetcher.fetch(context.Background(),
-		testVPNSettings("rejected-token", ""), logger)
-	require.ErrorContains(t, err, "PureVPN account username and password are not set")
-	requestsAfterSecondFetch := api.requestsCount()
-	assert.Greater(t, requestsAfterSecondFetch, requestsAfterFirstFetch)
-
-	// Changed session token: it replaces the stored session.
-	logger = NewMockLogger(ctrl)
-	gomock.InOrder(
-		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
-		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
-	)
-	_, err = fetcher.fetch(context.Background(),
-		testVPNSettings(testSSOCookie, ""), logger)
-	require.NoError(t, err)
-	assert.Greater(t, api.requestsCount(), requestsAfterSecondFetch)
-}
-
-func Test_wireguardFetcher_fetch_cleanupError(t *testing.T) {
-	t.Parallel()
-	ctrl := gomock.NewController(t)
-
-	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
-	server, network := newTestServer(t, api)
-	// For example the firewall got disabled during the fetch,
-	// so removing the firewall rule fails.
-	network.cleanupErrs = map[uint]error{0: errors.New("test error")}
-
-	logger := NewMockLogger(ctrl)
-	gomock.InOrder(
-		logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
-		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
-		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
-		logger.EXPECT().Warn("cleaning up connections to PureVPN: cleanup 0: test error"),
-	)
-	fetcher := newTestFetcher(t, server.URL, network)
-
-	_, err := fetcher.fetch(context.Background(), testVPNSettings(testSSOCookie, ""), logger)
-
-	assert.NoError(t, err)
 }
 
 func Test_wireguardFetcher_applyAccount(t *testing.T) {
@@ -516,72 +697,11 @@ func Test_wireguardFetcher_applyAccount(t *testing.T) {
 	}
 }
 
-func Test_wireguardFetcher_fetch_accountChange(t *testing.T) {
-	t.Parallel()
-	ctrl := gomock.NewController(t)
-
-	api := &fakeAPI{token: testJWT, endpoint: "203.0.113.5:51820"}
-	server, network := newTestServer(t, api)
-	fetcher := newTestFetcher(t, server.URL, network)
-
-	key, err := wgtypes.GeneratePrivateKey()
-	require.NoError(t, err)
-	fetcher.state.PrivateKey = key.String()
-
-	// Logged in for the first account through the session token.
-	logger := NewMockLogger(ctrl)
-	gomock.InOrder(
-		logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
-		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
-	)
-	vpnSettings := testVPNSettings(testSSOCookie, "")
-	*vpnSettings.PureVPN.Username = "alice"
-	*vpnSettings.PureVPN.Password = "alice-password"
-	_, err = fetcher.fetch(context.Background(), vpnSettings, logger)
-	require.NoError(t, err)
-
-	// Password changed for the same account: the stored session is used.
-	logger = NewMockLogger(ctrl)
-	gomock.InOrder(
-		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
-		logger.EXPECT().Info("PureVPN Wireguard server 203.0.113.5 (203.0.113.5:51820)"),
-	)
-	vpnSettings = testVPNSettings("", "")
-	*vpnSettings.PureVPN.Username = "alice"
-	*vpnSettings.PureVPN.Password = "alice-new-password"
-	_, err = fetcher.fetch(context.Background(), vpnSettings, logger)
-	require.NoError(t, err)
-
-	// Another account: the stored session of the first account must not
-	// be used, and the login with the new account credentials fails.
-	logger = NewMockLogger(ctrl)
-	gomock.InOrder(
-		logger.EXPECT().Info("discarding the stored PureVPN session since it is not for the configured account"),
-		logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US city ID 8778"),
-	)
-	vpnSettings = testVPNSettings("", "")
-	*vpnSettings.PureVPN.Username = "bob"
-	*vpnSettings.PureVPN.Password = "bob-password"
-	_, err = fetcher.fetch(context.Background(), vpnSettings, logger)
-	require.ErrorContains(t, err, "requesting configuration from PureVPN: ")
-
-	data, err := os.ReadFile(fetcher.statePath)
-	require.NoError(t, err)
-	var state wireguardState
-	require.NoError(t, json.Unmarshal(data, &state))
-	assert.Equal(t, key.String(), state.PrivateKey, "the key pair must be kept")
-	assert.Equal(t, hashHex("bob"), state.UsernameHash)
-	assert.Empty(t, state.SessionTokenHash)
-	assert.NotEqual(t, testJWT, state.Session.AccessToken)
-	assert.NotContains(t, state.Session.AuthCookies, "fusionauth.sso")
-}
-
 func Test_wireguardFetcher_saveState(t *testing.T) {
 	t.Parallel()
 
 	state := wireguardState{PrivateKey: "key", Session: wgapi.Session{AccessToken: "token"}}
-	expectedData, err := json.MarshalIndent(state, "", "  ") //nolint:gosec
+	expectedData, err := json.MarshalIndent(state, "", "  ") //nolint:gosec // test secrets
 	require.NoError(t, err)
 
 	testCases := map[string]struct {
@@ -600,7 +720,7 @@ func Test_wireguardFetcher_saveState(t *testing.T) {
 			makeStatePath: func(t *testing.T) string {
 				t.Helper()
 				path := filepath.Join(t.TempDir(), "state.json")
-				err := os.WriteFile(path, []byte("old content"), 0o644) //nolint:gosec
+				err := os.WriteFile(path, []byte("old content"), 0o644) //nolint:gosec // loose permissions on purpose
 				require.NoError(t, err)
 				err = os.Chmod(path, 0o644)
 				require.NoError(t, err)
@@ -713,152 +833,37 @@ func Test_wireguardFetcher_loadState(t *testing.T) {
 	}
 }
 
-func Test_writeFileAtomically_renameError(t *testing.T) {
+func Test_writeFileAtomically(t *testing.T) {
 	t.Parallel()
 
-	directory := t.TempDir()
-	path := filepath.Join(directory, "state.json")
-	err := os.Mkdir(path, 0o700) // renaming a file over a directory fails
-	require.NoError(t, err)
+	t.Run("rename_error", func(t *testing.T) {
+		t.Parallel()
+		directory := t.TempDir()
+		path := filepath.Join(directory, "state.json")
+		err := os.Mkdir(path, 0o700) // renaming a file over a directory fails
+		require.NoError(t, err)
 
-	err = writeFileAtomically(path, []byte("data"))
+		err = writeFileAtomically(path, []byte("data"))
 
-	assert.ErrorContains(t, err, "renaming temporary file: ")
-	entries, err := os.ReadDir(directory)
-	require.NoError(t, err)
-	require.Len(t, entries, 1, "temporary file must be removed")
-	assert.Equal(t, "state.json", entries[0].Name())
-	assert.True(t, entries[0].IsDir())
-}
+		assert.ErrorContains(t, err, "renaming temporary file: ")
+		entries, err := os.ReadDir(directory)
+		require.NoError(t, err)
+		require.Len(t, entries, 1, "temporary file must be removed")
+		assert.Equal(t, "state.json", entries[0].Name())
+		assert.True(t, entries[0].IsDir())
+	})
 
-func Test_wireguardFetcher_fetch_errors(t *testing.T) {
-	t.Parallel()
+	t.Run("create_temp_error", func(t *testing.T) {
+		t.Parallel()
+		directory := t.TempDir()
+		// The temporary file name is longer than the 255 bytes file name limit.
+		path := filepath.Join(directory, strings.Repeat("a", 250))
 
-	testCases := map[string]struct {
-		privateKey    string
-		endpoint      string
-		openErr       error
-		modifyFetcher func(fetcher *wireguardFetcher)
-		makeLogger    func(ctrl *gomock.Controller) *MockLogger
-		errMessage    string
-	}{
-		"invalid_settings_private_key": {
-			privateKey: "invalid",
-			makeLogger: NewMockLogger,
-			errMessage: "parsing Wireguard private key: wgtypes: failed to parse base64-encoded key: " +
-				"illegal base64 data at input byte 4",
-		},
-		"invalid_auth_url": {
-			modifyFetcher: func(fetcher *wireguardFetcher) {
-				fetcher.authURL = "://invalid"
-			},
-			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
-				logger := NewMockLogger(ctrl)
-				logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN")
-				logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie")
-				return logger
-			},
-			errMessage: `creating PureVPN client: parsing auth URL: parse "://invalid": missing protocol scheme`,
-		},
-		"open_https_error": {
-			openErr: errors.New("test error"),
-			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
-				logger := NewMockLogger(ctrl)
-				gomock.InOrder(
-					logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
-					logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-					// City ID 0 lets PureVPN pick a city in the country.
-					logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
-				)
-				return logger
-			},
-			errMessage: "opening restricted HTTPS connection: test error",
-		},
-		"not_https_url": {
-			modifyFetcher: func(fetcher *wireguardFetcher) {
-				fetcher.appURL = "http://127.0.0.1:1"
-			},
-			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
-				logger := NewMockLogger(ctrl)
-				gomock.InOrder(
-					logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
-					logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-					// City ID 0 lets PureVPN pick a city in the country.
-					logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
-				)
-				return logger
-			},
-			errMessage: `URL scheme "http" is not https`,
-		},
-		"endpoint_resolution_error": {
-			endpoint: "unknown.purevpn.net:51820",
-			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
-				logger := NewMockLogger(ctrl)
-				gomock.InOrder(
-					logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
-					logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-					// City ID 0 lets PureVPN pick a city in the country.
-					logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
-				)
-				return logger
-			},
-			errMessage: "resolving Wireguard endpoint: unknown host unknown.purevpn.net",
-		},
-		"endpoint_without_address": {
-			endpoint: "empty.purevpn.net:51820",
-			makeLogger: func(ctrl *gomock.Controller) *MockLogger {
-				logger := NewMockLogger(ctrl)
-				gomock.InOrder(
-					logger.EXPECT().Info("generated a new Wireguard key pair for PureVPN"),
-					logger.EXPECT().Debug("using PureVPN session token as single sign-on cookie"),
-					// City ID 0 lets PureVPN pick a city in the country.
-					logger.EXPECT().Info("fetching Wireguard configuration from PureVPN for country US"),
-				)
-				return logger
-			},
-			errMessage: "no IP address found for Wireguard endpoint empty.purevpn.net",
-		},
-	}
+		err := writeFileAtomically(path, []byte("data"))
 
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			ctrl := gomock.NewController(t)
-
-			endpoint := testCase.endpoint
-			if endpoint == "" {
-				endpoint = "us-ny.purevpn.net:51820"
-			}
-			api := &fakeAPI{token: testJWT, endpoint: endpoint}
-			server, network := newTestServer(t, api)
-			network.openErrs = map[uint]error{0: testCase.openErr}
-
-			fetcher := newTestFetcher(t, server.URL, network)
-			if testCase.modifyFetcher != nil {
-				testCase.modifyFetcher(fetcher)
-			}
-			vpnSettings := testVPNSettings(testSSOCookie, testCase.privateKey)
-			*vpnSettings.PureVPN.CityID = 0
-
-			connection, err := fetcher.fetch(context.Background(), vpnSettings, testCase.makeLogger(ctrl))
-
-			assert.ErrorContains(t, err, testCase.errMessage)
-			assert.Equal(t, models.WireguardConnection{}, connection)
-		})
-	}
-}
-
-func Test_writeFileAtomically_createTempError(t *testing.T) {
-	t.Parallel()
-
-	directory := t.TempDir()
-	// The temporary file name is longer than the 255 bytes file name limit.
-	path := filepath.Join(directory, strings.Repeat("a", 250))
-
-	err := writeFileAtomically(path, []byte("data"))
-
-	assert.ErrorContains(t, err, "creating temporary file: ")
-	entries, err := os.ReadDir(directory)
-	require.NoError(t, err)
-	assert.Empty(t, entries)
+		assert.ErrorContains(t, err, "creating temporary file: ")
+		entries, err := os.ReadDir(directory)
+		require.NoError(t, err)
+		assert.Empty(t, entries)
+	})
 }
