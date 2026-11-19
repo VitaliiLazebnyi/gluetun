@@ -80,15 +80,11 @@ type fakeCounters struct {
 }
 
 type fakeResponse struct {
-	status      int
-	contentType string
-	body        string
+	status int
+	body   string
 }
 
 func (r *fakeResponse) write(writer http.ResponseWriter) {
-	if r.contentType != "" {
-		writer.Header().Set("Content-Type", r.contentType)
-	}
 	writer.WriteHeader(r.status)
 	fmt.Fprint(writer, r.body)
 }
@@ -391,7 +387,7 @@ func newExpectedConfig(t *testing.T) Config {
 		EndpointHost:        "us-ny.purevpn.net",
 		EndpointPort:        51820,
 		PersistentKeepalive: 21 * time.Second,
-		ProtocolIP:          netip.MustParseAddr("203.0.113.7"),
+		protocolIP:          netip.MustParseAddr("203.0.113.7"),
 	}
 }
 
@@ -933,7 +929,7 @@ func cancelAfterTwoFactorResponse(transport http.RoundTripper, cancel context.Ca
 	return func(request *http.Request) (*http.Response, error) {
 		response, err := transport.RoundTrip(request)
 		if err == nil && request.URL.Path == "/oauth2/two-factor" {
-			response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
+			response.Body = &cancelOnClose{body: response.Body, cancel: cancel}
 		}
 		return response, err
 	}
@@ -941,13 +937,17 @@ func cancelAfterTwoFactorResponse(transport http.RoundTripper, cancel context.Ca
 
 // cancelOnClose cancels a context when the response body is closed.
 type cancelOnClose struct {
-	io.ReadCloser
+	body   io.ReadCloser
 	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Read(buffer []byte) (n int, err error) {
+	return c.body.Read(buffer)
 }
 
 func (c *cancelOnClose) Close() error {
 	c.cancel()
-	return c.ReadCloser.Close()
+	return c.body.Close()
 }
 
 func Test_New(t *testing.T) {
@@ -1365,13 +1365,15 @@ func Test_Client_saveAuthCookies(t *testing.T) {
 func Test_Client_login(t *testing.T) {
 	t.Parallel()
 
-	testCases := map[string]Credentials{
+	testCases := map[string]struct {
+		credentials Credentials
+	}{
 		"nothing_set":      {},
-		"password_not_set": {Username: testUsername},
-		"username_not_set": {Password: testPassword},
+		"password_not_set": {credentials: Credentials{Username: testUsername}},
+		"username_not_set": {credentials: Credentials{Password: testPassword}},
 	}
 
-	for name, credentials := range testCases {
+	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			httpClient := &http.Client{
@@ -1380,7 +1382,7 @@ func Test_Client_login(t *testing.T) {
 					return nil, errors.New("unexpected request")
 				}),
 			}
-			client, err := New(httpClient, "", "", credentials, Session{})
+			client, err := New(httpClient, "", "", testCase.credentials, Session{})
 			require.NoError(t, err)
 
 			token, err := client.login(t.Context())

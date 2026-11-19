@@ -38,10 +38,8 @@ const testSSOCookie = "sso-cookie-value"
 // endpoints, accepting only the testSSOCookie single sign-on cookie
 // and the access token given, and records the client public keys.
 type fakeAPI struct {
-	token    string
-	endpoint string
-	// loginError is the error message shown on the login page, if any.
-	loginError   string
+	token        string
+	endpoint     string
 	mutex        sync.Mutex
 	clientPubKey string
 	requests     uint
@@ -71,9 +69,6 @@ func (f *fakeAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "text/html")
 		page := `<form action="/oauth2/authorize" method="post">` +
 			`<input name="loginId"><input name="password"></form>`
-		if f.loginError != "" {
-			page += `<div class="error">` + f.loginError + `</div>`
-		}
 		_, _ = writer.Write([]byte(page))
 		return
 	}

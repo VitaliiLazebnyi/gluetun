@@ -28,16 +28,16 @@ type Config struct {
 	// PersistentKeepalive is the persistent keepalive interval,
 	// and is zero if not set.
 	PersistentKeepalive time.Duration
-	// ProtocolIP is the server IP address, given separately
+	// protocolIP is the server IP address, given separately
 	// from the configuration, and is invalid if not given.
-	ProtocolIP netip.Addr
+	protocolIP netip.Addr
 }
 
 // EndpointIP returns the protocol IP if it is set, or else the
 // endpoint host if it is an IP address.
 func (c Config) EndpointIP() (ip netip.Addr, ok bool) {
-	if c.ProtocolIP.IsValid() {
-		return c.ProtocolIP, true
+	if c.protocolIP.IsValid() {
+		return c.protocolIP, true
 	}
 	ip, err := netip.ParseAddr(c.EndpointHost)
 	if err != nil {

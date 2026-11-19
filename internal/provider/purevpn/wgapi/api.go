@@ -280,7 +280,7 @@ func (c *Client) getWireguardServer(ctx context.Context, token string,
 		if err != nil {
 			return Config{}, fmt.Errorf("unexpected response from PureVPN: parsing protocol IP: %w", err)
 		}
-		config.ProtocolIP = protocolIP.Unmap()
+		config.protocolIP = protocolIP.Unmap()
 	}
 	return config, nil
 }

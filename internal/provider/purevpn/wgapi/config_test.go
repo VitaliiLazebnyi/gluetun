@@ -119,7 +119,7 @@ func Test_Config_EndpointIP(t *testing.T) {
 		ok     bool
 	}{
 		"protocol_ip": {
-			config: Config{EndpointHost: "198.51.100.1", ProtocolIP: netip.MustParseAddr("203.0.113.7")},
+			config: Config{EndpointHost: "198.51.100.1", protocolIP: netip.MustParseAddr("203.0.113.7")},
 			ip:     netip.MustParseAddr("203.0.113.7"),
 			ok:     true,
 		},
