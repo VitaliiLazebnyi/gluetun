@@ -19,9 +19,6 @@ import (
 // PureVPN member area application.
 const clientID = "ed1ee674-0a34-4265-b4a1-141b721036eb"
 
-// accessToken is the name of the member area access token cookie.
-const accessToken = "fa_token"
-
 // ssoCookie is the name of the auth server single sign-on session cookie.
 const ssoCookie = "fusionauth.sso"
 
@@ -72,6 +69,9 @@ type Client struct {
 	appURL      *url.URL
 	credentials Credentials
 	timeNow     func() time.Time
+	// newTimer returns a channel receiving once the duration given
+	// elapsed, and a function stopping the timer.
+	newTimer func(duration time.Duration) (expired <-chan time.Time, stop func() bool)
 
 	session Session
 }
@@ -94,6 +94,10 @@ func New(httpClient *http.Client, authURL, appURL string,
 	client = &Client{
 		credentials: credentials,
 		timeNow:     time.Now,
+		newTimer: func(duration time.Duration) (expired <-chan time.Time, stop func() bool) {
+			timer := time.NewTimer(duration)
+			return timer.C, timer.Stop
+		},
 	}
 	client.authURL, err = url.Parse(authURL)
 	if err != nil {
@@ -118,7 +122,7 @@ func New(httpClient *http.Client, authURL, appURL string,
 		}
 		const maxRedirects = 10
 		if len(via) >= maxRedirects {
-			return fmt.Errorf("%w: stopped after %d redirects", errUnexpectedResponse, maxRedirects)
+			return fmt.Errorf("unexpected response from PureVPN: stopped after %d redirects", maxRedirects)
 		}
 		return nil
 	}
@@ -139,7 +143,7 @@ func (c *Client) checkHost(target *url.URL) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("%w: %s", errHostNotAllowed, target.Host)
+	return fmt.Errorf("host not allowed: %s", target.Host)
 }
 
 // isAuthRequest returns true if the request given is an auth flow
@@ -300,8 +304,9 @@ func redactURL(fullURL *url.URL) string {
 // getAccessTokenCookie returns the access token cookie value
 // from the cookie jar of the current login.
 func (c *Client) getAccessTokenCookie() string {
+	const accessTokenCookie = "fa_token"
 	for _, cookie := range c.httpClient.Jar.Cookies(c.appURL) {
-		if cookie.Name == accessToken && cookie.Value != "" {
+		if cookie.Name == accessTokenCookie && cookie.Value != "" {
 			return cookie.Value
 		}
 	}
@@ -330,7 +335,7 @@ func (c *Client) ensureAccessToken(ctx context.Context) (token string, loggedIn 
 func (c *Client) login(ctx context.Context) (token string, err error) {
 	c.session.AccessToken = ""
 	if !c.credentialsSet() && len(c.session.AuthCookies) == 0 {
-		return "", errCredentialsNotSet
+		return "", errors.New("PureVPN account username and password are not set")
 	}
 	c.httpClient.Jar = newCookieJar(c.authURL, c.session.AuthCookies)
 

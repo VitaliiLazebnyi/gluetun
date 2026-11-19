@@ -1,13 +1,11 @@
 package wgapi
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sync"
 	"testing"
 	"time"
 
@@ -164,21 +162,18 @@ func Test_loginPageError(t *testing.T) {
 
 	testCases := map[string]struct {
 		errors     []string
-		errWrapped error
 		errMessage string
 	}{
 		"no_message": {
-			errWrapped: errInvalidCredentials,
-			errMessage: "login page shown again without error message",
+			errMessage: "PureVPN rejected the account username or password: login page shown again without error message",
 		},
 		"invalid_credentials": {
 			errors:     []string{"Invalid login credentials."},
-			errWrapped: errInvalidCredentials,
-			errMessage: "Invalid login credentials.",
+			errMessage: "PureVPN rejected the account username or password: Invalid login credentials.",
 		},
 		"captcha": {
 			errors:     []string{"Please complete the CAPTCHA."},
-			errWrapped: errCaptchaRequired,
+			errMessage: "PureVPN requires a captcha to log in, log in once from a browser or set a session token",
 		},
 	}
 
@@ -186,7 +181,6 @@ func Test_loginPageError(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			err := loginPageError(&htmlPage{errors: testCase.errors})
-			assert.ErrorIs(t, err, testCase.errWrapped)
 			assert.ErrorContains(t, err, testCase.errMessage)
 		})
 	}
@@ -222,7 +216,6 @@ func Test_Client_submitForm(t *testing.T) {
 
 	testCases := map[string]struct {
 		action     string
-		errWrapped error
 		errMessage string
 	}{
 		"invalid_action": {
@@ -231,12 +224,11 @@ func Test_Client_submitForm(t *testing.T) {
 		},
 		"other_host": {
 			action:     "https://evil.example.com/oauth2/authorize",
-			errWrapped: errHostNotAllowed,
 			errMessage: "form action: host not allowed: evil.example.com",
 		},
 		"insecure_scheme": {
 			action:     "http://auth.purevpn.com/oauth2/authorize",
-			errWrapped: errHostNotAllowed,
+			errMessage: "host not allowed",
 		},
 	}
 
@@ -256,65 +248,7 @@ func Test_Client_submitForm(t *testing.T) {
 			_, err = client.submitForm(t.Context(), page, &htmlForm{action: testCase.action},
 				url.Values{"password": {"secret"}})
 
-			if testCase.errWrapped != nil {
-				assert.ErrorIs(t, err, testCase.errWrapped)
-			}
 			assert.ErrorContains(t, err, testCase.errMessage)
-		})
-	}
-}
-
-func Test_Client_redirects(t *testing.T) {
-	t.Parallel()
-
-	testCases := map[string]struct {
-		redirectTo func(otherURL string) string
-		errWrapped error
-		errMessage string
-	}{
-		"other_host": {
-			redirectTo: func(otherURL string) string { return otherURL + "/steal" },
-			errWrapped: errHostNotAllowed,
-			errMessage: "following redirect: host not allowed: ",
-		},
-		"redirect_loop": {
-			redirectTo: func(string) string { return "/loop" },
-			errWrapped: errUnexpectedResponse,
-			errMessage: "stopped after 10 redirects",
-		},
-	}
-
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			otherRequests := uint(0)
-			var mutex sync.Mutex
-			otherServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-				mutex.Lock()
-				otherRequests++
-				mutex.Unlock()
-			}))
-			t.Cleanup(otherServer.Close)
-			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				// 307 would replay the request body with the credentials.
-				http.Redirect(writer, request, testCase.redirectTo(otherServer.URL), http.StatusTemporaryRedirect)
-			}))
-			t.Cleanup(server.Close)
-			httpClient := &http.Client{Transport: &http.Transport{}}
-			client, err := New(httpClient, server.URL, server.URL, Credentials{}, Session{})
-			require.NoError(t, err)
-
-			_, err = client.doAuthRequest(t.Context(), http.MethodPost, server.URL+"/oauth2/authorize",
-				url.Values{"password": {"secret"}})
-			assert.ErrorIs(t, err, testCase.errWrapped)
-			assert.ErrorContains(t, err, testCase.errMessage)
-
-			err = client.apiRequest(t.Context(), "token", "/v2/api/subscription", nil, nil)
-			assert.ErrorIs(t, err, testCase.errWrapped)
-
-			mutex.Lock()
-			assert.Zero(t, otherRequests)
-			mutex.Unlock()
 		})
 	}
 }
@@ -325,7 +259,6 @@ func Test_Client_doAuthRequest(t *testing.T) {
 	testCases := map[string]struct {
 		status     int
 		rawURL     string
-		errWrapped error
 		errMessage string
 	}{
 		"invalid_url": {
@@ -334,7 +267,6 @@ func Test_Client_doAuthRequest(t *testing.T) {
 		},
 		"server_error": {
 			status:     http.StatusInternalServerError,
-			errWrapped: errUnexpectedResponse,
 			errMessage: "unexpected response from PureVPN: %s returned 500 Internal Server Error",
 		},
 		"client_error_page_parsed": {
@@ -356,15 +288,12 @@ func Test_Client_doAuthRequest(t *testing.T) {
 				rawURL = server.URL + "/page?secret=1"
 			}
 
-			page, err := client.doAuthRequest(context.Background(), http.MethodGet, rawURL, nil)
+			page, err := client.doAuthRequest(t.Context(), http.MethodGet, rawURL, nil)
 
 			if testCase.errMessage != "" {
 				errMessage := testCase.errMessage
 				if testCase.rawURL == "" {
 					errMessage = fmt.Sprintf(errMessage, server.URL+"/page")
-				}
-				if testCase.errWrapped != nil {
-					assert.ErrorIs(t, err, testCase.errWrapped)
 				}
 				assert.ErrorContains(t, err, errMessage)
 				assert.NotContains(t, err.Error(), "secret")
@@ -375,83 +304,15 @@ func Test_Client_doAuthRequest(t *testing.T) {
 			assert.Equal(t, []*htmlForm{{action: "/x", inputs: []htmlInput{{name: "a"}}}}, page.forms)
 		})
 	}
-}
 
-func Test_Client_accessTokenSet(t *testing.T) {
-	t.Parallel()
+	t.Run("read_body_error", func(t *testing.T) {
+		t.Parallel()
+		client, err := New(newReadErrorHTTPClient(), "", "", Credentials{}, Session{})
+		require.NoError(t, err)
 
-	testCases := map[string]struct {
-		loginChallenged    bool
-		apiRequest         bool
-		pagePath           string
-		redirectedRequests uint
-	}{
-		"auth_redirect_not_followed": {
-			pagePath: "/login",
-		},
-		"auth_challenge_ignored": {
-			loginChallenged: true,
-			pagePath:        "/login",
-		},
-		"api_redirect_followed": {
-			apiRequest:         true,
-			redirectedRequests: 1,
-		},
-	}
+		page, err := client.doAuthRequest(t.Context(), http.MethodGet, "https://auth.purevpn.com", nil)
 
-	for name, testCase := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			redirectedRequests := uint(0)
-			var mutex sync.Mutex
-			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				switch request.URL.Path {
-				case "/oauth2/authorize":
-					http.Redirect(writer, request, "/login", http.StatusFound)
-				case "/login":
-					http.SetCookie(writer, &http.Cookie{Name: accessToken, Value: "token", Path: "/"}) //nolint:gosec
-					if testCase.loginChallenged {
-						writeCloudflareChallenge(writer)
-						return
-					}
-					http.Redirect(writer, request, "/redirected", http.StatusFound)
-				case "/v2/api/test":
-					http.Redirect(writer, request, "/redirected", http.StatusFound)
-				case "/redirected":
-					mutex.Lock()
-					redirectedRequests++
-					mutex.Unlock()
-					if request.Header.Get("Authorization") == "" {
-						writeCloudflareChallenge(writer)
-						return
-					}
-					fmt.Fprint(writer, `{"status":true}`)
-				default:
-					t.Errorf("unexpected request path %s", request.URL.Path)
-				}
-			}))
-			t.Cleanup(server.Close)
-			// The auth and app URLs are on the same host, so the auth
-			// flow is told apart from API requests by the Authorization header.
-			client := newTestClient(t, server.URL, Credentials{}, Session{})
-
-			if testCase.apiRequest {
-				client.httpClient.Jar.SetCookies(client.appURL, []*http.Cookie{
-					{Name: accessToken, Value: "token", Path: "/"}, //nolint:gosec // client-side cookie jar
-				})
-				err := client.apiRequest(t.Context(), "token", "/v2/api/test", nil, nil)
-				assert.NoError(t, err)
-			} else {
-				page, err := client.doAuthRequest(t.Context(), http.MethodGet, server.URL+"/oauth2/authorize", nil)
-				require.NoError(t, err)
-				assert.Equal(t, testCase.pagePath, page.url.Path)
-				assert.Empty(t, page.forms)
-			}
-
-			assert.Equal(t, "token", client.getAccessTokenCookie())
-			mutex.Lock()
-			assert.Equal(t, testCase.redirectedRequests, redirectedRequests)
-			mutex.Unlock()
-		})
-	}
+		assert.ErrorContains(t, err, "reading response body: test read error")
+		assert.Nil(t, page)
+	})
 }

@@ -39,8 +39,13 @@ func (c *Client) authenticate(ctx context.Context) (token string, err error) {
 			// so log in with the credentials without the single sign-on cookie.
 			// The other auth cookies, such as the two-factor trusted device
 			// cookie, are kept.
+			blockedSSOCookie := authCookies[ssoCookie]
 			delete(authCookies, ssoCookie)
 			c.httpClient.Jar = newCookieJar(c.authURL, authCookies)
+			// The stored single sign-on session is kept if the login
+			// without it does not give a new one, since the block can be
+			// transient and the session can still be valid.
+			defer c.restoreSSOCookie(blockedSSOCookie)
 			page, err = c.doAuthRequest(ctx, http.MethodGet, c.authorizeURL().String(), nil)
 		}
 	}
@@ -62,11 +67,11 @@ func (c *Client) authenticate(ctx context.Context) (token string, err error) {
 		// The single sign-on session is still valid but the two-factor
 		// trusted device cookie expired, so go straight to two-factor.
 	case loginForm == nil:
-		return "", fmt.Errorf("%w: login form not found at %s with status %s",
-			errUnexpectedResponse, redactURL(page.url), page.status)
+		return "", fmt.Errorf("unexpected response from PureVPN: login form not found at %s with status %s",
+			redactURL(page.url), page.status)
 	case !c.credentialsSet():
 		// The login form is only shown without a valid single sign-on session.
-		return "", fmt.Errorf("%w and %w", errSessionExpired, errCredentialsNotSet)
+		return "", errors.New("PureVPN login session expired and PureVPN account username and password are not set")
 	default:
 		page, err = c.submitLoginForm(ctx, page, loginForm)
 		if err != nil {
@@ -90,9 +95,20 @@ func (c *Client) authenticate(ctx context.Context) (token string, err error) {
 	case passwordSubmitted && page.findForm(isLoginForm) != nil:
 		return "", loginPageError(page)
 	default:
-		return "", fmt.Errorf("%w: no access token after logging in, landed on %s with status %s",
-			errUnexpectedResponse, redactURL(page.url), page.status)
+		return "", fmt.Errorf("unexpected response from PureVPN: no access token after logging in, "+
+			"landed on %s with status %s", redactURL(page.url), page.status)
 	}
+}
+
+// restoreSSOCookie sets the single sign-on cookie given in the
+// cookie jar if the auth server did not set a new one.
+func (c *Client) restoreSSOCookie(value string) {
+	_, ssoCookieSet := c.jarAuthCookies()[ssoCookie]
+	if ssoCookieSet {
+		return
+	}
+	cookie := &http.Cookie{Name: ssoCookie, Value: value, Path: "/"} //nolint:gosec // client-side cookie jar
+	c.httpClient.Jar.SetCookies(c.authURL, []*http.Cookie{cookie})
 }
 
 func (c *Client) submitLoginForm(ctx context.Context, page *htmlPage,
@@ -119,7 +135,7 @@ func (c *Client) submitLoginForm(ctx context.Context, page *htmlPage,
 // for the next time step and submits the next code once.
 func (c *Client) submitTwoFactorCode(ctx context.Context, page *htmlPage) (*htmlPage, error) {
 	if c.credentials.TOTPSecret == "" {
-		return nil, errTwoFactorRequired
+		return nil, errors.New("two-factor authentication is enabled on the PureVPN account but no TOTP secret is set")
 	}
 
 	now := c.timeNow()
@@ -135,7 +151,7 @@ func (c *Client) submitTwoFactorCode(ctx context.Context, page *htmlPage) (*html
 	// TOTP codes from authenticator apps change every 30 seconds.
 	const timeStepSeconds = 30
 	nextTimeStep := time.Unix((now.Unix()/timeStepSeconds+1)*timeStepSeconds, 0)
-	err = waitFor(ctx, nextTimeStep.Sub(now))
+	err = c.waitFor(ctx, nextTimeStep.Sub(now))
 	if err != nil {
 		return nil, fmt.Errorf("waiting for the next two-factor code: %w", err)
 	}
@@ -145,7 +161,8 @@ func (c *Client) submitTwoFactorCode(ctx context.Context, page *htmlPage) (*html
 		return nil, err
 	}
 	if page.findForm(isTwoFactorForm) != nil {
-		return nil, fmt.Errorf("%w: %s", errTwoFactorCodeInvalid, page.errorMessage())
+		return nil, fmt.Errorf("PureVPN rejected the two-factor code, check the TOTP secret and the system clock: %s",
+			page.errorMessage())
 	}
 	return page, nil
 }
@@ -172,13 +189,13 @@ func (c *Client) submitTwoFactorCodeAt(ctx context.Context, page *htmlPage,
 }
 
 // waitFor waits for the duration given or until the context is canceled.
-func waitFor(ctx context.Context, duration time.Duration) error {
-	timer := time.NewTimer(duration)
+func (c *Client) waitFor(ctx context.Context, duration time.Duration) error {
+	expired, stop := c.newTimer(duration)
 	select {
-	case <-timer.C:
+	case <-expired:
 		return nil
 	case <-ctx.Done():
-		timer.Stop()
+		stop()
 		return ctx.Err()
 	}
 }
@@ -200,11 +217,12 @@ func loginPageError(page *htmlPage) error {
 	message := page.errorMessage()
 	switch {
 	case strings.Contains(strings.ToLower(message), "captcha"):
-		return fmt.Errorf("%w: %s", errCaptchaRequired, message)
+		return fmt.Errorf("PureVPN requires a captcha to log in, log in once from a browser or set a session token: %s",
+			message)
 	case message == "":
-		return fmt.Errorf("%w: login page shown again without error message", errInvalidCredentials)
+		return errors.New("PureVPN rejected the account username or password: login page shown again without error message")
 	default:
-		return fmt.Errorf("%w: %s", errInvalidCredentials, message)
+		return fmt.Errorf("PureVPN rejected the account username or password: %s", message)
 	}
 }
 
@@ -224,7 +242,7 @@ func (c *Client) submitForm(ctx context.Context, page *htmlPage,
 	// The form action comes from the page, and must not
 	// send the credentials to another host.
 	if action.Scheme != c.authURL.Scheme || action.Host != c.authURL.Host {
-		return nil, fmt.Errorf("form action: %w: %s", errHostNotAllowed, action.Host)
+		return nil, fmt.Errorf("form action: host not allowed: %s", action.Host)
 	}
 	return c.doAuthRequest(ctx, http.MethodPost, action.String(), values)
 }
@@ -269,8 +287,8 @@ func (c *Client) doAuthRequest(ctx context.Context, method, rawURL string,
 	}
 
 	if response.StatusCode >= http.StatusInternalServerError {
-		return nil, fmt.Errorf("%w: %s returned %s",
-			errUnexpectedResponse, redactURL(response.Request.URL), response.Status)
+		return nil, fmt.Errorf("unexpected response from PureVPN: %s returned %s",
+			redactURL(response.Request.URL), response.Status)
 	}
 
 	page.forms, page.errors = parseHTML(responseBody)

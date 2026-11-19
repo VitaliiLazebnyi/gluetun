@@ -127,7 +127,7 @@ func (c *Client) apiRequest(ctx context.Context, token, path string,
 		// HTML error page from the website protection, not the API.
 		return fmt.Errorf("%w: API returned %s with an HTML page", errBlocked, response.Status)
 	default:
-		return fmt.Errorf("%w: API returned %s: %s", errAPI, response.Status,
+		return fmt.Errorf("PureVPN API error: API returned %s: %s", response.Status,
 			truncate(string(responseBody)))
 	}
 
@@ -139,20 +139,20 @@ func (c *Client) apiRequest(ctx context.Context, token, path string,
 		// after a redirect because the token is not accepted.
 		return fmt.Errorf("%w: API returned an HTML page", errUnauthorized)
 	case err != nil:
-		return fmt.Errorf("%w: decoding response: %w", errUnexpectedResponse, err)
+		return fmt.Errorf("unexpected response from PureVPN: decoding response: %w", err)
 	case !data.Status && data.ErrorCode == "token_expired":
 		// The API answers with this error code and a 200 status
 		// for any token it does not accept, expired or not.
 		return fmt.Errorf("%w: %s", errUnauthorized, data.Message)
 	case !data.Status:
-		return fmt.Errorf("%w: %s", errAPI, data.Message)
+		return fmt.Errorf("PureVPN API error: %s", data.Message)
 	case body == nil:
 		return nil
 	}
 
 	err = json.Unmarshal(data.Body, body)
 	if err != nil {
-		return fmt.Errorf("%w: decoding response body: %w", errUnexpectedResponse, err)
+		return fmt.Errorf("unexpected response from PureVPN: decoding response body: %w", err)
 	}
 	return nil
 }
@@ -207,10 +207,10 @@ func (c *Client) selectSubscription(ctx context.Context, token,
 	}
 
 	if wantedID != "" || wantedUsername != "" {
-		return "", "", fmt.Errorf("%w: available subscriptions are %s",
-			errSubscriptionNotFound, describeSubscriptions(subscriptions))
+		return "", "", fmt.Errorf("PureVPN subscription not found: available subscriptions are %s",
+			describeSubscriptions(subscriptions))
 	}
-	return "", "", errNoActiveSubscription
+	return "", "", errors.New("no active PureVPN subscription found")
 }
 
 func describeSubscriptions(subscriptions []subscription) string {
@@ -238,14 +238,9 @@ func (c *Client) getEncryptedPassword(ctx context.Context, token, vpnUsername st
 		return "", err
 	}
 	if body.EncryptedPassword == "" {
-		return "", fmt.Errorf("%w: encrypted password is empty", errUnexpectedResponse)
+		return "", errors.New("unexpected response from PureVPN: encrypted password is empty")
 	}
 	return body.EncryptedPassword, nil
-}
-
-type wireguardServer struct {
-	Configuration string `json:"wireguard_configuration"`
-	ProtocolIP    string `json:"protocol_ip"`
 }
 
 func (c *Client) getWireguardServer(ctx context.Context, token string,
@@ -264,23 +259,26 @@ func (c *Client) getWireguardServer(ctx context.Context, token string,
 		form.Set("iCityId", strconv.FormatUint(uint64(request.CityID), 10))
 	}
 
-	var servers []wireguardServer
+	var servers []struct {
+		Configuration string `json:"wireguard_configuration"`
+		ProtocolIP    string `json:"protocol_ip"`
+	}
 	err = c.apiRequest(ctx, token, "/v2/api/wireguard/get-wg-server", form, &servers)
 	if err != nil {
 		return Config{}, err
 	}
 	if len(servers) == 0 || servers[0].Configuration == "" {
-		return Config{}, fmt.Errorf("%w: no Wireguard configuration in response", errUnexpectedResponse)
+		return Config{}, errors.New("unexpected response from PureVPN: no Wireguard configuration in response")
 	}
 
 	config, err = parseConfig(servers[0].Configuration)
 	if err != nil {
-		return Config{}, fmt.Errorf("%w: parsing Wireguard configuration: %w", errUnexpectedResponse, err)
+		return Config{}, fmt.Errorf("unexpected response from PureVPN: parsing Wireguard configuration: %w", err)
 	}
 	if servers[0].ProtocolIP != "" {
 		protocolIP, err := netip.ParseAddr(servers[0].ProtocolIP)
 		if err != nil {
-			return Config{}, fmt.Errorf("%w: parsing protocol IP: %w", errUnexpectedResponse, err)
+			return Config{}, fmt.Errorf("unexpected response from PureVPN: parsing protocol IP: %w", err)
 		}
 		config.ProtocolIP = protocolIP.Unmap()
 	}

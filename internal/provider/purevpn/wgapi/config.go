@@ -1,6 +1,7 @@
 package wgapi
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -87,11 +88,11 @@ func parseConfig(content string) (config Config, err error) {
 
 	switch {
 	case len(config.Addresses) == 0:
-		return Config{}, errAddressMissing
+		return Config{}, errors.New("interface address is missing")
 	case config.ServerPublicKey == wgtypes.Key{}:
-		return Config{}, errPublicKeyMissing
+		return Config{}, errors.New("peer public key is missing")
 	case config.EndpointHost == "":
-		return Config{}, errEndpointMissing
+		return Config{}, errors.New("peer endpoint is missing")
 	}
 	return config, nil
 }
