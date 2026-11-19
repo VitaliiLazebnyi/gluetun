@@ -32,6 +32,10 @@ const testTOTPSecret = "JBSWY3DPEHPK3PXP" //nolint:gosec // test value
 
 const testSSOCookie = "valid-sso-session"
 
+// challengedSSOCookie is a single sign-on cookie value which is valid,
+// but only for logins challenged by Cloudflare, and is never issued.
+const challengedSSOCookie = "challenged-sso-session"
+
 const testVPNUsername = "purevpn0s1234567"
 
 const testSubsID = "subs-123"
@@ -66,9 +70,10 @@ type fakePureVPN struct {
 	challengePath       string            // path answered with a Cloudflare challenge
 	challengeSSOLogins  bool              // challenge the member area redirect of single sign-on logins
 	// State
-	counters    fakeCounters
-	latestToken string
-	validTokens map[string]bool
+	counters      fakeCounters
+	latestToken   string
+	validTokens   map[string]bool
+	receivedCodes map[string]bool // two-factor codes received, which cannot be used again
 }
 
 type fakeCounters struct {
@@ -91,7 +96,7 @@ func (r *fakeResponse) write(writer http.ResponseWriter) {
 
 func newFakePureVPN(t *testing.T) *fakePureVPN {
 	t.Helper()
-	return &fakePureVPN{t: t, validTokens: map[string]bool{}}
+	return &fakePureVPN{t: t, validTokens: map[string]bool{}, receivedCodes: map[string]bool{}}
 }
 
 func (f *fakePureVPN) getCounters() fakeCounters {
@@ -248,7 +253,7 @@ func (f *fakePureVPN) serveAuthorizePage(writer http.ResponseWriter, request *ht
 	cookie, err := request.Cookie("fusionauth.sso")
 	switch {
 	case err != nil, f.ssoDisabled:
-	case cookie.Value == testSSOCookie && f.challengeSSOLogins:
+	case (cookie.Value == testSSOCookie || cookie.Value == challengedSSOCookie) && f.challengeSSOLogins:
 		http.Redirect(writer, request, "/v2/api/fusionauth/login?code=sso-challenged", http.StatusFound)
 		return
 	case cookie.Value == testSSOCookie:
@@ -298,10 +303,14 @@ func (f *fakePureVPN) serveTwoFactorCode(writer http.ResponseWriter, request *ht
 	assert.Equal(f.t, baseURL+"/oauth2/two-factor", request.Header.Get("Referer"))
 	assert.Equal(f.t, "tf-1", request.PostForm.Get("twoFactorId"))
 	assert.Equal(f.t, "true", request.PostForm.Get("trustComputer"))
-	valid, err := totp.ValidateCustom(request.PostForm.Get("code"), testTOTPSecret, f.totpTime, totp.ValidateOpts{
+	code := request.PostForm.Get("code")
+	valid, err := totp.ValidateCustom(code, testTOTPSecret, f.totpTime, totp.ValidateOpts{
 		Period: 30, Skew: 1, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
 	})
 	assert.NoError(f.t, err)
+	// The real auth server rejects a code it already received, even if rejected.
+	valid = valid && !f.receivedCodes[code]
+	f.receivedCodes[code] = true
 	if !valid || f.rejectCodes > 0 {
 		if valid {
 			f.rejectCodes--
@@ -780,7 +789,11 @@ func Test_Client_FetchConfig(t *testing.T) {
 				fake.challengeSSOLogins = true
 			},
 			credentials: credentialsWithTOTP,
-			session:     Session{AuthCookies: trustedCookies},
+			// The stored single sign-on cookie differs from the issued one,
+			// so the expected cookies can only come from the new login.
+			session: Session{AuthCookies: map[string]string{
+				"fusionauth.sso": challengedSSOCookie, "fusionauth.trust": "trusted",
+			}},
 			authCookies: trustedCookies,
 			counters:    fakeCounters{authorizePages: 2, passwordLogins: 1, tokens: 1},
 		},
